@@ -108,14 +108,18 @@ function parseDue(raw, base) {
   }
   if (/(今月末|月末)/.test(s)) return { date: toISO(endOfMonth(b)), approx: false };
   if (/(月初|来月初)/.test(s)) return { date: toISO(new Date(b.getFullYear(), b.getMonth() + 1, 1)), approx: true };
+
+  // 「上旬・中旬・下旬」は幅のある表現なので実日付にしない。
+  // 下の「来月」「来週」より先に判定すること。順序を逆にすると
+  // 「来月中旬」が『来月の同じ日』という無関係な日付になる。
+  if (/(上旬|中旬|下旬)/.test(s)) return { date: '', approx: true };
+
   if (/来月/.test(s)) { const d = new Date(b); d.setMonth(d.getMonth() + 1); return { date: toISO(d), approx: true }; }
   if (/来週/.test(s)) return { date: toISO(addDays(b, 7)), approx: true };
   if (/今週/.test(s)) {
     const diff = (5 - b.getDay() + 7) % 7;
     return { date: toISO(addDays(b, diff === 0 ? 0 : diff)), approx: true };
   }
-  if (/(上旬)/.test(s)) return { date: '', approx: true };
-  if (/(中旬|下旬)/.test(s)) return { date: '', approx: true };
 
   return { date: '', approx: false };
 }

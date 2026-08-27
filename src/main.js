@@ -21,6 +21,7 @@ const { attachCitations } = require('./cite');
 const mtype = require('./meetingType');
 const { enrichActionBlocks } = require('./actions');
 const updater = require('./updater');
+const { markdownToBlocks, blocksToMarkdown } = require('./minutes');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
 const CPU_DEFAULT_THREADS = Math.max(4, os.cpus().length - 2);
@@ -126,13 +127,6 @@ function buildPrompt(extraTail) {
   }
   if (extraTail) parts.push(extraTail);
   return parts.join(' ');
-}
-
-function fmtClock(ms) {
-  const s = Math.floor(ms / 1000);
-  const h = Math.floor(s / 3600); const m = Math.floor((s % 3600) / 60); const sec = s % 60;
-  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
-    : `${m}:${String(sec).padStart(2, '0')}`;
 }
 
 // ---------------------------------------------------------------- エンジン管理
@@ -329,44 +323,6 @@ async function generateMinutes(plain, memo, onProgress, type) {
     { role: 'system', content: sys },
     { role: 'user', content: `${memoBlock}【会議の要点メモ（時系列）】\n${notes.join('\n\n')}\n\n上記の要点メモを統合し、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${MINUTES_FORMAT}` },
   ], 1600);
-}
-
-// Markdown → ブロック配列（Notion のブロックモデル相当）
-function markdownToBlocks(md) {
-  const blocks = [];
-  for (const raw of String(md || '').split('\n')) {
-    const line = raw.trimEnd();
-    if (!line.trim()) continue;
-    let m;
-    if ((m = line.match(/^#{1,4}\s+(.*)$/))) {
-      blocks.push({ id: store.newId('b'), type: 'heading', text: m[1].trim(), cites: [] });
-    } else if ((m = line.match(/^\s*[-*]\s*\[([ xX])\]\s+(.*)$/))) {
-      blocks.push({ id: store.newId('b'), type: 'todo', text: m[2].trim(), checked: m[1].toLowerCase() === 'x', cites: [] });
-    } else if ((m = line.match(/^\s*[-*・]\s+(.*)$/))) {
-      blocks.push({ id: store.newId('b'), type: 'bullet', text: m[1].trim(), cites: [] });
-    } else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
-      blocks.push({ id: store.newId('b'), type: 'bullet', text: m[1].trim(), cites: [] });
-    } else {
-      blocks.push({ id: store.newId('b'), type: 'paragraph', text: line.trim(), cites: [] });
-    }
-  }
-  return blocks;
-}
-
-function blocksToMarkdown(page, segments) {
-  let md = `# ${page.title || '議事録'}\n\n`;
-  md += `- 日時: ${new Date(page.createdAt).toLocaleString('ja-JP')}\n`;
-  md += `- 録音時間: ${fmtClock((page.durationSec || 0) * 1000)}\n\n`;
-  if (page.memo && page.memo.trim()) md += `## メモ・アジェンダ\n${page.memo.trim()}\n\n`;
-  for (const b of page.blocks) {
-    if (b.type === 'heading') md += `\n## ${b.text}\n`;
-    else if (b.type === 'todo') md += `- [${b.checked ? 'x' : ' '}] ${b.text}\n`;
-    else if (b.type === 'bullet') md += `- ${b.text}\n`;
-    else md += `${b.text}\n`;
-  }
-  md += '\n## 文字起こし全文\n\n';
-  for (const s of segments) md += `[${fmtClock(s.atMs)}] ${s.text}\n`;
-  return md;
 }
 
 // ---------------------------------------------------------------- 貼り付け

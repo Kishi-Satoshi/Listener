@@ -16,7 +16,7 @@ const path = require('path');
 const os = require('os');
 
 // 更新の配布元。fork した場合はここだけ書き換えれば動く。
-const REPO = 'kishi-satoshi/listener';
+const REPO = 'Kishi-Satoshi/Listener';
 const API_LATEST = `https://api.github.com/repos/${REPO}/releases/latest`;
 const ASSET_PATTERN = /^listener-src-.*\.zip$/i;
 
@@ -55,7 +55,7 @@ async function check(currentVersion, userDataPath) {
     if (!latest) return { ok: false, error: 'リリースにバージョン情報がありません' };
 
     const asset = (data.assets || []).find((a) => ASSET_PATTERN.test(a.name));
-    if (!asset) return { ok: false, error: '更新ファイル（koetype-src-*.zip）がリリースに添付されていません' };
+    if (!asset) return { ok: false, error: '更新ファイル（listener-src-*.zip）がリリースに添付されていません' };
 
     const newer = cmpVersion(latest, currentVersion) > 0;
     log(userDataPath, `check: current=${currentVersion} latest=${latest} newer=${newer}`);
@@ -129,7 +129,7 @@ function rmrf(p) {
  * 失敗時はバックアップから自動で復旧する。
  */
 async function apply(url, appRoot, userDataPath, onProgress) {
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'koetype-up-'));
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'listener-up-'));
   const zip = path.join(work, 'update.zip');
   const ext = path.join(work, 'extracted');
   const srcDir = path.join(appRoot, 'src');
@@ -144,7 +144,7 @@ async function apply(url, appRoot, userDataPath, onProgress) {
     fs.mkdirSync(ext, { recursive: true });
     expandZip(zip, ext);
 
-    // zip の中身は src/ 直下、または koetype/src/ のどちらでも受け入れる
+    // zip の中身は src/ 直下、または <任意のフォルダ>/src/ のどちらでも受け入れる
     let newSrc = path.join(ext, 'src');
     if (!fs.existsSync(newSrc)) {
       const sub = fs.readdirSync(ext).map((d) => path.join(ext, d, 'src')).find((p) => fs.existsSync(p));
