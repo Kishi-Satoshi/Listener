@@ -3,21 +3,27 @@
 # 添付するのは src/ と package.json だけを固めた軽量zip（make-release.ps1 と同じ構成）。
 # インストーラー丸ごと（80MB超）だと、大容量ダウンロードが切れる回線で
 # 更新のたびに失敗しかねないため、更新の配布はこのzipで行う。
-#
-# 通常はタグを push して起動する:
-#   git tag -a v0.8.1 -m "変更点をここに書く"
-#   git push origin v0.8.1
-#
-# タグを push できない環境からは、Actions 画面の "Run workflow" でも起動できる
-# （その場合はタグもここで作る）。
-#
 # リリース本文はアプリの [設定] -> [アップデート] にそのまま表示される。
+#
+# 起動のしかたは3通り。どれも結果は同じ。
+#
+#  1. タグを push する（通常はこれ）
+#       git tag -a v0.8.1 -m "変更点をここに書く"
+#       git push origin v0.8.1
+#
+#  2. Actions 画面の "Run workflow"（ブラウザだけで完結する）
+#
+#  3. release/v0.8.1 という名前のブランチを push する
+#       タグの push を通さないプロキシ環境のための逃げ道。
+#       公開できたらこのブランチは自動で消す。
 name: release
 
 on:
   push:
     tags:
       - 'v*'
+    branches:
+      - 'release/v*'
   workflow_dispatch:
     inputs:
       tag:
@@ -50,20 +56,26 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           VER="$(node -p "require('./package.json').version")"
-          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+          CLEANUP=''
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="${INPUT_TAG:-v${VER}}"
+          elif [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
             TAG="$GITHUB_REF_NAME"
-          elif [ -n "$INPUT_TAG" ]; then
-            TAG="$INPUT_TAG"
+          elif [ "${GITHUB_REF#refs/heads/release/}" != "$GITHUB_REF" ]; then
+            TAG="${GITHUB_REF_NAME#release/}"
+            CLEANUP="$GITHUB_REF_NAME"   # 公開後に消す一時ブランチ
           else
-            TAG="v${VER}"
+            echo "::error::想定外の ref です: $GITHUB_REF"
+            exit 1
           fi
-          # 版ずれのまま公開すると、配布先が更新を受け取れない／二重に受け取る
+          # 版ずれのまま公開すると、配布先が更新を受け取れない／取り違える
           if [ "${TAG#v}" != "$VER" ]; then
             echo "::error::タグ ($TAG) と package.json ($VER) のバージョンが一致しません"
             exit 1
           fi
           echo "VER=$VER" >> "$GITHUB_ENV"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "CLEANUP=$CLEANUP" >> "$GITHUB_ENV"
           echo "tag=$TAG / package.json=$VER"
 
       # 追加のnpm依存は無いので install は不要（テストは Node 同梱のランナー）
@@ -102,3 +114,7 @@ jobs:
             --notes-file "$RUNNER_TEMP/notes.md" \
             --latest \
             "release/listener-src-${VER}.zip"
+
+      - name: 一時ブランチを片付ける
+        if: success() && env.CLEANUP != ''
+        run: git push origin --delete "$CLEANUP"
