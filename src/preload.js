@@ -26,6 +26,7 @@ contextBridge.exposeInMainWorld('koeApp', {
   vadStatus: () => ipcRenderer.invoke('app:vad-status'),
   pickFile: (kind) => ipcRenderer.invoke('dialog:pick', kind),
   openDataDir: () => ipcRenderer.invoke('app:open-data-dir'),
+  openReleases: () => ipcRenderer.invoke('app:open-releases'),
   appVersion: () => ipcRenderer.invoke('app:version'),
   updateCheck: () => ipcRenderer.invoke('update:check'),
   updateApply: (url) => ipcRenderer.invoke('update:apply', url),

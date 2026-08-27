@@ -967,6 +967,12 @@ function setupIpc() {
     return { path: p, auto: Boolean(p) && p !== settings.vadModelPath };
   });
   ipcMain.handle('app:open-data-dir', () => { shell.openPath(app.getPath('userData')); return true; });
+  ipcMain.handle('app:open-releases', () => {
+    // URL は REPO 定数から組み立てる。画面から受け取ったURLを開くと、
+    // 表示中の文字列次第で任意のページを開けてしまう。
+    shell.openExternal(`https://github.com/${updater.REPO}/releases/latest`);
+    return true;
+  });
   ipcMain.handle('app:version', () => ({ version: app.getVersion(), repo: updater.REPO }));
   ipcMain.handle('update:check', async () => {
     const r = await updater.check(app.getVersion(), app.getPath('userData'));

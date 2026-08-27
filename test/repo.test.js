@@ -187,6 +187,27 @@ test('画面が呼ぶ API がすべて preload に公開されている', () => 
   assert.deepStrictEqual(missingOverlay, [], 'overlay.html が使うのに preload に無い koeOverlay の API');
 });
 
+test('外部URLを開くのは REPO 定数から組み立てたものだけ', () => {
+  // 画面から渡された文字列を openExternal に流すと、表示中の内容次第で
+  // 任意のページを開けてしまう
+  const calls = [...main.matchAll(/shell\.openExternal\(([^)]*)\)/g)].map((m) => m[1].trim());
+  assert.ok(calls.length > 0, 'openExternal の呼び出しが見つからない');
+  for (const c of calls) {
+    assert.match(c, /^`https:\/\/github\.com\/\$\{updater\.REPO\}/,
+      `画面から受け取ったURLを開いていないか: ${c}`);
+  }
+});
+
+test('更新の告知が設定タブの外にも出る', () => {
+  // トーストだけだと数秒で消え、見逃すと更新に気づけない
+  assert.ok(appHtml.includes('id="updBadge"'), '常駐する告知の要素が無い');
+  assert.ok(appHtml.includes('function renderUpdateBadge'), '告知を組み立てる関数が無い');
+  const from = appHtml.indexOf('function showUpdate(r)');
+  assert.ok(from >= 0, 'showUpdate が無い');
+  const body = appHtml.slice(from, appHtml.indexOf('\n  }', from) + 4);
+  assert.ok(body.includes('renderUpdateBadge(r)'), '更新を検出したのに告知を出していない');
+});
+
 test('preload に公開したまま main.js 側が無い API がない', () => {
   const handled = new Set([
     ...all(/ipcMain\.handle\('([^']+)'/g, main),

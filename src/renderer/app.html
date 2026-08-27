@@ -247,6 +247,38 @@
     padding: 10px 20px; border-radius: 999px; font-size: 13px; opacity: 0; pointer-events: none;
     transition: opacity .2s, transform .2s; box-shadow: 0 10px 30px rgba(15,20,35,.35); z-index: 99; }
   #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  /* ---------- 更新の告知（左下に常駐） ---------- */
+  /* トーストは数秒で消えるため、見逃すと更新に気づけない。
+     押すか閉じるまで残る告知を置き、ここを更新の主導線にする。 */
+  #updBadge { position: fixed; left: 20px; bottom: 20px; z-index: 98; width: 300px; max-width: calc(100vw - 40px);
+    background: var(--glass-strong); backdrop-filter: blur(24px) saturate(160%);
+    -webkit-backdrop-filter: blur(24px) saturate(160%);
+    border: 1px solid var(--gline); border-radius: 14px; padding: 12px 14px;
+    box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,.7); }
+  #updBadge[hidden] { display: none; }
+  #updBadge .hd { display: flex; align-items: center; gap: 8px; }
+  #updBadge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+  #updBadge .ttl { font-size: 13px; font-weight: 600; flex: 1; min-width: 0; }
+  #updBadge .x { background: none; border: none; color: var(--faint); font: inherit; font-size: 14px;
+    line-height: 1; cursor: pointer; padding: 3px 5px; border-radius: 6px; flex: none; }
+  #updBadge .x:hover { color: var(--ink); background: rgba(27,30,37,.08); }
+  #updBadge .row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+  #updBadge button.go { background: linear-gradient(180deg, #7b8bef 0%, #5261dd 100%); color: #fff;
+    border: none; font: inherit; font-size: 12px; font-weight: 600; padding: 6px 14px;
+    border-radius: 999px; cursor: pointer; white-space: nowrap;
+    box-shadow: 0 4px 12px rgba(82,97,221,.32), inset 0 1px 0 rgba(255,255,255,.4); }
+  #updBadge button.go:disabled { opacity: .55; cursor: default; box-shadow: none; }
+  #updBadge button.link { background: none; border: none; color: var(--muted); font: inherit;
+    font-size: 12px; cursor: pointer; padding: 4px 2px; text-decoration: underline; }
+  #updBadge button.link:hover { color: var(--ink); }
+  #updBadge .st { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.6; }
+  #updBadge .st.ng { color: var(--danger); }
+  #updBadge .st:empty { display: none; }
+  #updBadge .notes { display: none; margin-top: 10px; font-size: 11px; line-height: 1.7;
+    white-space: pre-wrap; background: rgba(255,255,255,.55); border-radius: 10px;
+    padding: 10px; max-height: 160px; overflow-y: auto; }
+  #updBadge .notes.open { display: block; }
+
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
 </head>
@@ -487,6 +519,7 @@
   </main>
 
   <div id="toast" role="status"></div>
+  <div id="updBadge" role="status" hidden></div>
 
 <script>
 (() => {
@@ -1254,8 +1287,74 @@
   // ---------------- アップデート ----------------
   let pendingUpdate = null;
 
+  // 左下の告知。押すか閉じるまで残るので、トーストと違って見逃さない。
+  // 「閉じる」はこのセッション限り（更新確認は起動時の1回なので状態は持たない）。
+  let updDismissed = false;
+
+  function renderUpdateBadge(r) {
+    const el = $('updBadge');
+    el.textContent = '';
+    if (!r || updDismissed) { el.hidden = true; return; }
+    el.hidden = false;
+
+    const hd = document.createElement('div'); hd.className = 'hd';
+    const dot = document.createElement('span'); dot.className = 'dot';
+    const ttl = document.createElement('span'); ttl.className = 'ttl';
+    ttl.textContent = `バージョン ${r.version} が利用できます`;
+    const x = document.createElement('button');
+    x.className = 'x'; x.textContent = '✕';
+    x.title = '閉じる（次回起動時にまた表示します）';
+    x.onclick = () => { updDismissed = true; el.hidden = true; };
+    hd.append(dot, ttl, x);
+
+    const st = document.createElement('div'); st.className = 'st';
+    const notes = document.createElement('div'); notes.className = 'notes';
+    notes.textContent = r.notes || '';
+
+    const row = document.createElement('div'); row.className = 'row';
+    const go = document.createElement('button'); go.className = 'go';
+
+    if (r.applyable === false) {
+      // インストーラー版は src の差し替えでは更新できないので、配布ページへ送る
+      go.textContent = 'ダウンロード';
+      go.onclick = () => window.koeApp.openReleases();
+      st.textContent = 'インストーラー版のため、新しいインストーラーを実行してください。';
+    } else {
+      go.textContent = '更新して再起動';
+      go.onclick = async () => {
+        go.disabled = true;
+        st.className = 'st'; st.textContent = '更新中…';
+        let res;
+        try {
+          res = await window.koeApp.updateApply(r.url);
+        } catch (e) {
+          res = { ok: false, error: (e && e.message) ? e.message : String(e) };
+        }
+        if (!res || !res.ok) {
+          st.className = 'st ng';
+          st.textContent = `✗ ${(res && res.error) || '更新に失敗しました'}`;
+          go.disabled = false;
+          return;
+        }
+        st.className = 'st'; st.textContent = '✓ 適用しました。再起動します…';
+        setTimeout(() => window.koeApp.restart(), 900);
+      };
+    }
+    row.appendChild(go);
+
+    if (r.notes) {
+      const more = document.createElement('button');
+      more.className = 'link'; more.textContent = '変更点';
+      more.onclick = () => notes.classList.toggle('open');
+      row.appendChild(more);
+    }
+
+    el.append(hd, row, st, notes);
+  }
+
   function showUpdate(r) {
     pendingUpdate = r;
+    renderUpdateBadge(r);
     if (r.notes) { $('updNotes').style.display = ''; $('updNotes').textContent = r.notes; }
     // インストーラー版はこの方法では更新できない。押せないボタンを出すと
     // 「押したらエラーが出た」になるので、最初から出さず案内だけ表示する。
@@ -1264,13 +1363,11 @@
       $('updMsg').textContent = `新しいバージョン ${r.version} があります。`
         + 'インストーラー版のため、新しいインストーラーを実行して更新してください。';
       $('updMsg').className = 'save-msg';
-      toast(`アップデート ${r.version} が公開されています（設定タブ）`);
       return;
     }
     $('applyUpdBtn').style.display = '';
     $('updMsg').textContent = `新しいバージョン ${r.version} があります（${Math.max(1, Math.round((r.size||0)/1024))} KB）`;
     $('updMsg').className = 'save-msg ok';
-    toast(`アップデート ${r.version} が利用できます（設定タブ）`);
   }
 
   $('chkUpdBtn').onclick = async () => {
@@ -1279,6 +1376,7 @@
     const r = await window.koeApp.updateCheck();
     if (!r.ok) { m.textContent = r.error; m.className = 'save-msg ng'; return; }
     if (!r.update) { m.textContent = `最新です（${r.version}）`; m.className = 'save-msg ok'; return; }
+    updDismissed = false; // 自分で確認したときは閉じた後でも出し直す
     showUpdate(r);
   };
 
@@ -1305,6 +1403,8 @@
   window.koeApp.onUpdateAvailable((r) => showUpdate(r));
   window.koeApp.onUpdateProgress((p) => {
     $('updMsg').textContent = p.message || ''; $('updMsg').className = 'save-msg';
+    const st = $('updBadge').querySelector('.st');
+    if (st && p.message) { st.className = 'st'; st.textContent = p.message; }
   });
 
   // ---------------- 初期化 ----------------
