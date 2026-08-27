@@ -129,17 +129,23 @@ data/
 
 ### リリース手順
 
-`package.json` の `version` を上げてコミットし、注釈付きタグを push します。
-`.github/workflows/release.yml` がテストを回し、zipを作り、Releaseを公開します。
+1. `package.json` の `version` を上げる
+2. `CHANGELOG.md` に `## v0.8.1` の節を足して変更点を書く
+3. コミットしてタグを push する
 
 ```bash
-git tag -a v0.8.1 -m "変更点をここに書く"
+git tag -a v0.8.1 -m "リリース"
 git push origin v0.8.1
 ```
 
-タグのメッセージがそのままリリース本文になり、アプリの
+`.github/workflows/release.yml` がテストを回し、zipを作り、Releaseを公開します。
+`CHANGELOG.md` の該当節がそのままリリース本文になり、アプリの
 [設定] → [アップデート] に表示されます。
 タグと `package.json` のバージョンが食い違うとワークフローが止まります。
+
+タグを push できない環境（プロキシが `refs/tags` を拒否する等）では、
+Actions 画面の **Run workflow**、または `release/v0.8.1` という名前の
+ブランチを push しても同じ結果になります（そのブランチは公開後に自動で消えます）。
 
 各PCの Listener が起動時、または [設定] → [アップデート] → [更新を確認] で検出します。
 

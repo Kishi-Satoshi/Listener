@@ -92,28 +92,49 @@ jobs:
           rm -rf release/_stage
           unzip -l "release/listener-src-${VER}.zip"
 
+      # 本文の決め方: 入力 -> CHANGELOG.md の該当節 -> タグの注釈 -> 既定文
+      - name: リリース本文を組み立てる
+        env:
+          INPUT_NOTES: ${{ inputs.notes }}
+        run: |
+          blank() { [ -z "$(printf '%s' "$1" | tr -d '[:space:]')" ]; }
+          NOTES="$INPUT_NOTES"
+          if blank "$NOTES" && [ -f CHANGELOG.md ]; then
+            NOTES="$(awk -v tag="$TAG" '
+              $0 ~ "^## +" tag "([ \t]|$)" { found = 1; next }
+              found && /^## / { exit }
+              found { print }
+            ' CHANGELOG.md)"
+          fi
+          if blank "$NOTES"; then
+            NOTES="$(git tag -l --format='%(contents)' "$TAG")"
+          fi
+          if blank "$NOTES"; then
+            NOTES="Listener ${TAG}"
+          fi
+          # 前後の空行を落とす
+          printf '%s\n' "$NOTES" | sed -e '/./,$!d' | tac | sed -e '/./,$!d' | tac > "$RUNNER_TEMP/notes.md"
+          echo '--- リリース本文 ---'
+          cat "$RUNNER_TEMP/notes.md"
+
+      # 作り直しでも落ちないようにする（本文の直しや添付のやり直しができる）
       - name: リリースを公開
         env:
           GH_TOKEN: ${{ github.token }}
-          INPUT_NOTES: ${{ inputs.notes }}
         run: |
-          NOTES="$INPUT_NOTES"
-          if [ -z "$(printf '%s' "$NOTES" | tr -d '[:space:]')" ]; then
-            NOTES="$(git tag -l --format='%(contents)' "$TAG")"
+          ZIP="release/listener-src-${VER}.zip"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "既存のリリースを更新します: $TAG"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --latest
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$ZIP"
+          else
+            # タグが無ければ gh がこのコミットに作る。
+            # --latest を外すとアプリ側の releases/latest から外れるので必ず付ける。
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "$TAG" \
+              --notes-file "$RUNNER_TEMP/notes.md" --latest "$ZIP"
           fi
-          if [ -z "$(printf '%s' "$NOTES" | tr -d '[:space:]')" ]; then
-            NOTES="Listener ${TAG}"
-          fi
-          printf '%s\n' "$NOTES" > "$RUNNER_TEMP/notes.md"
-          # タグが無ければ gh がこのコミットに作る。
-          # --latest を外すとアプリ側の releases/latest から外れるので必ず付ける。
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "$TAG" \
-            --notes-file "$RUNNER_TEMP/notes.md" \
-            --latest \
-            "release/listener-src-${VER}.zip"
 
       - name: 一時ブランチを片付ける
         if: success() && env.CLEANUP != ''
