@@ -170,24 +170,41 @@ const ORDER = ['standup', 'review', 'oneonone', 'sales', 'interview', 'brainstor
  * タイトルと本文の冒頭から会議タイプを推定する。
  * タイトルは人が付けた明示的なラベルなので重く、本文は補助として軽く見る。
  */
+const BODY_ONLY_MIN = 5;
+
 function detectType(title, transcriptHead) {
   const t = String(title || '');
   const body = String(transcriptHead || '').slice(0, 1200);
-  const scores = {};
+  const scores = [];
 
   for (const key of ORDER) {
     if (key === 'general') continue;
-    let s = 0;
+    let total = 0; let title_ = 0; let longest = 0;
     for (const kw of TYPES[key].keywords) {
-      if (t.includes(kw)) s += 3;          // タイトル一致は強い根拠
-      if (body.includes(kw)) s += 1;       // 本文一致は補助
+      if (t.includes(kw)) {
+        total += 3;                        // タイトル一致は強い根拠
+        title_ += 3;
+        longest = Math.max(longest, kw.length);
+      }
+      if (body.includes(kw)) total += 1;   // 本文一致は補助
     }
-    if (s > 0) scores[key] = s;
+    if (total > 0) scores.push({ key, total, title: title_, longest });
   }
+  if (scores.length === 0) return 'general';
 
-  const best = Object.entries(scores).sort((a, b) => b[1] - a[1])[0];
-  if (!best || best[1] < 3) return 'general'; // タイトル一致が1つも無ければ判定しない
-  return best[0];
+  scores.sort((a, b) => (b.total - a.total)
+    // 同点なら、より長い（＝具体的な）語で当たった方を採る。
+    // 「採用面談」は interview の『採用面談』と oneonone の『面談』の両方に当たるが、
+    // 長い方が書き手の意図に近い。
+    || (b.longest - a.longest));
+
+  const best = scores[0];
+  // タイトルに手がかりがあればそれを信じる。
+  // 本文だけの一致は「提案」「価格」のような一般語でも起きるため、
+  // よほど数が揃わない限り型を決める根拠にはしない（誤った型を当てない）。
+  if (best.title > 0) return best.key;
+  if (best.total >= BODY_ONLY_MIN) return best.key;
+  return 'general';
 }
 
 function getFormat(type) {

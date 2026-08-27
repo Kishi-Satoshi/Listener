@@ -27,7 +27,11 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
 $pkgPath = Join-Path $root "package.json"
 $pkg = Get-Content $pkgPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $pkg.version = $Version
-$pkg | ConvertTo-Json -Depth 20 | Set-Content $pkgPath -Encoding UTF8
+# Set-Content -Encoding UTF8 は Windows PowerShell 5.1 では BOM を付ける。
+# BOM 付きの package.json は配布zipにそのまま入り、更新の適用側で
+# JSON.parse が失敗してバージョンが上がらなくなるため、BOM なしで書く。
+$json = $pkg | ConvertTo-Json -Depth 20
+[IO.File]::WriteAllText($pkgPath, $json, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host ("package.json を " + $Version + " に更新しました") -ForegroundColor Green
 
 # 配布用zipを作成

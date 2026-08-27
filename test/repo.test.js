@@ -40,7 +40,9 @@ test('個人名・個人パス・社内固有名がコードに残っていな�
     { re: /techvan/i, what: '社名' },
   ];
   const hits = [];
+  const SELF = 'test/repo.test.js'; // 禁止語そのものを持つので自分自身は対象外
   for (const f of files) {
+    if (f === SELF) continue;
     if (!TEXT_EXT.has(path.extname(f))) continue;
     const text = read(f);
     text.split('\n').forEach((line, i) => {

@@ -56,8 +56,17 @@ function parseDue(raw, base) {
       return { date: toISO(d), approx: false };
     }
   }
-  // 30日（今月または来月）※「3日後」を月内日付と誤読しないよう除外
-  if ((m = s.match(/^(\d{1,2})\s*日(?!後|間)/))) {
+  // 今月10日 / 来月10日 （「来月」だけを見ると日付が捨てられる）
+  if ((m = s.match(/(今月|来月|再来月)\s*(\d{1,2})\s*日/))) {
+    const off = m[1] === '今月' ? 0 : m[1] === '来月' ? 1 : 2;
+    const da = +m[2];
+    if (da >= 1 && da <= 31) {
+      return { date: toISO(new Date(b.getFullYear(), b.getMonth() + off, da)), approx: false };
+    }
+  }
+  // 30日（今月または来月）
+  // 「3日後」「10日間」「3日以内」などの期間表現を月内日付と誤読しないよう除外する
+  if ((m = s.match(/^(\d{1,2})\s*日(?!後|間|以内|以降|程度|ほど|ぐらい|くらい)/))) {
     const da = +m[1];
     let d = new Date(b.getFullYear(), b.getMonth(), da);
     if (d < b) d = new Date(b.getFullYear(), b.getMonth() + 1, da);
@@ -65,6 +74,7 @@ function parseDue(raw, base) {
   }
 
   // --- 相対（日数・週数） ---
+  if ((m = s.match(/(\d+)\s*日以内/))) return { date: toISO(addDays(b, +m[1])), approx: false };
   if ((m = s.match(/(\d+)\s*(?:日後|営業日)/))) return { date: toISO(addDays(b, +m[1])), approx: false };
   if ((m = s.match(/(\d+)\s*週間?後/))) return { date: toISO(addDays(b, +m[1] * 7)), approx: false };
   if ((m = s.match(/(\d+)\s*(?:ヶ月|カ月|か月|ケ月)後/))) {
@@ -90,18 +100,31 @@ function parseDue(raw, base) {
     }
     // 今週／指定なし: 基準日以降で最も近いその曜日
     let diff = (target - cur + 7) % 7;
-    if (diff === 0) diff = 7; // 同じ曜日なら次の週
+    // 同じ曜日なら次の週。ただし「今週◯曜」と明示されている場合は当日を指す
+    if (diff === 0 && !/今週|本週/.test(s)) diff = 7;
     return { date: toISO(addDays(b, diff)), approx: false };
   }
 
   // --- 期間の終わり ---
+  // 「来週末」を先に見ること。「週末まで」は「来週末まで」の一部でもあるため、
+  // 順序を逆にすると「来週末まで」が今週の金曜になる。
+  if (/来週末/.test(s)) {
+    const diff = (5 - b.getDay() + 7) % 7;
+    return { date: toISO(addDays(b, (diff === 0 ? 0 : diff) + 7)), approx: false };
+  }
   if (/(今週中|週内|今週末|週末まで)/.test(s)) {
     const diff = (5 - b.getDay() + 7) % 7; // 直近の金曜
     return { date: toISO(addDays(b, diff === 0 ? 0 : diff)), approx: false };
   }
-  if (/来週末/.test(s)) {
-    const diff = (5 - b.getDay() + 7) % 7;
-    return { date: toISO(addDays(b, (diff === 0 ? 0 : diff) + 7)), approx: false };
+  // 「9月末」のように月を明示した月末。下の「月末」より先に見ること。
+  // 順序を逆にすると 9月末 が『基準日の月の末日』になる。
+  if ((m = s.match(/(?:^|[^\d])(\d{1,2})\s*月末/))) {
+    const mo = +m[1];
+    if (mo >= 1 && mo <= 12) {
+      let d = endOfMonth(new Date(b.getFullYear(), mo - 1, 1));
+      if (d < b) d = endOfMonth(new Date(b.getFullYear() + 1, mo - 1, 1));
+      return { date: toISO(d), approx: false };
+    }
   }
   if (/(来月末|翌月末)/.test(s)) {
     return { date: toISO(endOfMonth(new Date(b.getFullYear(), b.getMonth() + 1, 1))), approx: false };
@@ -152,10 +175,10 @@ function parseAction(text, base) {
   }
 
   // (2) 括弧なしの定型: 担当: 山田 期限: 8/30
-  if (!assignee && (m = body.match(/(?:担当者?)\s*[:：]\s*([^\s/,、|]+)/))) {
+  if (!assignee && (m = body.match(/(?:担当者?)\s*[:：]\s*([^\s/,、|）)]+)/))) {
     assignee = m[1].trim(); body = body.replace(m[0], ' ').trim();
   }
-  if (!dueRaw && (m = body.match(/(?:期限|締切|〆切)\s*[:：]\s*([^\s,、|]+)/))) {
+  if (!dueRaw && (m = body.match(/(?:期限|締切|〆切)\s*[:：]\s*([^\s,、|）)]+)/))) {
     dueRaw = m[1].trim(); body = body.replace(m[0], ' ').trim();
   }
 
@@ -173,11 +196,16 @@ function parseAction(text, base) {
   if (!dueRaw && (m = body.match(/((?:今日|本日|明日|明後日|今週|来週|再来週|今月|来月|\d{1,2}\s*[月/]\s*\d{1,2}日?|\d{1,2}日|\d+\s*(?:日|週間?|ヶ月)後)(?:末|中)?(?:[日月火水木金土]曜日?)?)\s*(?:まで|迄)/))) {
     dueRaw = m[1].trim();
   }
-  if (!dueRaw && (m = body.match(/((?:今|来)?[週月]末|週内)\s*(?:まで|迄)?/))) {
+  // 「まで／迄／中に」を必須にする。無くても拾うと「月末処理の手順を作る」や
+  // 「先月末の請求書を確認する」に期限が付いてしまう。
+  // (5) の推定も「まで」を必須にしており、そちらと揃える。
+  if (!dueRaw && (m = body.match(/(?<![先前昨])(\d{1,2}\s*月末|(?:今|来)?[週月]末|週内)\s*(?:まで|迄|中に)/))) {
     dueRaw = m[1].trim();
   }
 
-  body = body.replace(/\s{2,}/g, ' ').replace(/^[-–—・\s]+/, '').trim();
+  // 値を抜いたあとに「（ / ）」のような殻が残ることがあるので畳む
+  body = body.replace(/[（(][\s/｜|,、]*[）)]/g, ' ')
+    .replace(/\s{2,}/g, ' ').replace(/^[-–—・\s]+/, '').trim();
   const parsed = parseDue(dueRaw, base);
 
   return {

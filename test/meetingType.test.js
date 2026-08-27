@@ -39,6 +39,27 @@ test('本文だけの弱い一致では型を決めない', () => {
   assert.strictEqual(mtype.detectType('打ち合わせ', '本日は商談の件で伺いました'), 'general');
 });
 
+test('より具体的な語で当たった型を採る', () => {
+  // 「採用面談」は interview の『採用面談』と oneonone の『面談』の両方に当たる
+  assert.strictEqual(mtype.detectType('採用面談', ''), 'interview');
+  // 「面談」単体、「キャリア面談」は 1on1 のまま
+  assert.strictEqual(mtype.detectType('面談', ''), 'oneonone');
+  assert.strictEqual(mtype.detectType('キャリア面談', ''), 'oneonone');
+});
+
+test('本文に一般語が並んだだけでは型を決めない', () => {
+  // 「提案」「価格」「紹介」はどの会議にも出る語。これで商談と判定してはいけない
+  assert.strictEqual(
+    mtype.detectType('2026/10/5 10:00 の議事録', '自己紹介します。提案の価格について説明します'),
+    'general');
+});
+
+test('本文の手がかりが十分に多ければ型を決める', () => {
+  assert.strictEqual(
+    mtype.detectType('2026/10/5 10:00 の議事録', '商談 提案 見積 価格 契約 再販 協業'),
+    'sales');
+});
+
 test('タイトル一致は本文一致より優先される', () => {
   // タイトルに「面接」（interview）、本文に「定例」（standup）
   assert.strictEqual(mtype.detectType('一次面接', '定例 定例 定例'), 'interview');

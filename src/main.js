@@ -26,6 +26,10 @@ const { markdownToBlocks, blocksToMarkdown } = require('./minutes');
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
 const CPU_DEFAULT_THREADS = Math.max(4, os.cpus().length - 2);
 const MIN_RECORD_MS = 400;
+// メモはプロンプトにそのまま前置きされるので、文脈を食い潰さない範囲に収める
+const MEMO_MAX = 1500;
+const SUM_MAX_TOKENS = 3000;   // 最終的な議事録
+const NOTE_MAX_TOKENS = 900;   // 分割要約の各パート
 const ENGINE_READY_TIMEOUT_MS = 90000;
 
 const DEFAULT_SETTINGS = {
@@ -288,7 +292,10 @@ async function llmChat(messages, maxTokens) {
   const data = await res.json();
   const text = data?.choices?.[0]?.message?.content?.trim();
   if (!text) throw new Error('要約エンジンの応答が空でした');
-  return text;
+  // 長さ上限で打ち切られると末尾の議題が黙って欠ける。
+  // 黙って欠けるより、欠けたと分かる方がよい。
+  const truncated = data?.choices?.[0]?.finish_reason === 'length';
+  return { text, truncated };
 }
 
 async function generateMinutes(plain, memo, onProgress, type) {
@@ -297,32 +304,44 @@ async function generateMinutes(plain, memo, onProgress, type) {
   if (!ok) throw new Error(sumEng.lastError || '要約エンジンが起動していません');
   const sys = 'あなたは優秀な議事録作成アシスタントです。会議の文字起こしを分析し、正確で実用的な議事録を日本語のMarkdownで作成します。'
     + '文字起こしに無い情報を創作せず、雑談は省いてください。';
-  const memoBlock = memo && memo.trim() ? `【会議メモ・アジェンダ（要約のヒント）】\n${memo.trim()}\n\n` : '';
+  // メモはユーザーが好きなだけ書けるうえ、そのままプロンプトに前置きされる。
+  // 長すぎると文脈を食い潰して文字起こし側が押し出されるので上限を設ける。
+  const memoText = String(memo || '').trim().slice(0, MEMO_MAX);
+  const memoBlock = memoText ? `【会議メモ・アジェンダ（要約のヒント）】\n${memoText}\n\n` : '';
 
   const CHUNK = 5500;
-  if (plain.length <= CHUNK + 1500) {
-    return llmChat([
+  // メモの分も含めて1回で収まるかを判断する
+  if (plain.length + memoBlock.length <= CHUNK + 1500) {
+    const one = await llmChat([
       { role: 'system', content: sys },
       { role: 'user', content: `${memoBlock}【会議の文字起こし】\n${plain}\n\n上記から、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${MINUTES_FORMAT}` },
-    ], 1600);
+    ], SUM_MAX_TOKENS);
+    return { md: one.text, truncated: one.truncated };
   }
 
   const chunks = [];
-  for (let i = 0; i < plain.length; i += CHUNK) chunks.push(plain.slice(i, i + CHUNK + 200));
+  for (let i = 0; i < plain.length; i += CHUNK) {
+    // 残りが重なり幅以下なら、直前のチャンクに完全に含まれるので作らない
+    if (i > 0 && plain.length - i <= 200) break;
+    chunks.push(plain.slice(i, i + CHUNK + 200));
+  }
   const notes = [];
+  let truncated = false;
   for (let i = 0; i < chunks.length; i++) {
     if (onProgress) onProgress(`要約中… (${i + 1}/${chunks.length})`);
     const part = await llmChat([
       { role: 'system', content: sys },
       { role: 'user', content: `以下は長い会議の文字起こしの一部（${i + 1}/${chunks.length}）です。重要な発言・決定・依頼・課題・数字を漏らさず、簡潔な箇条書きで抽出してください。\n\n${chunks[i]}` },
-    ], 700);
-    notes.push(`--- パート${i + 1} ---\n${part}`);
+    ], NOTE_MAX_TOKENS);
+    if (part.truncated) truncated = true;
+    notes.push(`--- パート${i + 1} ---\n${part.text}`);
   }
   if (onProgress) onProgress('議事録をまとめています…');
-  return llmChat([
+  const final = await llmChat([
     { role: 'system', content: sys },
     { role: 'user', content: `${memoBlock}【会議の要点メモ（時系列）】\n${notes.join('\n\n')}\n\n上記の要点メモを統合し、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${MINUTES_FORMAT}` },
-  ], 1600);
+  ], SUM_MAX_TOKENS);
+  return { md: final.text, truncated: truncated || final.truncated };
 }
 
 // ---------------------------------------------------------------- 貼り付け
@@ -472,6 +491,10 @@ function toggleRecording() {
 }
 
 async function handleDictationAudio(buffer, durationMs) {
+  // 取り消し後に届いた録音を処理しない。
+  // Escape で取り消しても、録音側の停止処理が終わってから音声が届くことがあり、
+  // そのまま進むと取り消したはずの文章が貼り付けられる。
+  if (state !== 'recording' && state !== 'processing') return;
   if (state === 'recording') globalShortcut.unregister('Escape');
   state = 'processing'; updateTray();
   if (durationMs < MIN_RECORD_MS || buffer.byteLength < 1000) { finishWithError('録音が短すぎます'); return; }
@@ -500,6 +523,9 @@ async function handleDictationAudio(buffer, durationMs) {
 }
 
 function finishWithError(message) {
+  // 録音中に確保した Escape を必ず手放す。ここを抜かすと、以後アプリ以外の
+  // 場所でも Escape が効かなくなる（録音中だけの横取りのはずが残り続ける）。
+  if (state === 'recording') globalShortcut.unregister('Escape');
   state = 'idle'; updateTray();
   sendToOverlay('overlay:phase', { phase: 'error', message });
   setTimeout(hideOverlayIfIdle, 3000);
@@ -576,6 +602,9 @@ function stopMeeting() {
   sendToOverlay('overlay:phase', { phase: 'processing', message: '議事録を作成中…' });
   sendToMainWin('meeting:progress', { message: '録音を終了し、残りの文字起こしを処理しています…' });
   updateTray();
+  // 開始・破棄と同じく状態を送る。これが無いと、ホットキーやトレイから
+  // 終了したときにボタンが「■ 終了して作成」のまま残る。
+  sendToMainWin('meeting:update', meetingStatus());
   return { ok: true };
 }
 
@@ -599,34 +628,43 @@ function toggleMeetingByHotkey() {
 
 function onMeetingSegment(buffer, durationMs, isFinal) {
   if (!meeting) return;
-  const segOffset = meeting.offsetMs;
-  meeting.offsetMs += durationMs;
+  // 文字起こしは録音より遅れて終わる。その間に議事録が破棄されて次の記録が
+  // 始まっていることがあるので、この区間が属する議事録を捕まえておき、
+  // 「今も同じ議事録か」で判断する。単なる null 判定だと、破棄した議事録の
+  // 発言が次の議事録に紛れ込む。
+  const m = meeting;
+  const segOffset = m.offsetMs;
+  m.offsetMs += durationMs;
   pendingSegs++;
   sendToMainWin('meeting:update', meetingStatus());
   segChain = segChain.then(async () => {
-    if (!meeting) return;
+    if (meeting !== m) return;
     if (buffer.byteLength < 4000) return;
-    const tail = meeting.segments.length ? meeting.segments[meeting.segments.length - 1].text.slice(-100) : '';
+    const tail = m.segments.length ? m.segments[m.segments.length - 1].text.slice(-100) : '';
     let text = '';
     try {
       text = await transcribeLocal(buffer, tail);
     } catch (e) {
-      meeting.segments.push({ id: `s${++meeting.seq}`, atMs: segOffset, text: `（この区間の認識に失敗: ${e.message}）`, failed: true });
+      if (meeting !== m) return;
+      m.segments.push({ id: `s${++m.seq}`, atMs: segOffset, text: `（この区間の認識に失敗: ${e.message}）`, failed: true });
       writeDraft(); sendToMainWin('meeting:update', meetingStatus());
       return;
     }
-    if (!meeting) return;
+    if (meeting !== m) return;
     if (settings.removeFillers) text = removeFillersRule(text);
     if (!text) return;
-    const prev = meeting.segments.length ? meeting.segments[meeting.segments.length - 1].text : '';
+    const prev = m.segments.length ? m.segments[m.segments.length - 1].text : '';
     if (prev && text.length > 6 && prev === text) return; // 繰り返しハルシネーション抑制
-    meeting.segments.push({ id: `s${++meeting.seq}`, atMs: segOffset, text });
+    m.segments.push({ id: `s${++m.seq}`, atMs: segOffset, text });
     writeDraft();
     sendToMainWin('meeting:update', meetingStatus());
   }).catch(() => {}).finally(() => {
-    pendingSegs--;
+    // 破棄済みの議事録の区間は、破棄時に数え直した件数を減らさない
+    if (meeting === m) pendingSegs = Math.max(0, pendingSegs - 1);
     sendToMainWin('meeting:update', meetingStatus());
-    if (isFinal || (meeting && meeting.stopping && pendingSegs === 0)) maybeFinalizeMeeting();
+    if (meeting === m && (isFinal || (m.stopping && pendingSegs === 0))) {
+      maybeFinalizeMeeting().catch((e) => engineLog(`finalize failed: ${e.message}`));
+    }
   });
 }
 
@@ -640,20 +678,30 @@ async function maybeFinalizeMeeting() {
   const dt = new Date(m.startedAt);
   const fallbackTitle = `${dt.getFullYear()}/${dt.getMonth() + 1}/${dt.getDate()} ${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')} の議事録`;
 
-  const page = store.createPage({
-    title: fallbackTitle,
-    date: dt.toISOString().slice(0, 10),
-    durationSec, memo: m.memo, blocks: [],
-    segments: m.segments,
-    createdAt: dt.toISOString(),
-  });
-  store.clearDraft();
+  let page = null;
+  try {
+    page = store.createPage({
+      title: fallbackTitle,
+      date: dt.toISOString().slice(0, 10),
+      durationSec, memo: m.memo, blocks: [],
+      segments: m.segments,
+      createdAt: dt.toISOString(),
+    });
+    store.clearDraft();
+  } catch (e) {
+    // 保存に失敗しても draft.json は消さない（次回起動時に復旧できる）
+    engineLog(`議事録の保存に失敗: ${e.message}`);
+    sendToOverlay('overlay:phase', { phase: 'error', message: '議事録を保存できませんでした' });
+    sendToMainWin('app:notice', `議事録を保存できませんでした: ${e.message}\n次回起動時に復旧を試みます。`);
+  } finally {
+    // 何があっても録音状態は解除する。ここを抜けると画面が「作成中…」で止まる。
+    state = 'idle'; updateTray();
+    setTimeout(hideOverlayIfIdle, 2000);
+    sendToMainWin('meeting:update', meetingStatus());
+  }
+  if (!page) return;
 
-  state = 'idle'; updateTray();
   sendToOverlay('overlay:phase', { phase: 'done', message: '議事録を保存しました' });
-  setTimeout(hideOverlayIfIdle, 2000);
-  // 録音状態の解除をUIへ通知する。これを送らないと画面が「作成中…」のまま止まる
-  sendToMainWin('meeting:update', meetingStatus());
   sendToMainWin('pages:updated', store.listPages());
   sendToMainWin('page:open', page.id);
 
@@ -700,28 +748,40 @@ async function runSummary(pageId) {
     message: `要約エンジンで議事録を作成中…（${mtype.getLabel(page.meetingType)}として要約します）`,
   });
   try {
-    const md = await generateMinutes(
+    const { md, truncated } = await generateMinutes(
       plain, page.memo,
       (msg) => sendToMainWin('meeting:progress', { message: msg }),
       page.meetingType,
     );
     const blocks = markdownToBlocks(md);
-    const stat = attachCitations(blocks, usable);
+    // 担当・期限を先に抜く。出典の突き合わせは
+    // 「（担当: ○○ / 期限: ○○）」を落とした本文に対して行いたい。
+    // 書式が残ったままだと、その語がクエリに混ざって一致がぶれる。
     const actStat = enrichActionBlocks(blocks, new Date(page.createdAt));
-    page.blocks = blocks;
-    page.summaryError = '';
-    page.citeStat = stat;
-    page.actionStat = actStat;
-    store.savePage(page);
+    const stat = attachCitations(blocks, usable);
+
+    // 要約は数分かかる。その間にタイトルやメモが編集されているかもしれないので、
+    // 読み込み時のページを丸ごと書き戻さず、生成物だけを最新のページに載せる。
+    const saved = store.getPage(pageId) || page;
+    saved.blocks = blocks;
+    saved.meetingType = page.meetingType;
+    saved.typeAuto = page.typeAuto;
+    saved.citeStat = stat;
+    saved.actionStat = actStat;
+    saved.summaryError = truncated
+      ? '要約が長さの上限で打ち切られた可能性があります。末尾の議題が欠けていないか確認してください。'
+      : '';
+    store.savePage(saved);
     clearUi();
     sendToMainWin('pages:updated', store.listPages());
-    sendToMainWin('page:updated', { page, segments });
-    return { ok: true, page, stat };
+    sendToMainWin('page:updated', { page: saved, segments });
+    return { ok: true, page: saved, stat };
   } catch (e) {
-    page.summaryError = e.message;
-    store.savePage(page);
+    const saved = store.getPage(pageId) || page;
+    saved.summaryError = e.message;
+    store.savePage(saved);
     clearUi();
-    sendToMainWin('page:updated', { page, segments });
+    sendToMainWin('page:updated', { page: saved, segments });
     return { ok: false, error: e.message };
   }
 }
@@ -908,7 +968,12 @@ function setupIpc() {
   });
   ipcMain.handle('app:open-data-dir', () => { shell.openPath(app.getPath('userData')); return true; });
   ipcMain.handle('app:version', () => ({ version: app.getVersion(), repo: updater.REPO }));
-  ipcMain.handle('update:check', () => updater.check(app.getVersion(), app.getPath('userData')));
+  ipcMain.handle('update:check', async () => {
+    const r = await updater.check(app.getVersion(), app.getPath('userData'));
+    // インストーラー版は src の差し替えでは更新できない（下の update:apply 参照）。
+    // 画面側が「更新して再起動」を出すかどうかの判断に使う。
+    return { ...r, applyable: !app.isPackaged };
+  });
   ipcMain.handle('update:apply', async (_e, url) => {
     const root = app.isPackaged ? path.dirname(app.getPath('exe')) : app.getAppPath();
     if (app.isPackaged) {
@@ -941,7 +1006,10 @@ function setupIpc() {
   ipcMain.on('audio:segment', (_e, { buffer, durationMs, final }) => onMeetingSegment(Buffer.from(buffer), durationMs, Boolean(final)));
   ipcMain.on('audio:error', (_e, { message }) => {
     if (state === 'meeting' || state === 'meeting-finalizing') {
-      if (meeting) { meeting.stopping = true; state = 'meeting-finalizing'; maybeFinalizeMeeting(); }
+      if (meeting) {
+        meeting.stopping = true; state = 'meeting-finalizing';
+        maybeFinalizeMeeting().catch((e) => engineLog(`finalize failed: ${e.message}`));
+      }
     } else finishWithError(message || 'マイクにアクセスできません');
   });
   ipcMain.on('overlay:hidden-request', () => hideOverlayIfIdle());
@@ -972,7 +1040,7 @@ if (!gotLock) {
     // 起動から少し置いて更新確認。オフラインなら黙って諦める
     setTimeout(async () => {
       const r = await updater.check(app.getVersion(), app.getPath('userData'));
-      if (r.ok && r.update) sendToMainWin('update:available', r);
+      if (r.ok && r.update) sendToMainWin('update:available', { ...r, applyable: !app.isPackaged });
     }, 8000);
   });
   app.on('window-all-closed', () => { /* トレイ常駐 */ });

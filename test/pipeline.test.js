@@ -17,11 +17,13 @@ const { enrichActionBlocks } = require('../src/actions');
 const mtype = require('../src/meetingType');
 const { STANDUP_SEGMENTS, STANDUP_SUMMARY_MD, STANDUP_UNGROUNDED } = require('./fixtures');
 
-// runSummary と同じ順序で実行する
+// runSummary と同じ順序で実行する。
+// 担当・期限の抽出が先。出典の突き合わせは「（担当: ○○ / 期限: ○○）」を
+// 落とした本文に対して行う（書式が残るとその語がクエリに混ざって一致がぶれる）。
 function runPipeline(md, segments, baseDate) {
   const blocks = markdownToBlocks(md);
-  const citeStat = attachCitations(blocks, segments);
   const actionStat = enrichActionBlocks(blocks, baseDate);
+  const citeStat = attachCitations(blocks, segments);
   return { blocks, citeStat, actionStat };
 }
 

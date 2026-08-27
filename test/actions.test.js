@@ -57,6 +57,38 @@ test('週末・月末', () => {
   assert.strictEqual(due('来月初'), '2026-11-01');
 });
 
+test('月を明示した月末は、その月の末日になる', () => {
+  // 「9月末」を『基準日の月の末日』に丸めない
+  assert.strictEqual(due('12月末'), '2026-12-31');
+  assert.strictEqual(due('10月末'), '2026-10-31');
+  // 年が無く基準日より前なら翌年（8/30 と同じ扱い）
+  assert.strictEqual(due('9月末'), '2027-09-30');
+});
+
+test('月をまたぐ日付指定で日が捨てられない', () => {
+  assert.strictEqual(due('来月10日'), '2026-11-10');
+  assert.strictEqual(due('今月20日'), '2026-10-20');
+  assert.strictEqual(due('再来月1日'), '2026-12-01');
+});
+
+test('「N日以内」を月内日付と誤読しない', () => {
+  assert.strictEqual(due('3日以内'), '2026-10-08');
+  assert.strictEqual(due('7日以内'), '2026-10-12');
+});
+
+test('「今週◯曜」は当週を指す（基準日と同じ曜日でも翌週に飛ばない）', () => {
+  // 基準日は月曜
+  assert.strictEqual(due('今週月曜'), '2026-10-05');
+  assert.strictEqual(due('今週水曜'), '2026-10-07');
+  // 「今週」が付かなければ従来どおり翌週
+  assert.strictEqual(due('月曜'), '2026-10-12');
+});
+
+test('「来週末まで」が今週の金曜にならない', () => {
+  assert.strictEqual(due('来週末まで'), '2026-10-16');
+  assert.strictEqual(due('今週末まで'), '2026-10-09');
+});
+
 test('曖昧な表現は実日付にせず空で返す（推測で誤った期限を入れない）', () => {
   for (const s of ['9月上旬', '来月中旬', '今月下旬']) {
     const r = parseDue(s, BASE);
@@ -135,6 +167,29 @@ test('担当も期限も書かれていなければ空のまま（埋めない�
   assert.strictEqual(r.dueRaw, '');
   assert.strictEqual(r.due, '');
   assert.strictEqual(r.text, '残不具合2件を修正する');
+});
+
+test('書式の括弧が行末に無くても、値が行末まで飲み込まれない', () => {
+  const r = parseAction('（担当: 山田 / 期限: 今月末）を反映する', BASE);
+  assert.strictEqual(r.assignee, '山田');
+  assert.strictEqual(r.dueRaw, '今月末');
+  assert.strictEqual(r.due, '2026-10-31');
+  assert.strictEqual(r.text, 'を反映する', '本文が消えている');
+});
+
+test('期限らしき語が「まで」を伴わなければ期限にしない', () => {
+  // 「月末処理」「先月末の請求書」に期限を付けない（誤った期限より空の方がよい）
+  for (const t of ['月末処理の手順を文書化する', '先月末の請求書を確認する', '週末の当番表を作る']) {
+    const r = parseAction(t, BASE);
+    assert.strictEqual(r.due, '', `${t} に期限が付いた: ${r.dueRaw}`);
+    assert.strictEqual(r.text, t, '本文が変わった');
+  }
+});
+
+test('自然文の「9月末までに」で月の指定が落ちない', () => {
+  const r = parseAction('9月末までに棚卸を終える', BASE);
+  assert.strictEqual(r.dueRaw, '9月末');
+  assert.strictEqual(r.due, '2027-09-30');
 });
 
 test('本文中の括弧を書式と誤認しない', () => {

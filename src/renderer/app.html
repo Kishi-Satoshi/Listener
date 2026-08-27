@@ -180,6 +180,9 @@
   .atag.due.over { background: rgba(208,69,60,.16); color: var(--danger); }
   .atag.add { background: transparent; color: var(--faint); border: 1px dashed rgba(56,60,70,.28); }
   .atag:hover { filter: brightness(.95); }
+  .atag-edit { font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 5px;
+    width: 132px; border: 1px solid rgba(91,110,225,.5); background: #fff; color: var(--ink);
+    font-family: inherit; box-shadow: 0 0 0 3px rgba(91,110,225,.16); }
 
   /* アクション横断ビュー */
   .actrow { display: flex; align-items: flex-start; gap: 9px; padding: 9px 12px;
@@ -784,6 +787,41 @@
     setPane(pane);
   }
 
+  // チップをその場で編集する。
+  // Electron の window.prompt は呼ぶと例外になるため使えない
+  // （contextIsolation 有効時も含め、常に throw する）。
+  // 入力欄に差し替える方式なら、この画面の中で完結し、依存も増えない。
+  function editTag(btn, current, placeholder, commit) {
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.className = 'atag-edit';
+    inp.value = current || '';
+    inp.placeholder = placeholder;
+    btn.replaceWith(inp);
+    inp.focus(); inp.select();
+
+    let finished = false;
+    const finish = async (save) => {
+      if (finished) return;
+      finished = true;
+      const v = inp.value.trim();
+      inp.replaceWith(btn);
+      if (!save || v === (current || '')) return;
+      try {
+        await commit(v);
+        await openPage(curId);
+        refreshList();
+      } catch (e) {
+        toast(`変更を保存できませんでした: ${e && e.message ? e.message : e}`);
+      }
+    };
+    inp.onkeydown = (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); finish(true); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); finish(false); }
+    };
+    inp.onblur = () => finish(true);
+  }
+
   function renderBlocks() {
     const box = $('pNote'); box.textContent = '';
     if (curPage.summaryError) {
@@ -850,23 +888,15 @@
         who.className = 'atag ' + (b.assignee ? 'who' : 'add');
         who.textContent = b.assignee || '＋担当';
         who.title = '担当者を設定';
-        who.onclick = async () => {
-          const v = prompt('担当者（空欄で解除）', b.assignee || '');
-          if (v === null) return;
-          await window.koeApp.blockSetAction(curId, b.id, v, undefined);
-          await openPage(curId); refreshList();
-        };
+        who.onclick = () => editTag(who, b.assignee, '担当者（空欄で解除）', (v) =>
+          window.koeApp.blockSetAction(curId, b.id, v, undefined));
         const di = dueInfo(b.due, b.dueApprox);
         const due = document.createElement('button');
         due.className = 'atag ' + (di ? `due ${di.cls}` : b.dueRaw ? 'due' : 'add');
         due.textContent = di ? `${di.label}・${di.note}` : (b.dueRaw || '＋期限');
         due.title = b.dueRaw ? `元の表記: ${b.dueRaw}` : '期限を設定（「来週金曜」「8/30」などで入力できます）';
-        due.onclick = async () => {
-          const v = prompt('期限（「来週金曜」「8/30」「今月末」など。空欄で解除）', b.dueRaw || '');
-          if (v === null) return;
-          await window.koeApp.blockSetAction(curId, b.id, undefined, v);
-          await openPage(curId); refreshList();
-        };
+        due.onclick = () => editTag(due, b.dueRaw, '「来週金曜」「8/30」など（空欄で解除）', (v) =>
+          window.koeApp.blockSetAction(curId, b.id, undefined, v));
         meta.append(who, due);
         el.appendChild(meta);
       }
@@ -1226,10 +1256,20 @@
 
   function showUpdate(r) {
     pendingUpdate = r;
+    if (r.notes) { $('updNotes').style.display = ''; $('updNotes').textContent = r.notes; }
+    // インストーラー版はこの方法では更新できない。押せないボタンを出すと
+    // 「押したらエラーが出た」になるので、最初から出さず案内だけ表示する。
+    if (r.applyable === false) {
+      $('applyUpdBtn').style.display = 'none';
+      $('updMsg').textContent = `新しいバージョン ${r.version} があります。`
+        + 'インストーラー版のため、新しいインストーラーを実行して更新してください。';
+      $('updMsg').className = 'save-msg';
+      toast(`アップデート ${r.version} が公開されています（設定タブ）`);
+      return;
+    }
     $('applyUpdBtn').style.display = '';
     $('updMsg').textContent = `新しいバージョン ${r.version} があります（${Math.max(1, Math.round((r.size||0)/1024))} KB）`;
     $('updMsg').className = 'save-msg ok';
-    if (r.notes) { $('updNotes').style.display = ''; $('updNotes').textContent = r.notes; }
     toast(`アップデート ${r.version} が利用できます（設定タブ）`);
   }
 
@@ -1247,9 +1287,16 @@
     if (!confirm(`バージョン ${pendingUpdate.version} に更新して再起動します。\n記録中の議事録がある場合は先に終了してください。\n\n続行しますか？`)) return;
     const b = $('applyUpdBtn'); b.disabled = true;
     const m = $('updMsg'); m.className = 'save-msg'; m.textContent = '更新中…';
-    const r = await window.koeApp.updateApply(pendingUpdate.url);
-    if (!r.ok) {
-      m.textContent = `✗ ${r.error}`; m.className = 'save-msg ng'; b.disabled = false; return;
+    // 例外で抜けるとボタンが押せないまま残るので、必ず戻す
+    let r;
+    try {
+      r = await window.koeApp.updateApply(pendingUpdate.url);
+    } catch (e) {
+      r = { ok: false, error: (e && e.message) ? e.message : String(e) };
+    }
+    if (!r || !r.ok) {
+      m.textContent = `✗ ${(r && r.error) || '更新に失敗しました'}`;
+      m.className = 'save-msg ng'; b.disabled = false; return;
     }
     m.textContent = '✓ 適用しました。再起動します…'; m.className = 'save-msg ok';
     setTimeout(() => window.koeApp.restart(), 900);

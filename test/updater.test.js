@@ -170,6 +170,57 @@ test('apply() が src を差し替え、失敗時は元に戻す', { skip: !CAN_
   '更新に失敗したのに既存の src/ が壊れた（アプリが起動しなくなる）');
 });
 
+test('BOM付きの package.json でもバージョンが更新される', { skip: !CAN_PACK && 'zip コマンドが無い' }, async (t) => {
+  // Windows PowerShell 5.1 の Set-Content -Encoding UTF8 は BOM を付ける。
+  // 素の JSON.parse は BOM で失敗するため、更新しても版が上がらなくなる。
+  const { packDir } = require('./helpers/pack');
+  const stage = path.join(work, 'bom-stage');
+  fs.rmSync(stage, { recursive: true, force: true });
+  fs.mkdirSync(path.join(stage, 'src', 'renderer'), { recursive: true });
+  // updater は 1000 バイト未満のダウンロードを不完全とみなすので、
+  // 圧縮で潰れない中身にしておく
+  const filler = () => require('node:crypto').randomBytes(1200).toString('hex');
+  for (const f of ['main.js', 'preload.js']) {
+    fs.writeFileSync(path.join(stage, 'src', f), `// ${f} 新版\n// ${filler()}`);
+  }
+  fs.writeFileSync(path.join(stage, 'src', 'renderer', 'app.html'), `<!doctype html>\n<!-- ${filler()} -->`);
+  fs.writeFileSync(path.join(stage, 'package.json'),
+    `﻿${JSON.stringify({ name: 'listener', version: '0.9.9' }, null, 2)}`, 'utf8');
+  const zip = packDir(stage, path.join(work, 'bom.zip'));
+  const bytes = fs.readFileSync(zip);
+
+  const server = http.createServer((req, res) => { res.writeHead(200); res.end(bytes); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => server.close());
+
+  const appRoot = path.join(work, 'app-bom');
+  fs.mkdirSync(path.join(appRoot, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(appRoot, 'src', 'main.js'), '// 旧');
+  fs.writeFileSync(path.join(appRoot, 'package.json'),
+    JSON.stringify({ name: 'listener', version: '0.7.0' }, null, 2), 'utf8');
+
+  const r = await updater.apply(`http://127.0.0.1:${server.address().port}/a.zip`, appRoot, work, () => {});
+  assert.strictEqual(r.ok, true, r.error);
+  const pkg = JSON.parse(fs.readFileSync(path.join(appRoot, 'package.json'), 'utf8'));
+  assert.strictEqual(pkg.version, '0.9.9', 'BOMのせいでバージョンが更新されなかった');
+});
+
+test('apply() は一時フォルダを作れなくても例外を投げず {ok:false} を返す', async () => {
+  // 例外で抜けると画面側は「更新中…」のままボタンが押せなくなる
+  const prev = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
+  const bogus = path.join(work, 'no-such-dir', 'nested');
+  process.env.TMPDIR = bogus; process.env.TMP = bogus; process.env.TEMP = bogus;
+  try {
+    const r = await updater.apply('http://127.0.0.1:1/x.zip', path.join(work, 'app4'), work, () => {});
+    assert.strictEqual(r.ok, false);
+    assert.ok(typeof r.error === 'string' && r.error.length > 0);
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
 test('apply() は落とせないときも既存の src を壊さない', async () => {
   const appRoot = path.join(work, 'app3');
   fs.mkdirSync(path.join(appRoot, 'src'), { recursive: true });

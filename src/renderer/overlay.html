@@ -339,8 +339,11 @@
       }
       releaseStream();
     };
+    // 上限時間で打ち切るときも通常の停止と同じ扱いにする。
+    // recorder を直接止めると表示が「聞き取り中…」のまま変換に入り、
+    // 話し続けてよいのか分からない見た目になる。
     autoStopId = setTimeout(() => {
-      if (recorder && recorder.state === 'recording') recorder.stop();
+      if (recorder && recorder.state === 'recording') stop();
     }, DICTATION_MAX_MS);
     recorder.start(250);
   }
@@ -352,15 +355,19 @@
     recorder = newRecorder();
     recorder.onstop = async () => {
       const durationMs = Date.now() - segStart;
-      const isFinal = stopping || cancelled;
       if (cancelled) { cleanup(); return; }
       const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+      let wav = null;
       try {
-        const wav = await blobToWav16k(blob);
-        window.koeOverlay.sendSegment(wav, durationMs, isFinal);
-      } catch (e) {
-        if (isFinal) window.koeOverlay.sendSegment(new Uint8Array(0), durationMs, true);
-      }
+        wav = await blobToWav16k(blob);
+      } catch (e) { wav = null; }
+      // 変換の途中で「終了」「破棄」が押されていることがある。
+      // 区切りの直前に決めた値のままだと、この区間を最後と扱えず次の録音が
+      // 始まってしまい、マイクが開いたまま残る。変換後にもう一度見る。
+      if (cancelled) { cleanup(); return; }
+      const isFinal = stopping;
+      if (wav) window.koeOverlay.sendSegment(wav, durationMs, isFinal);
+      else if (isFinal) window.koeOverlay.sendSegment(new Uint8Array(0), durationMs, true);
       if (!isFinal) {
         startMeetingSegment(); // 次のセグメントへ
       } else {

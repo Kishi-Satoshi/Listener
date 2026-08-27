@@ -127,15 +127,16 @@ if (Test-Path $modelPath) {
     $len = (Get-Item $modelPath).Length
     if ($len -lt $minBytes) {
         $lenMB = [math]::Round($len / 1MB)
-        Write-Host "[2/2] 既存のモデルが不完全です（$lenMB MB / 期待 $minMB MB以上）。再ダウンロードします。" -ForegroundColor Yellow
-        Remove-Item $modelPath -Force
+        # ここで消すと curl.exe -C - の再開元が無くなり、毎回先頭から落とし直しになる。
+        # 社内回線は115〜122MB付近で切れる実績があるため、消さずに続きから取る。
+        Write-Host "[2/2] 既存のモデルが不完全です（$lenMB MB / 期待 $minMB MB以上）。続きから再開します。" -ForegroundColor Yellow
     }
     else {
         Write-Host "[2/2] モデルは既に存在します: $modelFile" -ForegroundColor Yellow
     }
 }
 
-if (-not (Test-Path $modelPath)) {
+if (-not (Test-Path $modelPath) -or ((Get-Item $modelPath).Length -lt $minBytes)) {
     Write-Host "[2/2] モデルをダウンロード中: $modelFile （数百MB・切断されても自動で再開します）..." -ForegroundColor Cyan
     $ok = Get-BigFile -Url $modelUrl -Out $modelPath -MinBytes $minBytes
     if (-not $ok) {
@@ -177,7 +178,7 @@ else {
 # ---------------------------------------------------------------------
 Write-Host ""
 Write-Host "========================= セットアップ完了 =========================" -ForegroundColor Green
-Write-Host "Listener の [設定] -> [ローカル（whisper.cpp）] に以下を貼り付けてください。"
+Write-Host "Listener の [設定] -> [文字起こしエンジン（whisper.cpp・オフライン）] に以下を貼り付けてください。"
 Write-Host ""
 Write-Host ("  whisper-server.exe : " + $server.FullName) -ForegroundColor White
 Write-Host ("  モデルファイル     : " + $modelPath) -ForegroundColor White
@@ -186,6 +187,6 @@ if (Test-Path $vadPath) {
     Write-Host "  （VADモデルは自動検出されるため、設定画面への入力は不要です）" -ForegroundColor DarkGray
 }
 Write-Host ""
-Write-Host "「エンジン接続テスト」で OK が出れば、以後は完全オフラインで使えます。"
+Write-Host "「起動テスト」で OK が出れば、以後は完全オフラインで使えます。"
 Write-Host "※ 起動時にエラーが出る場合は Microsoft Visual C++ 再頒布可能パッケージ"
 Write-Host "   (https://aka.ms/vs/17/release/vc_redist.x64.exe) をインストールしてください。"

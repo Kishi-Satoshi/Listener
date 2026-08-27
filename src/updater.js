@@ -129,13 +129,17 @@ function rmrf(p) {
  * 失敗時はバックアップから自動で復旧する。
  */
 async function apply(url, appRoot, userDataPath, onProgress) {
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'listener-up-'));
-  const zip = path.join(work, 'update.zip');
-  const ext = path.join(work, 'extracted');
+  // 一時フォルダの作成も try の中で行う。ここで投げると呼び出し側は
+  // { ok:false } ではなく例外を受け取り、画面のボタンが押せないまま残る。
+  let work = '';
   const srcDir = path.join(appRoot, 'src');
   const backup = path.join(appRoot, `src.backup-${Date.now()}`);
 
   try {
+    work = fs.mkdtempSync(path.join(os.tmpdir(), 'listener-up-'));
+    const zip = path.join(work, 'update.zip');
+    const ext = path.join(work, 'extracted');
+
     if (onProgress) onProgress('更新をダウンロードしています…');
     const bytes = await download(url, zip);
     log(userDataPath, `downloaded ${bytes} bytes`);
@@ -161,9 +165,17 @@ async function apply(url, appRoot, userDataPath, onProgress) {
     try {
       fs.cpSync(newSrc, srcDir, { recursive: true });
     } catch (e) {
-      // 失敗したら元に戻す
-      rmrf(srcDir);
-      if (fs.existsSync(backup)) fs.renameSync(backup, srcDir);
+      // 失敗したら元に戻す。ここでの復旧に失敗すると src/ が無いまま残り、
+      // アプリが起動しなくなる。復旧処理自体も必ず最後までやり切る。
+      try {
+        if (fs.existsSync(srcDir)) fs.renameSync(srcDir, `${srcDir}.failed-${Date.now()}`);
+      } catch (_) { rmrf(srcDir); }
+      try {
+        if (!fs.existsSync(srcDir) && fs.existsSync(backup)) fs.renameSync(backup, srcDir);
+      } catch (e2) {
+        log(userDataPath, `rollback failed: ${e2.message}`);
+        throw new Error(`更新に失敗し、元に戻すこともできませんでした。${path.basename(backup)} を src にリネームしてください。`);
+      }
       throw e;
     }
 
@@ -171,13 +183,20 @@ async function apply(url, appRoot, userDataPath, onProgress) {
     const newPkg = path.join(path.dirname(newSrc), 'package.json');
     if (fs.existsSync(newPkg)) {
       try {
-        const cur = JSON.parse(fs.readFileSync(path.join(appRoot, 'package.json'), 'utf8'));
-        const nxt = JSON.parse(fs.readFileSync(newPkg, 'utf8'));
+        // Windows PowerShell 5.1 の Set-Content -Encoding UTF8 は BOM を付ける。
+        // BOM が残ったままだと JSON.parse が投げ、version が永久に上がらない。
+        const readJson = (f) => JSON.parse(fs.readFileSync(f, 'utf8').replace(/^\uFEFF/, ''));
+        const cur = readJson(path.join(appRoot, 'package.json'));
+        const nxt = readJson(newPkg);
         if (nxt.version) {
           cur.version = nxt.version;
           fs.writeFileSync(path.join(appRoot, 'package.json'), JSON.stringify(cur, null, 2), 'utf8');
         }
-      } catch (_) { /* version 更新は必須ではない */ }
+      } catch (e) {
+        // version の更新は必須ではないが、黙って落とすと「更新しても版が上がらない」
+        // という分かりにくい状態になるため記録は残す
+        log(userDataPath, `package.json version update skipped: ${e.message}`);
+      }
     }
 
     // 直近1つだけバックアップを残し、古いものは掃除する
@@ -186,11 +205,11 @@ async function apply(url, appRoot, userDataPath, onProgress) {
     }
 
     log(userDataPath, `applied. backup=${path.basename(backup)}`);
-    rmrf(work);
+    if (work) rmrf(work);
     return { ok: true, backup: path.basename(backup) };
   } catch (e) {
     log(userDataPath, `apply failed: ${e.message}`);
-    rmrf(work);
+    if (work) rmrf(work);
     return { ok: false, error: e.message };
   }
 }
