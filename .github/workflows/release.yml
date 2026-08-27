@@ -1,0 +1,76 @@
+# タグ v* を push するとリリースを作る。
+#
+# 添付するのは src/ と package.json だけを固めた軽量zip（make-release.ps1 と同じ構成）。
+# インストーラー丸ごと（80MB超）だと、大容量ダウンロードが切れる回線で
+# 更新のたびに失敗しかねないため、更新の配布はこのzipで行う。
+#
+# リリース本文には注釈付きタグのメッセージをそのまま使う。
+# この本文はアプリの [設定] -> [アップデート] にそのまま表示される。
+#
+#   git tag -a v0.8.1 -m "変更点をここに書く"
+#   git push origin v0.8.1
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # リリースの作成に必要
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # タグの注釈を読むため、履歴ごと取得する
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # 追加のnpm依存は無いので install は不要（テストは Node 同梱のランナー）
+      - name: テスト
+        run: npm test
+
+      - name: タグと package.json のバージョンが一致するか
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          echo "tag=$TAG package.json=$PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::タグ ($TAG) と package.json ($PKG) のバージョンが一致しません" >&2
+            exit 1
+          fi
+
+      - name: 配布zipを作る
+        run: |
+          VER="$(node -p "require('./package.json').version")"
+          rm -rf release
+          mkdir -p release/_stage
+          cp -a src release/_stage/src
+          cp package.json release/_stage/package.json
+          (cd release/_stage && zip -q -r -X "../listener-src-${VER}.zip" src package.json)
+          rm -rf release/_stage
+          unzip -l "release/listener-src-${VER}.zip"
+
+      - name: リリースを公開
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER="$(node -p "require('./package.json').version")"
+          # 注釈付きタグのメッセージをリリース本文にする。
+          # 軽量タグだった場合はコミットメッセージが入るので、その場合は素っ気ない既定文にする。
+          NOTES="$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")"
+          if [ -z "$(printf '%s' "$NOTES" | tr -d '[:space:]')" ]; then
+            NOTES="Listener ${GITHUB_REF_NAME}"
+          fi
+          printf '%s\n' "$NOTES" > "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --latest \
+            "release/listener-src-${VER}.zip"

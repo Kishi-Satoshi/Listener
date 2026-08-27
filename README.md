@@ -127,13 +127,27 @@ data/
 インストーラー丸ごと（80MB超）だと、大容量ダウンロードが切れる回線で
 更新のたびに失敗しかねないためです。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\make-release.ps1 -Version 0.8.0
+### リリース手順
+
+`package.json` の `version` を上げてコミットし、注釈付きタグを push します。
+`.github/workflows/release.yml` がテストを回し、zipを作り、Releaseを公開します。
+
+```bash
+git tag -a v0.8.1 -m "変更点をここに書く"
+git push origin v0.8.1
 ```
 
-`release\listener-src-<版>.zip` ができるので、GitHub の Releases で
-タグ `v<版>` の Release を作り、このzipを添付して Publish します。
+タグのメッセージがそのままリリース本文になり、アプリの
+[設定] → [アップデート] に表示されます。
+タグと `package.json` のバージョンが食い違うとワークフローが止まります。
+
 各PCの Listener が起動時、または [設定] → [アップデート] → [更新を確認] で検出します。
+
+手元でzipだけ作りたい場合（Releaseは手動で作る）:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\make-release.ps1 -Version 0.8.1
+```
 
 適用前に現行の `src/` を `src.backup-*` として退避するので、
 展開に失敗しても起動できなくなることはありません（1世代だけ残します）。
