@@ -1,0 +1,1283 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<title>Listener</title>
+<style>
+  :root {
+    --ink: #1b1e25;
+    --muted: rgba(56, 60, 70, 0.64);
+    --faint: rgba(56, 60, 70, 0.40);
+    --accent: #5b6ee1;
+    --accent-deep: #4a5cd0;
+    --rec: #e5484d;
+    --danger: #d0453c;
+    --green: #2f9e63;
+    --glass: rgba(255, 255, 255, 0.55);
+    --glass-soft: rgba(255, 255, 255, 0.40);
+    --glass-strong: rgba(255, 255, 255, 0.76);
+    --gline: rgba(255, 255, 255, 0.70);
+    --gline-dark: rgba(27, 30, 37, 0.08);
+    --shadow: 0 8px 32px rgba(44, 62, 112, 0.13);
+    --shadow-soft: 0 4px 16px rgba(44, 62, 112, 0.09);
+    --r-lg: 20px;
+    --r-md: 12px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    color: var(--ink); background: #e9edf5;
+    font-family: "Yu Gothic UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+    font-size: 14px; display: flex; flex-direction: column; overflow: hidden;
+  }
+  .bg { position: fixed; inset: 0; z-index: -1; overflow: hidden;
+    background: linear-gradient(165deg, #eef2fa 0%, #e8edf7 45%, #f4efe9 100%); }
+  .blob { position: absolute; border-radius: 50%; filter: blur(80px); }
+  .b1 { width: 560px; height: 560px; left: -160px; top: -180px; background: rgba(168,199,250,.60); }
+  .b2 { width: 480px; height: 480px; right: -140px; top: 40px; background: rgba(213,187,248,.55); }
+  .b3 { width: 560px; height: 440px; left: 28%; bottom: -240px; background: rgba(255,214,187,.60); }
+  .b4 { width: 320px; height: 320px; right: 22%; bottom: -100px; background: rgba(188,235,214,.50); }
+
+  /* ---------- ヘッダー ---------- */
+  header { display: flex; align-items: center; gap: 20px; padding: 16px 24px 8px; flex: none; }
+  .wordmark { font-family: Georgia, "Yu Mincho", serif; font-size: 21px; letter-spacing: .02em; }
+  nav { margin-left: auto; display: flex; gap: 2px; padding: 4px;
+    background: var(--glass-soft); border: 1px solid var(--gline); border-radius: 999px;
+    backdrop-filter: blur(20px) saturate(150%); -webkit-backdrop-filter: blur(20px) saturate(150%);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.65), var(--shadow-soft); }
+  nav button { background: none; border: none; color: var(--muted); font: inherit;
+    padding: 7px 16px; cursor: pointer; border-radius: 999px; }
+  nav button.active { background: rgba(255,255,255,.92); color: var(--ink); font-weight: 600;
+    box-shadow: 0 2px 10px rgba(44,62,112,.18), inset 0 1px 0 #fff; }
+  nav button:hover { color: var(--ink); }
+
+  main { flex: 1; min-height: 0; padding: 8px 24px 20px; }
+  .tab { display: none; height: 100%; }
+  .tab.active { display: block; }
+
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(27,30,37,.16); border-radius: 5px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(27,30,37,.30); }
+
+  /* ---------- 部品 ---------- */
+  button.action { background: linear-gradient(180deg, #7b8bef 0%, #5261dd 100%); color: #fff;
+    border: none; font: inherit; font-weight: 600; padding: 9px 18px; border-radius: 999px; cursor: pointer;
+    white-space: nowrap; flex: none;
+    box-shadow: 0 6px 18px rgba(82,97,221,.35), inset 0 1px 0 rgba(255,255,255,.4); }
+  button.action:hover { box-shadow: 0 8px 22px rgba(82,97,221,.45), inset 0 1px 0 rgba(255,255,255,.4); }
+  button.action:active { transform: scale(.98); }
+  button.action:disabled { opacity: .5; cursor: default; box-shadow: none; }
+  button.ghost { background: rgba(255,255,255,.5); border: 1px solid var(--gline); color: #3c414c;
+    font: inherit; padding: 7px 14px; border-radius: 999px; cursor: pointer; white-space: nowrap; flex: none;
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.6), var(--shadow-soft); }
+  button.ghost:hover { background: rgba(255,255,255,.82); color: var(--ink); }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  input[type="text"], select, textarea {
+    background: rgba(255,255,255,.62); border: 1px solid rgba(255,255,255,.78);
+    color: var(--ink); font: inherit; padding: 8px 12px; border-radius: var(--r-md); width: 100%;
+    box-shadow: inset 0 1px 2px rgba(27,30,37,.06); }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(91,110,225,.5);
+    background: rgba(255,255,255,.9); box-shadow: 0 0 0 3px rgba(91,110,225,.16); }
+  ::placeholder { color: rgba(56,60,70,.4); }
+
+  .card { background: var(--glass); backdrop-filter: blur(28px) saturate(160%);
+    -webkit-backdrop-filter: blur(28px) saturate(160%); border: 1px solid var(--gline);
+    border-radius: var(--r-lg); padding: 20px; margin-bottom: 14px;
+    box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,.75); }
+  .card h2 { font-size: 12px; font-weight: 700; color: var(--muted); letter-spacing: .1em; margin-bottom: 14px; }
+  .field { margin-bottom: 13px; }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+  .field .row { display: flex; gap: 8px; align-items: center; }
+  .field .row > input, .field .row > select { flex: 1; min-width: 0; }
+  .field .desc { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .check { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 11px; cursor: pointer; }
+  .check input { width: 16px; height: 16px; margin-top: 2px; accent-color: var(--accent); }
+  .check .d { font-size: 11px; color: var(--muted); }
+  .save-msg { font-size: 12px; color: var(--muted); }
+  .save-msg.ok { color: var(--green); }
+  .save-msg.ng { color: var(--danger); }
+  .empty { text-align: center; color: var(--muted); padding: 48px 20px; line-height: 1.9; }
+  .empty .big { font-size: 15px; color: var(--ink); margin-bottom: 6px; }
+  kbd { background: rgba(255,255,255,.72); border: 1px solid rgba(255,255,255,.9);
+    border-bottom: 2px solid rgba(27,30,37,.15); border-radius: 6px; padding: 2px 7px; font-size: 12px; }
+
+  /* ================= 議事録: 2ペイン ================= */
+  .notes { display: flex; gap: 14px; height: 100%; }
+  .side { width: 300px; flex: none; display: flex; flex-direction: column; gap: 10px; }
+  .side .tools { display: flex; gap: 6px; }
+  .side .filters { display: flex; gap: 5px; }
+  .chip { background: rgba(255,255,255,.5); border: 1px solid var(--gline); color: var(--muted);
+    font: inherit; font-size: 11px; padding: 4px 11px; border-radius: 999px; cursor: pointer; }
+  .chip.on { background: rgba(255,255,255,.95); color: var(--ink); font-weight: 600;
+    box-shadow: 0 2px 8px rgba(44,62,112,.16); }
+  .plist { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; padding-right: 2px; }
+  .pitem { background: var(--glass-strong); border: 1px solid var(--gline); border-radius: 14px;
+    padding: 11px 13px; cursor: pointer; box-shadow: var(--shadow-soft);
+    backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); }
+  .pitem:hover { background: #fff; }
+  .pitem.sel { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(91,110,225,.25), var(--shadow-soft); }
+  .pitem .t { font-weight: 600; font-size: 13px; line-height: 1.45;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .pitem .m { font-size: 11px; color: var(--muted); margin-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .pitem .badge { color: var(--accent); font-weight: 600; }
+  .pitem .snip { font-size: 11px; color: var(--faint); margin-top: 4px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+  /* ---------- ページ本体 ---------- */
+  .page { flex: 1; min-width: 0; display: flex; flex-direction: column;
+    background: var(--glass); backdrop-filter: blur(28px) saturate(160%);
+    -webkit-backdrop-filter: blur(28px) saturate(160%); border: 1px solid var(--gline);
+    border-radius: var(--r-lg); box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,.75); overflow: hidden; }
+  .phead { padding: 18px 24px 12px; border-bottom: 1px solid var(--gline-dark); flex: none; }
+  .ptitle { font-size: 21px; font-weight: 700; line-height: 1.4; outline: none; border-radius: 6px; padding: 2px 4px; }
+  .ptitle:focus { background: rgba(255,255,255,.8); box-shadow: 0 0 0 2px rgba(91,110,225,.3); }
+  .pprops { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .pacts { display: flex; gap: 7px; margin-top: 12px; flex-wrap: wrap; }
+  .pacts button { font-size: 12px; padding: 6px 13px; }
+  .ptabs { display: flex; gap: 4px; padding: 10px 24px 0; flex: none; }
+  .pbody { flex: 1; overflow-y: auto; padding: 14px 24px 24px; }
+  .pane { display: none; }
+  .pane.active { display: block; }
+  .note { font-size: 12px; color: var(--danger); margin-bottom: 10px;
+    background: rgba(208,69,60,.08); border-radius: 10px; padding: 9px 12px; }
+  .note.info { color: var(--accent); background: rgba(91,110,225,.09); }
+
+  /* ---------- ブロック ---------- */
+  .blk { display: flex; align-items: flex-start; gap: 8px; padding: 3px 0; position: relative; }
+  .blk .bullet { color: var(--faint); flex: none; line-height: 1.85; user-select: none; }
+  .blk .txt { flex: 1; line-height: 1.85; outline: none; border-radius: 6px; padding: 1px 5px; min-width: 0;
+    word-break: break-word; }
+  .blk .txt:hover { background: rgba(255,255,255,.5); }
+  .blk .txt:focus { background: rgba(255,255,255,.92); box-shadow: 0 0 0 2px rgba(91,110,225,.3); }
+  .blk.heading { margin-top: 18px; }
+  .blk.heading .txt { font-size: 15px; font-weight: 700; letter-spacing: .02em; }
+  .blk.heading .txt::before { content: ''; }
+  .blk.todo input[type=checkbox] { width: 16px; height: 16px; margin-top: 4px; accent-color: var(--accent); flex: none; }
+  .blk.todo.done .txt { color: var(--faint); text-decoration: line-through; }
+  .blk .del { opacity: 0; background: none; border: none; color: var(--faint); cursor: pointer;
+    font-size: 15px; line-height: 1; padding: 4px 6px; flex: none; }
+  .blk:hover .del { opacity: 1; }
+  .blk .del:hover { color: var(--danger); }
+
+  /* 会議タイプ */
+  .typeSel { background: rgba(91,110,225,.11); border: 1px solid rgba(91,110,225,.25);
+    color: var(--accent-deep); font: inherit; font-size: 11px; font-weight: 600;
+    padding: 3px 8px; border-radius: 7px; cursor: pointer; width: auto; box-shadow: none; }
+  .typeSel:focus { background: #fff; }
+  .tbadge { font-size: 10px; font-weight: 700; color: var(--accent-deep);
+    background: rgba(91,110,225,.12); border-radius: 5px; padding: 2px 6px; }
+
+  /* アクションの担当・期限 */
+  .ameta { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: middle; flex-wrap: wrap; }
+  .atag { font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 5px;
+    border: none; font-family: inherit; cursor: pointer; white-space: nowrap; }
+  .atag.who { background: rgba(47,158,99,.14); color: #227a4b; }
+  .atag.due { background: rgba(56,60,70,.10); color: #4a4f5a; }
+  .atag.due.soon { background: rgba(235,140,40,.18); color: #a25c0d; }
+  .atag.due.over { background: rgba(208,69,60,.16); color: var(--danger); }
+  .atag.add { background: transparent; color: var(--faint); border: 1px dashed rgba(56,60,70,.28); }
+  .atag:hover { filter: brightness(.95); }
+
+  /* アクション横断ビュー */
+  .actrow { display: flex; align-items: flex-start; gap: 9px; padding: 9px 12px;
+    background: var(--glass-strong); border: 1px solid var(--gline); border-radius: 12px; margin-bottom: 6px; }
+  .actrow input[type=checkbox] { width: 16px; height: 16px; margin-top: 3px; accent-color: var(--accent); flex: none; }
+  .actrow .body { flex: 1; min-width: 0; }
+  .actrow .src { font-size: 11px; color: var(--faint); margin-top: 3px; cursor: pointer; }
+  .actrow .src:hover { color: var(--accent); text-decoration: underline; }
+  .agroup { font-size: 11px; font-weight: 700; color: var(--muted); letter-spacing: .06em;
+    margin: 14px 0 6px; }
+  .agroup:first-child { margin-top: 0; }
+
+  /* 出典チップ */
+  .cites { display: inline-flex; gap: 3px; margin-left: 6px; vertical-align: middle; }
+  .cite { background: rgba(91,110,225,.13); color: var(--accent-deep); border: none;
+    font: inherit; font-size: 10px; font-weight: 700; line-height: 1;
+    padding: 3px 6px; border-radius: 5px; cursor: pointer; }
+  .cite:hover { background: var(--accent); color: #fff; }
+  .nocite { display: inline-block; margin-left: 6px; font-size: 10px; color: var(--faint);
+    border: 1px dashed rgba(56,60,70,.28); border-radius: 5px; padding: 2px 6px; vertical-align: middle; }
+
+  /* ---------- 文字起こし ---------- */
+  .seg { display: flex; gap: 10px; padding: 5px 6px; border-radius: 8px; line-height: 1.8; }
+  .seg .at { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums;
+    flex: none; padding-top: 3px; min-width: 44px; }
+  .seg.hit { background: rgba(91,110,225,.16); box-shadow: 0 0 0 2px rgba(91,110,225,.3); }
+  .seg.failed { color: var(--danger); }
+
+  /* ---------- 進行中バー ---------- */
+  .live { display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
+    background: rgba(255,255,255,.62); border: 1px solid var(--gline); border-radius: 14px; padding: 11px 14px; }
+  .rec-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent);
+    animation: pulse 1.4s ease-in-out infinite; flex: none; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(91,110,225,.4); } 50% { box-shadow: 0 0 0 7px rgba(91,110,225,0); } }
+  .live .tm { color: var(--muted); font-variant-numeric: tabular-nums; margin-left: auto; }
+  .prog { font-size: 12px; color: var(--accent); margin-bottom: 10px; }
+
+  /* ---------- 音声入力 ---------- */
+  .stats { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+  .stat { flex: 1; min-width: 150px; background: var(--glass); border: 1px solid var(--gline);
+    border-radius: var(--r-lg); padding: 13px 17px; box-shadow: var(--shadow-soft);
+    backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); }
+  .stat .n { font-size: 19px; font-variant-numeric: tabular-nums; }
+  .stat .n small { font-size: 12px; color: var(--muted); margin-left: 2px; }
+  .stat .l { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .toolbar { display: flex; gap: 9px; margin-bottom: 13px; align-items: center; }
+  .toolbar input { flex: 1; }
+  .entry { background: var(--glass-strong); border: 1px solid var(--gline); border-radius: 16px;
+    padding: 13px 16px; margin-bottom: 9px; box-shadow: var(--shadow-soft);
+    backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); }
+  .entry .text { line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+  .entry .meta { margin-top: 7px; display: flex; align-items: center; gap: 13px; font-size: 12px; color: var(--muted); }
+  .entry .meta .sp { flex: 1; }
+  .entry .meta button { background: none; border: none; color: var(--muted); font: inherit; font-size: 12px;
+    cursor: pointer; padding: 2px 4px; }
+  .entry .meta button:hover { color: var(--ink); }
+  .entry .meta button.danger:hover { color: var(--danger); }
+  .scroll { height: 100%; overflow-y: auto; }
+
+  #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(8px);
+    background: rgba(24,27,34,.85); backdrop-filter: blur(16px); color: #fff;
+    padding: 10px 20px; border-radius: 999px; font-size: 13px; opacity: 0; pointer-events: none;
+    transition: opacity .2s, transform .2s; box-shadow: 0 10px 30px rgba(15,20,35,.35); z-index: 99; }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+</head>
+<body>
+  <div class="bg" aria-hidden="true"><span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span><span class="blob b4"></span></div>
+
+  <header>
+    <div class="wordmark">Listener</div>
+    <nav>
+      <button id="tabBtnNotes" class="active">議事録</button>
+      <button id="tabBtnDictation">音声入力</button>
+      <button id="tabBtnSettings">設定</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ================= 議事録 ================= -->
+    <section id="tabNotes" class="tab active">
+      <div class="notes">
+        <aside class="side">
+          <div class="tools">
+            <button class="action" id="mtToggleBtn">● 記録開始</button>
+            <button class="ghost" id="mtDiscardBtn" style="display:none">破棄</button>
+          </div>
+          <input type="text" id="searchBox" placeholder="議事録を検索…" />
+          <div class="filters">
+            <button class="chip on" id="fltAll">すべて</button>
+            <button class="chip" id="fltActions">アクション</button>
+            <button class="chip" id="fltFull">全文検索</button>
+          </div>
+          <div class="plist" id="plist"></div>
+        </aside>
+
+        <div class="page" id="pageWrap">
+          <div class="phead">
+            <div class="ptitle" id="pTitle" contenteditable="true" spellcheck="false"></div>
+            <div class="pprops" id="pProps"></div>
+            <div style="margin-top:8px;display:flex;align-items:center;gap:8px">
+              <span style="font-size:11px;color:var(--muted)">会議タイプ</span>
+              <select class="typeSel" id="pType"></select>
+              <span style="font-size:11px;color:var(--faint)" id="pTypeHint"></span>
+            </div>
+            <div class="pacts" id="pActs"></div>
+          </div>
+          <div class="ptabs">
+            <button class="chip on" id="paneBtnNote">議事録</button>
+            <button class="chip" id="paneBtnScript">文字起こし</button>
+            <button class="chip" id="paneBtnMemo">メモ</button>
+          </div>
+          <div class="pbody" id="pBody">
+            <div id="pProgress" class="prog" style="display:none"></div>
+            <div id="pNote" class="pane active"></div>
+            <div id="pScript" class="pane"></div>
+            <div id="pMemo" class="pane"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 音声入力 ================= -->
+    <section id="tabDictation" class="tab">
+      <div class="scroll">
+        <div class="stats">
+          <div class="stat"><div class="n" id="stToday">—</div><div class="l">今日の入力</div></div>
+          <div class="stat"><div class="n" id="stTotal">—</div><div class="l">累計</div></div>
+          <div class="stat"><div class="n" id="stSaved">—</div><div class="l">タイピング節約時間（推定）</div></div>
+        </div>
+        <div class="toolbar">
+          <button class="action" id="recBtn">● 音声入力</button>
+          <input type="text" id="histSearch" placeholder="履歴を検索…" />
+          <button class="ghost" id="clearBtn">全消去</button>
+        </div>
+        <div id="histList"></div>
+      </div>
+    </section>
+
+    <!-- ================= 設定 ================= -->
+    <section id="tabSettings" class="tab">
+      <div class="scroll">
+        <div class="card">
+          <h2>文字起こしエンジン（whisper.cpp・オフライン）</h2>
+          <div class="field">
+            <label for="localServerExe">whisper-server.exe のパス</label>
+            <div class="row">
+              <input type="text" id="localServerExe" placeholder="…\local-engine\bin\Release\whisper-server.exe" />
+              <button class="ghost" id="pickExeBtn" type="button">参照…</button>
+            </div>
+          </div>
+          <div class="field">
+            <label for="localModelPath">モデルファイル（ggml-*.bin）のパス</label>
+            <div class="row">
+              <input type="text" id="localModelPath" placeholder="…\local-engine\ggml-kotoba-whisper-v2.0-q5_0.bin" />
+              <button class="ghost" id="pickModelBtn" type="button">参照…</button>
+            </div>
+          </div>
+          <div class="field">
+            <div class="row">
+              <div style="flex:1"><label for="localThreads">スレッド数</label><input type="text" id="localThreads" /></div>
+              <div style="flex:1"><label for="localPort">ポート</label><input type="text" id="localPort" /></div>
+            </div>
+          </div>
+          <label class="check">
+            <input type="checkbox" id="useVad" />
+            <span>VAD（無音スキップ）を使う<br />
+              <span class="d">無音を除いてから文字起こしするため高速化し、繰り返し誤認識も減ります。<span id="vadState"></span></span></span>
+          </label>
+          <div class="field">
+            <label for="vadModelPath">VADモデル（空欄なら上のモデルと同じフォルダから自動検出）</label>
+            <div class="row">
+              <input type="text" id="vadModelPath" placeholder="自動検出" />
+              <button class="ghost" id="pickVadBtn" type="button">参照…</button>
+            </div>
+          </div>
+          <label class="check">
+            <input type="checkbox" id="suppressNst" />
+            <span>非発話トークンを抑制する<br /><span class="d">咳・雑音が文字として出るのを抑えます。</span></span>
+          </label>
+          <div class="row" style="display:flex;gap:8px">
+            <button class="ghost" id="testBtn" type="button">起動テスト</button>
+            <span class="desc save-msg" id="testMsg" style="align-self:center"></span>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>要約エンジン（llama.cpp・オフライン）— 議事録の自動要約に使用</h2>
+          <div class="field">
+            <label for="sumServerExe">llama-server.exe のパス</label>
+            <div class="row">
+              <input type="text" id="sumServerExe" placeholder="…\local-engine\llm\bin\llama-server.exe" />
+              <button class="ghost" id="pickSumExeBtn" type="button">参照…</button>
+            </div>
+          </div>
+          <div class="field">
+            <label for="sumModelPath">モデルファイル（*.gguf）のパス</label>
+            <div class="row">
+              <input type="text" id="sumModelPath" placeholder="…\local-engine\llm\Qwen2.5-3B-Instruct-Q4_K_M.gguf" />
+              <button class="ghost" id="pickSumModelBtn" type="button">参照…</button>
+            </div>
+            <div class="desc">初回セットアップ: setup-summarizer.ps1 を実行。未設定でも文字起こしは使えます。</div>
+          </div>
+          <div class="field">
+            <div class="row">
+              <div style="flex:1"><label for="sumThreads">スレッド数</label><input type="text" id="sumThreads" /></div>
+              <div style="flex:1"><label for="sumPort">ポート</label><input type="text" id="sumPort" /></div>
+            </div>
+          </div>
+          <div class="row" style="display:flex;gap:8px">
+            <button class="ghost" id="testSumBtn" type="button">起動テスト</button>
+            <span class="desc save-msg" id="testSumMsg" style="align-self:center"></span>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>動作</h2>
+          <div class="field">
+            <label for="hotkey">音声入力ホットキー（クリックしてキーを押す）</label>
+            <input type="text" id="hotkey" readonly />
+          </div>
+          <div class="field">
+            <label for="meetingHotkey">議事録ホットキー（開始／終了をトグル）</label>
+            <input type="text" id="meetingHotkey" readonly />
+            <div class="desc">※ 左右のAltは区別されません（どちらでも動作）。</div>
+          </div>
+          <div class="field">
+            <label for="segmentSec">議事録の文字起こし間隔（秒）</label>
+            <input type="text" id="segmentSec" />
+            <div class="desc">短いほど早く画面に出ますが、文の切れ目が増えます（既定75秒。最初の1回は20秒）。</div>
+          </div>
+          <div class="field">
+            <label for="pillPos">録音バーの表示位置（表示中はドラッグでも移動できます）</label>
+            <select id="pillPos">
+              <option value="bottom">下・中央（既定）</option>
+              <option value="top">上・中央</option>
+              <option value="left">左・中央</option>
+              <option value="right">右・中央</option>
+              <option value="top-left">左上</option>
+              <option value="top-right">右上</option>
+              <option value="bottom-left">左下</option>
+              <option value="bottom-right">右下</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="micSelect">使用するマイク</label>
+            <div class="row">
+              <select id="micSelect"></select>
+              <button class="ghost" id="micReloadBtn" type="button">更新</button>
+            </div>
+          </div>
+          <div class="field">
+            <label for="language">認識言語</label>
+            <select id="language">
+              <option value="ja">日本語</option><option value="en">英語</option><option value="auto">自動判定</option>
+            </select>
+          </div>
+          <label class="check"><input type="checkbox" id="autoPaste" />
+            <span>文字起こし後、カーソル位置へ自動貼り付け</span></label>
+          <label class="check"><input type="checkbox" id="removeFillers" />
+            <span>フィラー除去（えー、あのー 等）</span></label>
+          <label class="check"><input type="checkbox" id="soundFeedback" />
+            <span>効果音</span></label>
+          <label class="check"><input type="checkbox" id="autoLaunch" />
+            <span>Windowsサインイン時に自動起動<br />
+              <span class="d">インストーラー版でのみ動作します。</span></span></label>
+        </div>
+
+        <div class="card">
+          <h2>ユーザー辞書（認識ヒント）</h2>
+          <div class="field">
+            <textarea id="dictionary" rows="5" placeholder="1行に1語ずつ&#10;自社名&#10;製品名&#10;部署名"></textarea>
+            <div class="desc">固有名詞・社内用語をエンジンへ渡し、認識精度を上げます。</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>アップデート</h2>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <span id="verNow" style="font-size:13px"></span>
+            <button class="ghost" id="chkUpdBtn" type="button">更新を確認</button>
+            <button class="action" id="applyUpdBtn" type="button" style="display:none">更新して再起動</button>
+            <span class="save-msg" id="updMsg"></span>
+          </div>
+          <div id="updNotes" style="display:none;margin-top:12px;font-size:12px;line-height:1.7;
+            white-space:pre-wrap;background:rgba(255,255,255,.5);border-radius:10px;padding:12px;max-height:200px;overflow-y:auto"></div>
+          <div class="desc" style="margin-top:10px">
+            更新はアプリ本体（数百KB）のみを取得します。エンジンやモデル、保存済みの議事録はそのままです。<br />
+            更新前のバージョンは <code>src.backup-*</code> として1世代だけ残ります。
+          </div>
+        </div>
+
+        <div style="display:flex;align-items:center;gap:12px;padding-bottom:20px">
+          <button class="action" id="saveBtn">設定を保存</button>
+          <span class="save-msg" id="saveMsg"></span>
+          <span style="flex:1"></span>
+          <button class="ghost" id="openDataBtn" type="button">データ保存先を開く</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" role="status"></div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  let settings = null;
+  let history = [];
+  let pages = [];
+  let curId = null;
+  let curPage = null;
+  let curSegs = [];
+  let filter = 'all';
+  let mtypes = [];
+  let assigneeFilter = '';
+  let pane = 'note';
+  let mtTimer = null;
+  let mtStartedAt = null;
+
+  // ---------------- タブ ----------------
+  function showTab(n) {
+    for (const t of ['Notes', 'Dictation', 'Settings']) {
+      $('tab' + t).classList.toggle('active', n === t.toLowerCase());
+      $('tabBtn' + t).classList.toggle('active', n === t.toLowerCase());
+    }
+  }
+  $('tabBtnNotes').onclick = () => showTab('notes');
+  $('tabBtnDictation').onclick = () => showTab('dictation');
+  $('tabBtnSettings').onclick = () => showTab('settings');
+
+  let toastT = null;
+  function toast(m) {
+    const e = $('toast'); e.textContent = m; e.classList.add('show');
+    clearTimeout(toastT); toastT = setTimeout(() => e.classList.remove('show'), 2600);
+  }
+
+  // ---------------- 共通整形 ----------------
+  function fmtDur(sec) {
+    const m = Math.floor(sec / 60), s = sec % 60, h = Math.floor(m / 60);
+    return h > 0 ? `${h}時間${m % 60}分` : m > 0 ? `${m}分${s}秒` : `${s}秒`;
+  }
+  function fmtClock(ms) {
+    const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+    return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(x).padStart(2,'0')}` : `${m}:${String(x).padStart(2,'0')}`;
+  }
+  function dueInfo(due, approx) {
+    if (!due) return null;
+    const today = new Date(); today.setHours(0,0,0,0);
+    const d = new Date(due + 'T00:00:00');
+    const days = Math.round((d - today) / 86400000);
+    const label = `${d.getMonth()+1}/${d.getDate()}`;
+    let cls = '', note = '';
+    if (days < 0) { cls = 'over'; note = `${-days}日超過`; }
+    else if (days === 0) { cls = 'soon'; note = '今日'; }
+    else if (days <= 3) { cls = 'soon'; note = `あと${days}日`; }
+    else note = `あと${days}日`;
+    return { label: (approx ? '〜' : '') + label, cls, note, days };
+  }
+
+  function relTime(iso) {
+    const d = new Date(iso), diff = (Date.now() - d.getTime()) / 1000;
+    if (diff < 60) return 'たった今';
+    if (diff < 3600) return `${Math.floor(diff/60)}分前`;
+    if (diff < 86400) return `${Math.floor(diff/3600)}時間前`;
+    return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+  }
+
+  // ================= 議事録: 一覧 =================
+  async function refreshList() {
+    const q = $('searchBox').value.trim();
+    if (filter === 'actions') { await renderActionView(q); return; }
+    if (filter === 'full' && q) pages = await window.koeApp.pagesSearchFull(q);
+    else pages = await window.koeApp.pagesSearch(q);
+    renderList();
+  }
+
+  // 未完了アクションを全議事録から集めて、期限順に表示する
+  async function renderActionView(q) {
+    const box = $('plist'); box.textContent = '';
+    let acts = await window.koeApp.openActions();
+    if (q) acts = acts.filter((x) => x.text.includes(q) || x.pageTitle.includes(q) || x.assignee.includes(q));
+    if (assigneeFilter) acts = acts.filter((x) => x.assignee === assigneeFilter);
+
+    // 担当者での絞り込みチップ
+    const people = await window.koeApp.assigneeList();
+    if (people.length) {
+      const row = document.createElement('div');
+      row.className = 'filters'; row.style.flexWrap = 'wrap'; row.style.marginBottom = '4px';
+      const mkc = (label, val) => {
+        const b = document.createElement('button');
+        b.className = 'chip' + (assigneeFilter === val ? ' on' : '');
+        b.textContent = label;
+        b.onclick = () => { assigneeFilter = assigneeFilter === val ? '' : val; refreshList(); };
+        row.appendChild(b);
+      };
+      mkc('全員', '');
+      for (const p of people.slice(0, 8)) mkc(`${p.name} ${p.count}`, p.name);
+      box.appendChild(row);
+    }
+
+    if (!acts.length) {
+      const d = document.createElement('div'); d.className = 'empty';
+      d.innerHTML = '<div class="big">未完了のアクションはありません</div>議事録の要約から自動で集められます。';
+      box.appendChild(d); return;
+    }
+
+    const groups = { over: [], today: [], week: [], later: [], none: [] };
+    for (const x of acts) {
+      const i = dueInfo(x.due, x.dueApprox);
+      if (!i) groups.none.push(x);
+      else if (i.days < 0) groups.over.push(x);
+      else if (i.days === 0) groups.today.push(x);
+      else if (i.days <= 7) groups.week.push(x);
+      else groups.later.push(x);
+    }
+    const labels = { over: '期限超過', today: '今日', week: '今週中', later: '先の予定', none: '期限なし' };
+    for (const key of ['over','today','week','later','none']) {
+      if (!groups[key].length) continue;
+      const h = document.createElement('div'); h.className = 'agroup';
+      h.textContent = `${labels[key]}（${groups[key].length}）`;
+      if (key === 'over') h.style.color = 'var(--danger)';
+      box.appendChild(h);
+      for (const x of groups[key]) box.appendChild(buildActionRow(x));
+    }
+  }
+
+  function buildActionRow(x) {
+    const el = document.createElement('div'); el.className = 'actrow';
+    const cb = document.createElement('input'); cb.type = 'checkbox';
+    cb.onchange = async () => {
+      await window.koeApp.blockUpdate(x.pageId, x.blockId, { checked: cb.checked });
+      refreshList();
+      if (curId === x.pageId) openPage(curId);
+    };
+    const body = document.createElement('div'); body.className = 'body';
+    const t = document.createElement('div'); t.textContent = x.text; t.style.lineHeight = '1.6';
+    body.appendChild(t);
+    const meta = document.createElement('span'); meta.className = 'ameta';
+    if (x.assignee) { const w = document.createElement('span'); w.className = 'atag who'; w.textContent = x.assignee; meta.appendChild(w); }
+    const di = dueInfo(x.due, x.dueApprox);
+    if (di) { const d = document.createElement('span'); d.className = `atag due ${di.cls}`;
+      d.textContent = `${di.label}・${di.note}`; meta.appendChild(d); }
+    else if (x.dueRaw) { const d = document.createElement('span'); d.className = 'atag due';
+      d.textContent = x.dueRaw; meta.appendChild(d); }
+    if (meta.childNodes.length) body.appendChild(meta);
+    const src = document.createElement('div'); src.className = 'src';
+    src.textContent = `${x.date} ${x.pageTitle}`;
+    src.onclick = () => openPage(x.pageId);
+    body.appendChild(src);
+    el.append(cb, body);
+    return el;
+  }
+
+  function renderList() {
+    const box = $('plist'); box.textContent = '';
+    if (pages.length === 0) {
+      const d = document.createElement('div');
+      d.className = 'empty';
+      d.innerHTML = '<div class="big">議事録はありません</div>「記録開始」で会議を録音すると<br>要約と文字起こしが作られます。';
+      box.appendChild(d); return;
+    }
+    for (const p of pages) {
+      const el = document.createElement('div');
+      el.className = 'pitem' + (p.id === curId ? ' sel' : '');
+      const t = document.createElement('div'); t.className = 't'; t.textContent = p.title;
+      const m = document.createElement('div'); m.className = 'm';
+      const s1 = document.createElement('span'); s1.textContent = `${p.date} ・ ${fmtDur(p.durationSec)}`;
+      m.appendChild(s1);
+      if (p.meetingType && p.meetingType !== 'general') {
+        const tb = document.createElement('span'); tb.className = 'tbadge';
+        const def = mtypes.find((t) => t.key === p.meetingType);
+        tb.textContent = def ? def.label : p.meetingType; m.appendChild(tb);
+      }
+      if (p.openActionCount > 0) {
+        const b = document.createElement('span'); b.className = 'badge';
+        const di = dueInfo(p.nextDue, false);
+        b.textContent = `未完了 ${p.openActionCount}` + (di ? `（最短 ${di.label}）` : '');
+        if (di && di.days < 0) b.style.color = 'var(--danger)';
+        m.appendChild(b);
+      }
+      if (!p.hasSummary) {
+        const b = document.createElement('span'); b.style.color = 'var(--danger)';
+        b.textContent = '要約なし'; m.appendChild(b);
+      }
+      el.append(t, m);
+      if (p.snippet) {
+        const sn = document.createElement('div'); sn.className = 'snip'; sn.textContent = p.snippet;
+        el.appendChild(sn);
+      }
+      el.onclick = () => openPage(p.id);
+      box.appendChild(el);
+    }
+  }
+
+  let searchT = null;
+  $('searchBox').oninput = () => { clearTimeout(searchT); searchT = setTimeout(refreshList, 220); };
+  function setFilter(f) {
+    filter = f;
+    $('fltAll').classList.toggle('on', f === 'all');
+    $('fltActions').classList.toggle('on', f === 'actions');
+    $('fltFull').classList.toggle('on', f === 'full');
+    refreshList();
+  }
+  $('fltAll').onclick = () => setFilter('all');
+  $('fltActions').onclick = () => setFilter('actions');
+  $('fltFull').onclick = () => setFilter('full');
+
+  // ================= 議事録: ページ =================
+  async function openPage(id) {
+    const r = await window.koeApp.pageGet(id);
+    if (!r) { toast('ページが見つかりません'); return; }
+    curId = id; curPage = r.page; curSegs = r.segments;
+    pane = curPage.blocks.length ? 'note' : 'script';
+    renderList(); renderPage();
+  }
+
+  function setPane(p) {
+    pane = p;
+    $('paneBtnNote').classList.toggle('on', p === 'note');
+    $('paneBtnScript').classList.toggle('on', p === 'script');
+    $('paneBtnMemo').classList.toggle('on', p === 'memo');
+    $('pNote').classList.toggle('active', p === 'note');
+    $('pScript').classList.toggle('active', p === 'script');
+    $('pMemo').classList.toggle('active', p === 'memo');
+  }
+  $('paneBtnNote').onclick = () => setPane('note');
+  $('paneBtnScript').onclick = () => setPane('script');
+  $('paneBtnMemo').onclick = () => setPane('memo');
+
+  function renderPage() {
+    if (!curPage) {
+      $('pTitle').textContent = '';
+      $('pProps').textContent = '';
+      $('pActs').textContent = '';
+      $('pNote').innerHTML = '<div class="empty"><div class="big">左の一覧から議事録を選んでください</div>会議を録音すると、要約とアクションアイテムが自動で作られます。</div>';
+      $('pScript').textContent = ''; $('pMemo').textContent = '';
+      setPane('note');
+      return;
+    }
+    $('pTitle').textContent = curPage.title;
+
+    // 会議タイプ
+    const sel = $('pType'); sel.textContent = '';
+    for (const t of mtypes) sel.add(new Option(t.label, t.key));
+    sel.value = curPage.meetingType || 'general';
+    const def = mtypes.find((t) => t.key === sel.value);
+    $('pTypeHint').textContent = (curPage.typeAuto === false ? '手動指定' : '自動判定')
+      + (def ? ` ・ ${def.hint}` : '');
+    sel.onchange = async () => {
+      await window.koeApp.pageSetType(curId, sel.value);
+      curPage.meetingType = sel.value; curPage.typeAuto = false;
+      const d2 = mtypes.find((t) => t.key === sel.value);
+      $('pTypeHint').textContent = `手動指定 ・ ${d2 ? d2.hint : ''}`;
+      toast('会議タイプを変更しました。「要約を再生成」で反映されます');
+      refreshList();
+    };
+
+    const props = $('pProps'); props.textContent = '';
+    const add = (t, color) => { const s = document.createElement('span'); s.textContent = t; if (color) s.style.color = color; props.appendChild(s); };
+    add(`📅 ${new Date(curPage.createdAt).toLocaleString('ja-JP')}`);
+    add(`⏱ ${fmtDur(curPage.durationSec || 0)}`);
+    add(`💬 ${curSegs.length} 区間`);
+    const st = curPage.citeStat;
+    if (st && st.total) add(`🔗 出典 ${st.linked}/${st.total}`, st.linked === st.total ? 'var(--green)' : '');
+    const ast = curPage.actionStat;
+    if (ast && ast.total) add(`✅ アクション ${ast.total}（担当${ast.withAssignee} / 期限${ast.withDue}）`);
+
+    const acts = $('pActs'); acts.textContent = '';
+    const mk = (label, fn, primary) => {
+      const b = document.createElement('button');
+      b.className = primary ? 'action' : 'ghost'; b.textContent = label; b.onclick = fn;
+      acts.appendChild(b); return b;
+    };
+    mk(curPage.blocks.length ? '要約を再生成' : '要約を生成', async (e) => {
+      const b = e.target; b.disabled = true; b.textContent = '生成中…';
+      const r = await window.koeApp.pageSummarize(curId);
+      if (!r.ok) { toast(r.error || '生成に失敗しました'); if (/未設定/.test(r.error||'')) showTab('settings'); }
+      else toast(`議事録を作成しました（出典 ${r.stat.linked}/${r.stat.total}）`);
+      await openPage(curId);
+    }, !curPage.blocks.length);
+    mk('Markdown保存', async () => {
+      const r = await window.koeApp.pageExport(curId);
+      if (r.ok) toast('保存しました'); else if (r.error) toast(r.error);
+    });
+    mk('コピー', async () => {
+      const md = curPage.blocks.map((b) => b.type === 'heading' ? `\n## ${b.text}`
+        : b.type === 'todo' ? `- [${b.checked?'x':' '}] ${b.text}` : b.type === 'bullet' ? `- ${b.text}` : b.text).join('\n');
+      await window.koeApp.copy(md.trim()); toast('議事録をコピーしました');
+    });
+    mk('削除', async () => {
+      if (!confirm('この議事録を削除します。よろしいですか？')) return;
+      await window.koeApp.pageDelete(curId);
+      curId = null; curPage = null; curSegs = [];
+      await refreshList(); renderPage();
+    });
+
+    renderBlocks();
+    renderScript();
+    renderMemo();
+    setPane(pane);
+  }
+
+  function renderBlocks() {
+    const box = $('pNote'); box.textContent = '';
+    if (curPage.summaryError) {
+      const n = document.createElement('div'); n.className = 'note'; n.textContent = curPage.summaryError;
+      box.appendChild(n);
+    }
+    if (!curPage.blocks.length) {
+      const d = document.createElement('div'); d.className = 'empty';
+      d.innerHTML = '<div class="big">要約はまだありません</div>上の「要約を生成」で作成できます。';
+      box.appendChild(d); return;
+    }
+    const info = document.createElement('div');
+    info.className = 'note info';
+    info.textContent = '各要点の [1] をクリックすると、根拠になった発言へ移動します。テキストはクリックで直接編集できます。';
+    box.appendChild(info);
+
+    for (const b of curPage.blocks) {
+      const el = document.createElement('div');
+      el.className = `blk ${b.type}` + (b.type === 'todo' && b.checked ? ' done' : '');
+      el.dataset.id = b.id;
+
+      if (b.type === 'todo') {
+        const cb = document.createElement('input');
+        cb.type = 'checkbox'; cb.checked = Boolean(b.checked);
+        cb.onchange = async () => {
+          await window.koeApp.blockUpdate(curId, b.id, { checked: cb.checked });
+          b.checked = cb.checked;
+          el.classList.toggle('done', cb.checked);
+          refreshList();
+        };
+        el.appendChild(cb);
+      } else if (b.type === 'bullet') {
+        const d = document.createElement('span'); d.className = 'bullet'; d.textContent = '•';
+        el.appendChild(d);
+      }
+
+      const txt = document.createElement('div');
+      txt.className = 'txt'; txt.contentEditable = 'true'; txt.spellcheck = false;
+      txt.textContent = b.text;
+      txt.onblur = async () => {
+        const v = txt.textContent.trim();
+        if (v === b.text) return;
+        b.text = v;
+        await window.koeApp.blockUpdate(curId, b.id, { text: v });
+        refreshList();
+      };
+      txt.onkeydown = async (ev) => {
+        if (ev.key === 'Enter') {
+          ev.preventDefault(); txt.blur();
+          const r = await window.koeApp.blockInsert(curId, b.id, b.type === 'heading' ? 'bullet' : b.type);
+          if (r) { await openPage(curId); focusBlock(r.blockId); }
+        } else if (ev.key === 'Backspace' && txt.textContent.trim() === '') {
+          ev.preventDefault();
+          await window.koeApp.blockRemove(curId, b.id);
+          await openPage(curId);
+        }
+      };
+      el.appendChild(txt);
+
+      // 担当・期限（クリックで編集）
+      if (b.type === 'todo') {
+        const meta = document.createElement('span'); meta.className = 'ameta';
+        const who = document.createElement('button');
+        who.className = 'atag ' + (b.assignee ? 'who' : 'add');
+        who.textContent = b.assignee || '＋担当';
+        who.title = '担当者を設定';
+        who.onclick = async () => {
+          const v = prompt('担当者（空欄で解除）', b.assignee || '');
+          if (v === null) return;
+          await window.koeApp.blockSetAction(curId, b.id, v, undefined);
+          await openPage(curId); refreshList();
+        };
+        const di = dueInfo(b.due, b.dueApprox);
+        const due = document.createElement('button');
+        due.className = 'atag ' + (di ? `due ${di.cls}` : b.dueRaw ? 'due' : 'add');
+        due.textContent = di ? `${di.label}・${di.note}` : (b.dueRaw || '＋期限');
+        due.title = b.dueRaw ? `元の表記: ${b.dueRaw}` : '期限を設定（「来週金曜」「8/30」などで入力できます）';
+        due.onclick = async () => {
+          const v = prompt('期限（「来週金曜」「8/30」「今月末」など。空欄で解除）', b.dueRaw || '');
+          if (v === null) return;
+          await window.koeApp.blockSetAction(curId, b.id, undefined, v);
+          await openPage(curId); refreshList();
+        };
+        meta.append(who, due);
+        el.appendChild(meta);
+      }
+
+      // 出典チップ
+      if (b.type === 'bullet' || b.type === 'todo') {
+        const wrap = document.createElement('span'); wrap.className = 'cites';
+        const cites = Array.isArray(b.cites) ? b.cites : [];
+        if (cites.length) {
+          cites.forEach((sid, i) => {
+            const c = document.createElement('button');
+            c.className = 'cite'; c.textContent = String(i + 1);
+            const seg = curSegs.find((s) => s.id === sid);
+            c.title = seg ? `${fmtClock(seg.atMs)} ${seg.text.slice(0, 60)}` : '該当の発言';
+            c.onclick = () => jumpToSegment(sid);
+            wrap.appendChild(c);
+          });
+        } else if (txt.textContent.trim().length >= 6) {
+          const n = document.createElement('span'); n.className = 'nocite';
+          n.textContent = '根拠なし'; n.title = '文字起こしに対応する発言が見つかりませんでした';
+          wrap.appendChild(n);
+        }
+        el.appendChild(wrap);
+      }
+
+      const del = document.createElement('button');
+      del.className = 'del'; del.textContent = '×'; del.title = 'この行を削除';
+      del.onclick = async () => { await window.koeApp.blockRemove(curId, b.id); await openPage(curId); };
+      el.appendChild(del);
+
+      box.appendChild(el);
+    }
+  }
+
+  function focusBlock(blockId) {
+    const els = $('pNote').querySelectorAll('.blk');
+    for (const el of els) {
+      if (el.dataset.id === blockId) { el.querySelector('.txt').focus(); return; }
+    }
+  }
+
+  function renderScript() {
+    const box = $('pScript'); box.textContent = '';
+    if (!curSegs.length) {
+      const d = document.createElement('div'); d.className = 'empty'; d.textContent = '文字起こしがありません';
+      box.appendChild(d); return;
+    }
+    for (const s of curSegs) {
+      const el = document.createElement('div');
+      el.className = 'seg' + (s.failed ? ' failed' : '');
+      el.id = `seg-${s.id}`;
+      const at = document.createElement('span'); at.className = 'at'; at.textContent = fmtClock(s.atMs);
+      const tx = document.createElement('span'); tx.textContent = s.text;
+      el.append(at, tx);
+      box.appendChild(el);
+    }
+  }
+
+  function renderMemo() {
+    const box = $('pMemo'); box.textContent = '';
+    const label = document.createElement('div');
+    label.className = 'field';
+    const l = document.createElement('label'); l.textContent = 'メモ・アジェンダ（要約のヒントとして使われます）';
+    const ta = document.createElement('textarea');
+    ta.rows = 10; ta.value = curPage.memo || '';
+    ta.placeholder = '例: 週次定例。議題: 売上見込み / 案件進捗 / 採用状況';
+    let t = null;
+    ta.oninput = () => {
+      clearTimeout(t);
+      t = setTimeout(async () => { await window.koeApp.pageSetMemo(curId, ta.value); curPage.memo = ta.value; }, 500);
+    };
+    label.append(l, ta); box.appendChild(label);
+  }
+
+  function jumpToSegment(sid) {
+    setPane('script');
+    const el = document.getElementById(`seg-${sid}`);
+    if (!el) { toast('該当の発言が見つかりません'); return; }
+    for (const e of $('pScript').querySelectorAll('.seg.hit')) e.classList.remove('hit');
+    el.classList.add('hit');
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+
+  // タイトル編集
+  $('pTitle').onblur = async () => {
+    if (!curId) return;
+    const v = $('pTitle').textContent.trim();
+    if (!v || v === curPage.title) { $('pTitle').textContent = curPage.title; return; }
+    curPage.title = v;
+    await window.koeApp.pageSetTitle(curId, v);
+    refreshList();
+  };
+  $('pTitle').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); $('pTitle').blur(); } };
+
+  // ---------------- 録音セッション ----------------
+  function mtClock() {
+    if (!mtStartedAt) return '0:00';
+    return fmtClock(Date.now() - mtStartedAt);
+  }
+  function setMeetingUi(st) {
+    mtStartedAt = st.startedAt;
+    $('mtToggleBtn').textContent = st.finalizing ? '作成中…' : st.active ? '■ 終了して作成' : '● 記録開始';
+    $('mtToggleBtn').disabled = Boolean(st.finalizing);
+    $('mtDiscardBtn').style.display = st.active && !st.finalizing ? '' : 'none';
+
+    let live = $('liveBar');
+    if (st.active) {
+      if (!live) {
+        live = document.createElement('div'); live.className = 'live'; live.id = 'liveBar';
+        live.innerHTML = '<span class="rec-dot"></span><span id="liveTitle">議事録を記録中</span><span class="tm" id="liveTm">0:00</span>';
+        $('pBody').insertBefore(live, $('pBody').firstChild);
+      }
+      $('liveTitle').textContent = st.finalizing ? '議事録を作成しています…'
+        : st.pending > 0 ? `議事録を記録中（${st.pending}区間を文字起こし中）` : '議事録を記録中';
+      if (!mtTimer) mtTimer = setInterval(() => { const e = $('liveTm'); if (e) e.textContent = mtClock(); }, 500);
+      // 記録中はライブ文字起こしを表示
+      if (!curId) {
+        curSegs = st.segments || [];
+        const box = $('pScript'); box.textContent = '';
+        for (const s of curSegs) {
+          const el = document.createElement('div'); el.className = 'seg';
+          const at = document.createElement('span'); at.className = 'at'; at.textContent = fmtClock(s.atMs);
+          const tx = document.createElement('span'); tx.textContent = s.text;
+          el.append(at, tx); box.appendChild(el);
+        }
+        if (!curSegs.length) {
+          const d = document.createElement('div'); d.className = 'empty';
+          d.textContent = '発言を待っています…（最初の結果は開始から30秒〜1分ほどで表示されます）';
+          box.appendChild(d);
+        }
+        setPane('script');
+        box.scrollTop = box.scrollHeight;
+      }
+    } else {
+      if (live) live.remove();
+      if (mtTimer) { clearInterval(mtTimer); mtTimer = null; }
+      if (!st.finalizing) $('pProgress').style.display = 'none';
+    }
+  }
+
+  $('mtToggleBtn').onclick = async () => {
+    const r = await window.koeApp.meetingToggle();
+    if (r && r.ok === false && r.error) { toast(r.error); if (/未設定/.test(r.error)) showTab('settings'); }
+    setMeetingUi(await window.koeApp.meetingStatus());
+  };
+  $('mtDiscardBtn').onclick = async () => {
+    if (!confirm('この議事録の録音を破棄します。よろしいですか？')) return;
+    await window.koeApp.meetingDiscard();
+    setMeetingUi(await window.koeApp.meetingStatus());
+    $('pProgress').style.display = 'none';
+  };
+
+  window.koeApp.onMeetingUpdate((st) => setMeetingUi(st));
+  window.koeApp.onMeetingProgress((p) => {
+    const e = $('pProgress');
+    if (!p.message) { e.style.display = 'none'; return; }
+    e.style.display = ''; e.textContent = p.message;
+  });
+  window.koeApp.onPagesUpdated(() => refreshList());
+  window.koeApp.onPageOpen((id) => { showTab('notes'); openPage(id); });
+  window.koeApp.onPageUpdated(({ page, segments }) => {
+    refreshList();
+    if (page.id !== curId) return;
+    curPage = page; curSegs = segments; renderPage();
+  });
+  window.koeApp.onNotice((m) => { if (/未設定/.test(m)) showTab('settings'); toast(m); });
+
+  // ================= 音声入力 =================
+  function fmtChars(n) { return n >= 10000 ? `${(n/10000).toFixed(1)}万` : String(n); }
+  function renderHistory() {
+    const today = new Date(); today.setHours(0,0,0,0);
+    let tc=0, tch=0, ac=0, ach=0, saved=0;
+    for (const h of history) {
+      ac++; ach += h.chars || 0;
+      if (new Date(h.createdAt) >= today) { tc++; tch += h.chars || 0; }
+      saved += Math.max(0, (h.chars||0)/70 - (h.durationSec||0)/60);
+    }
+    $('stToday').innerHTML = `${tc}<small>回</small> ${fmtChars(tch)}<small>字</small>`;
+    $('stTotal').innerHTML = `${ac}<small>回</small> ${fmtChars(ach)}<small>字</small>`;
+    $('stSaved').innerHTML = saved >= 60 ? `${(saved/60).toFixed(1)}<small>時間</small>` : `${Math.round(saved)}<small>分</small>`;
+
+    const q = $('histSearch').value.trim();
+    const list = q ? history.filter((h) => h.text.includes(q)) : history;
+    const box = $('histList'); box.textContent = '';
+    if (!list.length) {
+      const d = document.createElement('div'); d.className = 'empty';
+      d.innerHTML = history.length
+        ? '検索に一致する履歴がありません'
+        : `<div class="big">まだ履歴がありません</div>どのアプリでも <kbd>${settings ? settings.hotkey : 'Ctrl+Shift+Space'}</kbd> を押して話しかけてください。`;
+      box.appendChild(d); return;
+    }
+    for (const h of list) {
+      const c = document.createElement('div'); c.className = 'entry';
+      const t = document.createElement('div'); t.className = 'text'; t.textContent = h.text;
+      const m = document.createElement('div'); m.className = 'meta';
+      const i = document.createElement('span');
+      i.textContent = `${relTime(h.createdAt)} ・ ${h.durationSec}秒 ・ ${h.chars}文字${h.procMs?` ・ ${(h.procMs/1000).toFixed(1)}秒で変換`:''}`;
+      const sp = document.createElement('span'); sp.className = 'sp';
+      const cp = document.createElement('button'); cp.textContent = 'コピー';
+      cp.onclick = async () => { await window.koeApp.copy(h.text); toast('コピーしました'); };
+      const dl = document.createElement('button'); dl.className = 'danger'; dl.textContent = '削除';
+      dl.onclick = async () => { history = await window.koeApp.deleteHistory(h.id); renderHistory(); };
+      m.append(i, sp, cp, dl); c.append(t, m); box.appendChild(c);
+    }
+  }
+  $('histSearch').oninput = renderHistory;
+  $('recBtn').onclick = () => window.koeApp.toggleRecording();
+  $('clearBtn').onclick = async () => {
+    if (!history.length) return;
+    if (!confirm('履歴をすべて削除します。よろしいですか？')) return;
+    history = await window.koeApp.clearHistory(); renderHistory();
+  };
+  window.koeApp.onHistoryUpdated((h) => { history = h; renderHistory(); });
+
+  // ================= 設定 =================
+  async function loadMics(sel) {
+    const s = $('micSelect'); s.textContent = '';
+    s.add(new Option('既定のマイク（Windowsの設定に従う）', ''));
+    try {
+      let devs = await navigator.mediaDevices.enumerateDevices();
+      if (!devs.some((d) => d.kind === 'audioinput' && d.label)) {
+        const st = await navigator.mediaDevices.getUserMedia({ audio: true });
+        st.getTracks().forEach((t) => t.stop());
+        devs = await navigator.mediaDevices.enumerateDevices();
+      }
+      for (const d of devs) {
+        if (d.kind !== 'audioinput' || !d.deviceId || d.deviceId === 'default') continue;
+        s.add(new Option(d.label || `マイク (${d.deviceId.slice(0,8)})`, d.deviceId));
+      }
+    } catch (_) { /* 未許可でも既定で動く */ }
+    s.value = sel || '';
+    if (s.value !== (sel || '')) s.value = '';
+  }
+  $('micReloadBtn').onclick = () => loadMics($('micSelect').value);
+
+  function fill(s) {
+    $('localServerExe').value = s.localServerExe || '';
+    $('localModelPath').value = s.localModelPath || '';
+    $('localThreads').value = s.localThreads || 4;
+    $('localPort').value = s.localPort || 8990;
+    $('vadModelPath').value = s.vadModelPath || '';
+    $('useVad').checked = s.useVad !== false;
+    $('suppressNst').checked = s.suppressNst !== false;
+    $('sumServerExe').value = s.sumServerExe || '';
+    $('sumModelPath').value = s.sumModelPath || '';
+    $('sumThreads').value = s.sumThreads || 4;
+    $('sumPort').value = s.sumPort || 8991;
+    $('hotkey').value = s.hotkey || '';
+    $('meetingHotkey').value = s.meetingHotkey || '';
+    $('segmentSec').value = s.segmentSec || 75;
+    $('pillPos').value = s.pillPos || 'bottom';
+    $('language').value = s.language || 'ja';
+    $('autoPaste').checked = s.autoPaste !== false;
+    $('removeFillers').checked = s.removeFillers !== false;
+    $('soundFeedback').checked = s.soundFeedback !== false;
+    $('autoLaunch').checked = Boolean(s.autoLaunch);
+    $('dictionary').value = (s.dictionary || []).join('\n');
+    loadMics(s.micId || '');
+  }
+
+  const pick = (kind, target) => async () => {
+    const p = await window.koeApp.pickFile(kind);
+    if (p) $(target).value = p;
+  };
+  $('pickExeBtn').onclick = pick('exe', 'localServerExe');
+  $('pickModelBtn').onclick = pick('model', 'localModelPath');
+  $('pickVadBtn').onclick = pick('model', 'vadModelPath');
+  $('pickSumExeBtn').onclick = pick('exe', 'sumServerExe');
+  $('pickSumModelBtn').onclick = pick('model', 'sumModelPath');
+  $('openDataBtn').onclick = () => window.koeApp.openDataDir();
+
+  function attachHotkey(id) {
+    $(id).onkeydown = (e) => {
+      e.preventDefault();
+      const mods = [];
+      if (e.ctrlKey) mods.push('Control');
+      if (e.shiftKey) mods.push('Shift');
+      if (e.altKey) mods.push('Alt');
+      if (e.metaKey) mods.push('Super');
+      let k = e.key;
+      if (['Control','Shift','Alt','Meta'].includes(k)) return;
+      if (k === ' ') k = 'Space';
+      else if (k.startsWith('Arrow')) k = k.replace('Arrow','');
+      else if (k.length === 1) k = k.toUpperCase();
+      if (!mods.length && !/^F\d{1,2}$/.test(k)) {
+        $('saveMsg').textContent = '修飾キー（Ctrl/Shift/Alt）との組み合わせにしてください';
+        $('saveMsg').className = 'save-msg ng'; return;
+      }
+      $(id).value = [...mods, k].join('+');
+      $('saveMsg').textContent = '';
+    };
+  }
+  attachHotkey('hotkey'); attachHotkey('meetingHotkey');
+
+  async function refreshVad() {
+    try {
+      const s = await window.koeApp.vadStatus();
+      const el = $('vadState'); if (!el) return;
+      el.textContent = s.path
+        ? (s.auto ? `　✓ 自動検出: ${s.path.split('\\').pop()}` : '　✓ 指定パスを使用')
+        : '　※ VADモデルが見つかりません（setup-local-engine.ps1 を再実行すると取得できます）';
+      el.style.color = s.path ? 'var(--green)' : 'var(--danger)';
+    } catch (_) { /* noop */ }
+  }
+
+  async function runTest(fn, msgId) {
+    const m = $(msgId); m.className = 'save-msg';
+    m.textContent = '確認中…（初回はモデル読み込みに時間がかかります）';
+    if (!await save(true)) { m.textContent = ''; return; }
+    const r = await fn();
+    m.textContent = r.ok ? `✓ ${r.info || 'OK'}` : `✗ ${r.error}`;
+    m.className = r.ok ? 'save-msg ok' : 'save-msg ng';
+  }
+  $('testBtn').onclick = () => runTest(() => window.koeApp.testApi(), 'testMsg');
+  $('testSumBtn').onclick = () => runTest(() => window.koeApp.testSum(), 'testSumMsg');
+
+  async function save(silent) {
+    const next = {
+      localServerExe: $('localServerExe').value.trim(),
+      localModelPath: $('localModelPath').value.trim(),
+      localThreads: $('localThreads').value.trim() || 4,
+      localPort: $('localPort').value.trim() || 8990,
+      vadModelPath: $('vadModelPath').value.trim(),
+      useVad: $('useVad').checked,
+      suppressNst: $('suppressNst').checked,
+      sumServerExe: $('sumServerExe').value.trim(),
+      sumModelPath: $('sumModelPath').value.trim(),
+      sumThreads: $('sumThreads').value.trim() || 4,
+      sumPort: $('sumPort').value.trim() || 8991,
+      hotkey: $('hotkey').value.trim() || 'Control+Shift+Space',
+      meetingHotkey: $('meetingHotkey').value.trim() || 'Alt+M',
+      segmentSec: $('segmentSec').value.trim() || 75,
+      pillPos: $('pillPos').value,
+      micId: $('micSelect').value,
+      language: $('language').value,
+      autoPaste: $('autoPaste').checked,
+      removeFillers: $('removeFillers').checked,
+      soundFeedback: $('soundFeedback').checked,
+      autoLaunch: $('autoLaunch').checked,
+      dictionary: $('dictionary').value.split('\n').map((s) => s.trim()).filter(Boolean),
+    };
+    const r = await window.koeApp.saveSettings(next);
+    const m = $('saveMsg');
+    if (r.ok) {
+      settings = { ...settings, ...next };
+      if (!silent) { m.textContent = '保存しました'; m.className = 'save-msg ok'; }
+      refreshVad();
+      return true;
+    }
+    m.textContent = r.error || '保存に失敗しました'; m.className = 'save-msg ng';
+    return false;
+  }
+  $('saveBtn').onclick = () => save(false);
+
+  // ---------------- アップデート ----------------
+  let pendingUpdate = null;
+
+  function showUpdate(r) {
+    pendingUpdate = r;
+    $('applyUpdBtn').style.display = '';
+    $('updMsg').textContent = `新しいバージョン ${r.version} があります（${Math.max(1, Math.round((r.size||0)/1024))} KB）`;
+    $('updMsg').className = 'save-msg ok';
+    if (r.notes) { $('updNotes').style.display = ''; $('updNotes').textContent = r.notes; }
+    toast(`アップデート ${r.version} が利用できます（設定タブ）`);
+  }
+
+  $('chkUpdBtn').onclick = async () => {
+    const m = $('updMsg'); m.className = 'save-msg'; m.textContent = '確認中…';
+    $('applyUpdBtn').style.display = 'none'; $('updNotes').style.display = 'none';
+    const r = await window.koeApp.updateCheck();
+    if (!r.ok) { m.textContent = r.error; m.className = 'save-msg ng'; return; }
+    if (!r.update) { m.textContent = `最新です（${r.version}）`; m.className = 'save-msg ok'; return; }
+    showUpdate(r);
+  };
+
+  $('applyUpdBtn').onclick = async () => {
+    if (!pendingUpdate) return;
+    if (!confirm(`バージョン ${pendingUpdate.version} に更新して再起動します。\n記録中の議事録がある場合は先に終了してください。\n\n続行しますか？`)) return;
+    const b = $('applyUpdBtn'); b.disabled = true;
+    const m = $('updMsg'); m.className = 'save-msg'; m.textContent = '更新中…';
+    const r = await window.koeApp.updateApply(pendingUpdate.url);
+    if (!r.ok) {
+      m.textContent = `✗ ${r.error}`; m.className = 'save-msg ng'; b.disabled = false; return;
+    }
+    m.textContent = '✓ 適用しました。再起動します…'; m.className = 'save-msg ok';
+    setTimeout(() => window.koeApp.restart(), 900);
+  };
+
+  window.koeApp.onUpdateAvailable((r) => showUpdate(r));
+  window.koeApp.onUpdateProgress((p) => {
+    $('updMsg').textContent = p.message || ''; $('updMsg').className = 'save-msg';
+  });
+
+  // ---------------- 初期化 ----------------
+  (async () => {
+    settings = await window.koeApp.getSettings();
+    fill(settings);
+    refreshVad();
+    mtypes = await window.koeApp.meetingTypes();
+    try {
+      const v = await window.koeApp.appVersion();
+      $('verNow').textContent = `現在のバージョン: ${v.version}`;
+    } catch (_) { /* noop */ }
+    history = await window.koeApp.getHistory();
+    renderHistory();
+    await refreshList();
+    renderPage();
+    setMeetingUi(await window.koeApp.meetingStatus());
+    if (!settings.localServerExe || !settings.localModelPath) showTab('settings');
+  })();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<title>Listener Overlay</title>
+<style>
+  :root {
+    --ink: #1b1e25;
+    --muted: rgba(56, 60, 70, 0.64);
+    --accent: #5b6ee1;
+    --rec: #e5484d;
+    --green: #2f9e63;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: transparent; overflow: hidden; height: 100%; }
+  body {
+    font-family: "Yu Gothic UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    -webkit-user-select: none; user-select: none;
+  }
+  /* Liquid Glass ピル: 光を透かす白ガラス + スペキュラハイライト */
+  .pill {
+    display: flex; align-items: center; gap: 9px;
+    width: 296px; height: 48px;
+    padding: 0 9px 0 14px;
+    -webkit-app-region: drag;   /* ピル全体をドラッグで移動可能に */
+    cursor: grab;
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.92) 0%, rgba(255, 255, 255, 0.74) 100%);
+    border: 1px solid rgba(255, 255, 255, 0.85);
+    border-radius: 999px;
+    box-shadow:
+      0 8px 24px rgba(20, 30, 60, 0.22),
+      0 1px 4px rgba(20, 30, 60, 0.10),
+      inset 0 1px 0 rgba(255, 255, 255, 0.95);
+    backdrop-filter: blur(24px) saturate(160%);
+    -webkit-backdrop-filter: blur(24px) saturate(160%);
+    color: var(--ink);
+    opacity: 0; transform: translateY(10px) scale(.97);
+    transition: opacity .18s ease, transform .22s cubic-bezier(.2, .9, .3, 1.2);
+  }
+  .pill.visible { opacity: 1; transform: none; }
+
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); flex: none; }
+  .pill[data-phase="recording"] .dot { animation: pulse 1.4s ease-in-out infinite; }
+  .pill[data-phase="processing"] .dot {
+    background: transparent;
+    border: 2px solid rgba(27, 30, 37, 0.14); border-top-color: var(--accent);
+    animation: spin .8s linear infinite;
+  }
+  .pill[data-phase="done"] .dot { background: var(--green); }
+  .pill[data-phase="error"] .dot { background: var(--rec); }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(91, 110, 225, 0.4); }
+    50% { box-shadow: 0 0 0 8px rgba(91, 110, 225, 0); }
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .pill, .pill .dot { animation: none !important; transition: none !important; }
+  }
+
+  .center { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+  canvas#wave { width: 100%; height: 18px; display: block; }
+  .status {
+    font-size: 11px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .pill[data-phase="done"] .status { color: var(--green); }
+  .pill[data-phase="error"] .status { color: var(--rec); }
+
+  .timer {
+    flex: none; font-size: 12px; font-variant-numeric: tabular-nums;
+    color: var(--ink); letter-spacing: .03em; min-width: 36px; text-align: right;
+  }
+  .pill[data-phase="done"] .timer { color: var(--green); font-size: 12px; }
+
+  .btns { display: none; gap: 7px; flex: none; }
+  .pill[data-phase="recording"] .btns { display: flex; }
+  .pbtn {
+    -webkit-app-region: no-drag;
+    width: 27px; height: 27px; border-radius: 50%; border: none; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; line-height: 1; padding: 0;
+    transition: transform .08s ease, background .12s ease, filter .12s ease;
+  }
+  .pbtn:active { transform: scale(.92); }
+  .pbtn.ok {
+    background: linear-gradient(180deg, #7b8bef 0%, #5261dd 100%);
+    color: #fff;
+    box-shadow: 0 4px 12px rgba(82, 97, 221, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  }
+  .pbtn.ok:hover { filter: brightness(1.06); }
+  .pbtn.ng {
+    background: rgba(255, 255, 255, 0.6);
+    color: var(--muted);
+    border: 1px solid rgba(27, 30, 37, 0.12);
+  }
+  .pbtn.ng:hover { color: var(--ink); background: rgba(255, 255, 255, 0.92); }
+  .pill.meeting .pbtn.ng { display: none; } /* 議事録は誤操作防止のため✕なし */
+</style>
+</head>
+<body>
+  <div class="pill" id="pill" data-phase="recording">
+    <div class="dot"></div>
+    <div class="center">
+      <canvas id="wave" width="160" height="18"></canvas>
+      <div class="status" id="status">聞き取り中…</div>
+    </div>
+    <div class="timer" id="timer">0:00</div>
+    <div class="btns">
+      <button class="pbtn ok" id="okBtn" title="確定（ホットキーでも可）">✓</button>
+      <button class="pbtn ng" id="ngBtn" title="キャンセル（Esc）">✕</button>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const DICTATION_MAX_MS = 10 * 60 * 1000;
+
+  const pill = document.getElementById('pill');
+  const statusEl = document.getElementById('status');
+  const timerEl = document.getElementById('timer');
+  const canvas = document.getElementById('wave');
+  const ctx2d = canvas.getContext('2d');
+
+  let mode = 'dictation'; // 'dictation' | 'meeting'
+  let segmentMs = 75000;
+  const FIRST_SEG_MS = 20000; // 最初のセグメントは短くして早く結果を見せる
+  let firstSegDone = false;
+  let mediaStream = null;
+  let recorder = null;
+  let chunks = [];
+  let cancelled = false;
+  let stopping = false;
+  let startedAt = 0;   // セッション開始（表示用）
+  let segStart = 0;    // セグメント開始
+  let timerId = null;
+  let autoStopId = null;
+  let audioCtx = null;
+  let analyser = null;
+  let rafId = null;
+  let micId = '';
+  let soundOn = true;
+
+  // ---------------- 効果音 ----------------
+  let sctx = null;
+  function beep(seq) {
+    if (!soundOn) return;
+    try {
+      if (!sctx) sctx = new AudioContext();
+      sctx.resume().catch(() => {});
+      const t0 = sctx.currentTime + 0.01;
+      for (const [f, d, off] of seq) {
+        const o = sctx.createOscillator();
+        const g = sctx.createGain();
+        o.type = 'sine';
+        o.frequency.value = f;
+        g.gain.setValueAtTime(0.0001, t0 + off);
+        g.gain.exponentialRampToValueAtTime(0.07, t0 + off + 0.012);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + off + d);
+        o.connect(g).connect(sctx.destination);
+        o.start(t0 + off);
+        o.stop(t0 + off + d + 0.03);
+      }
+    } catch (_) { /* noop */ }
+  }
+  const SND = {
+    start: [[620, 0.09, 0], [880, 0.12, 0.07]],
+    stop: [[880, 0.07, 0], [660, 0.1, 0.06]],
+    done: [[1040, 0.12, 0]],
+    cancel: [[440, 0.09, 0]],
+    error: [[220, 0.22, 0]],
+  };
+
+  // ---------------- WAV変換（16kHz mono PCM16） ----------------
+  async function blobToWav16k(blob) {
+    const arr = await blob.arrayBuffer();
+    const dc = new AudioContext();
+    let decoded;
+    try {
+      decoded = await dc.decodeAudioData(arr);
+    } finally {
+      dc.close().catch(() => {});
+    }
+    const rate = 16000;
+    const len = Math.max(1, Math.ceil(decoded.duration * rate));
+    const oac = new OfflineAudioContext(1, len, rate);
+    const src = oac.createBufferSource();
+    src.buffer = decoded;
+    src.connect(oac.destination);
+    src.start();
+    const rendered = await oac.startRendering();
+    const f32 = rendered.getChannelData(0);
+    const out = new ArrayBuffer(44 + f32.length * 2);
+    const dv = new DataView(out);
+    const wstr = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+    wstr(0, 'RIFF');
+    dv.setUint32(4, 36 + f32.length * 2, true);
+    wstr(8, 'WAVE');
+    wstr(12, 'fmt ');
+    dv.setUint32(16, 16, true);
+    dv.setUint16(20, 1, true);
+    dv.setUint16(22, 1, true);
+    dv.setUint32(24, rate, true);
+    dv.setUint32(28, rate * 2, true);
+    dv.setUint16(32, 2, true);
+    dv.setUint16(34, 16, true);
+    wstr(36, 'data');
+    dv.setUint32(40, f32.length * 2, true);
+    for (let i = 0; i < f32.length; i++) {
+      const s = Math.max(-1, Math.min(1, f32[i]));
+      dv.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return new Uint8Array(out);
+  }
+
+  // ---------------- 表示 ----------------
+  function setPhase(phase, message) {
+    pill.dataset.phase = phase;
+    if (message != null) statusEl.textContent = message;
+  }
+  function fmt(ms) {
+    const s = Math.floor(ms / 1000);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    return h > 0
+      ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+      : `${m}:${String(sec).padStart(2, '0')}`;
+  }
+  let ampHist = [];
+  function drawWave() {
+    const w = canvas.width, h = canvas.height;
+    ctx2d.clearRect(0, 0, w, h);
+    if (!analyser) return;
+    // 声の大きさ（RMS）を毎フレーム記録し、右から左へ流れるバーで描く
+    const data = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(data);
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) {
+      const v = (data[i] - 128) / 128;
+      sum += v * v;
+    }
+    const level = Math.min(1, Math.sqrt(sum / data.length) * 3.4);
+    ampHist.push(level);
+    const bars = 40;
+    if (ampHist.length > bars) ampHist.shift();
+    const bw = w / bars;
+    ctx2d.fillStyle = 'rgba(27,30,37,0.72)';
+    for (let i = 0; i < ampHist.length; i++) {
+      const x = w - (ampHist.length - i) * bw;   // 右端が最新
+      const bh = Math.max(2, ampHist[i] * (h - 2));
+      const y = (h - bh) / 2;                     // 上下中央
+      if (ctx2d.roundRect) {
+        ctx2d.beginPath();
+        ctx2d.roundRect(x + 1, y, bw - 2, bh, (bw - 2) / 2);
+        ctx2d.fill();
+      } else {
+        ctx2d.fillRect(x + 1, y, bw - 2, bh);
+      }
+    }
+    rafId = requestAnimationFrame(drawWave);
+  }
+  function pickMime() {
+    const cands = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+    for (const m of cands) {
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m;
+    }
+    return '';
+  }
+
+  // ---------------- 録音本体 ----------------
+  async function openStream() {
+    const audio = {
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
+    if (micId) audio.deviceId = { ideal: micId };
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio });
+    audioCtx = new AudioContext();
+    audioCtx.resume().catch(() => {});
+    const src = audioCtx.createMediaStreamSource(mediaStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.6;
+    src.connect(analyser);
+    drawWave();
+  }
+
+  function newRecorder() {
+    const mime = pickMime();
+    const rec = new MediaRecorder(
+      mediaStream,
+      mime ? { mimeType: mime, audioBitsPerSecond: 32000 } : { audioBitsPerSecond: 32000 },
+    );
+    rec.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+    return rec;
+  }
+
+  async function start() {
+    cleanup();
+    cancelled = false;
+    stopping = false;
+    chunks = [];
+    ampHist = [];
+    firstSegDone = false;
+    setPhase('recording', mode === 'meeting' ? '議事録を記録中' : '聞き取り中…');
+    timerEl.textContent = '0:00';
+    pill.classList.toggle('meeting', mode === 'meeting');
+
+    try {
+      await openStream();
+    } catch (e) {
+      window.koeOverlay.sendError('マイクにアクセスできません（OSのマイク許可を確認してください）');
+      return;
+    }
+    beep(SND.start);
+    startedAt = Date.now();
+    timerId = setInterval(() => { timerEl.textContent = fmt(Date.now() - startedAt); }, 250);
+
+    if (mode === 'meeting') startMeetingSegment();
+    else startDictation();
+  }
+
+  // --- 音声入力（1本録り） ---
+  function startDictation() {
+    recorder = newRecorder();
+    recorder.onstop = async () => {
+      stopMeters();
+      const durationMs = Date.now() - startedAt;
+      if (cancelled) { cleanup(); return; }
+      const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+      try {
+        const wav = await blobToWav16k(blob);
+        window.koeOverlay.sendAudio(wav, 'audio/wav', durationMs);
+      } catch (e) {
+        window.koeOverlay.sendError('音声の変換に失敗しました');
+      }
+      releaseStream();
+    };
+    autoStopId = setTimeout(() => {
+      if (recorder && recorder.state === 'recording') recorder.stop();
+    }, DICTATION_MAX_MS);
+    recorder.start(250);
+  }
+
+  // --- 議事録（セグメント録り） ---
+  function startMeetingSegment() {
+    chunks = [];
+    segStart = Date.now();
+    recorder = newRecorder();
+    recorder.onstop = async () => {
+      const durationMs = Date.now() - segStart;
+      const isFinal = stopping || cancelled;
+      if (cancelled) { cleanup(); return; }
+      const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+      try {
+        const wav = await blobToWav16k(blob);
+        window.koeOverlay.sendSegment(wav, durationMs, isFinal);
+      } catch (e) {
+        if (isFinal) window.koeOverlay.sendSegment(new Uint8Array(0), durationMs, true);
+      }
+      if (!isFinal) {
+        startMeetingSegment(); // 次のセグメントへ
+      } else {
+        stopMeters();
+        releaseStream();
+      }
+    };
+    const thisSegMs = firstSegDone ? segmentMs : FIRST_SEG_MS;
+    firstSegDone = true;
+    autoStopId = setTimeout(() => {
+      if (recorder && recorder.state === 'recording') recorder.stop();
+    }, thisSegMs);
+    recorder.start(250);
+  }
+
+  function stop() {
+    stopping = true;
+    if (autoStopId) clearTimeout(autoStopId);
+    setPhase('processing', mode === 'meeting' ? '議事録を作成中…' : '文字起こし中…');
+    beep(SND.stop);
+    if (recorder && recorder.state === 'recording') recorder.stop();
+  }
+
+  function cancel() {
+    cancelled = true;
+    if (autoStopId) clearTimeout(autoStopId);
+    setPhase('error', 'キャンセルしました');
+    beep(SND.cancel);
+    if (recorder && recorder.state === 'recording') recorder.stop();
+    else cleanup();
+    setTimeout(() => pill.classList.remove('visible'), 400);
+    setTimeout(() => window.koeOverlay.requestHide(), 650);
+  }
+
+  function stopMeters() {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+    if (timerId) clearInterval(timerId);
+    timerId = null;
+    if (autoStopId) clearTimeout(autoStopId);
+    autoStopId = null;
+    if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
+    analyser = null;
+    ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+  }
+  function releaseStream() {
+    if (mediaStream) {
+      mediaStream.getTracks().forEach((t) => t.stop());
+      mediaStream = null;
+    }
+    recorder = null;
+  }
+  function cleanup() {
+    stopMeters();
+    releaseStream();
+    chunks = [];
+  }
+
+  document.getElementById('okBtn').addEventListener('click', () => window.koeOverlay.confirmStop());
+  document.getElementById('ngBtn').addEventListener('click', () => window.koeOverlay.requestCancel());
+
+  window.koeOverlay.onStart((p) => {
+    mode = (p && p.mode) || 'dictation';
+    segmentMs = ((p && p.segmentSec) || 75) * 1000;
+    micId = (p && p.micId) || '';
+    soundOn = !p || p.sound !== false;
+    pill.classList.add('visible');
+    start();
+  });
+  window.koeOverlay.onStop(() => stop());
+  window.koeOverlay.onCancel(() => cancel());
+  window.koeOverlay.onPhase(({ phase, message, procSec }) => {
+    setPhase(phase, message);
+    if (phase === 'done') {
+      timerEl.textContent = procSec ? `${procSec}s` : '';
+      beep(SND.done);
+      setTimeout(() => pill.classList.remove('visible'), 1600);
+    } else if (phase === 'error') {
+      beep(SND.error);
+      setTimeout(() => pill.classList.remove('visible'), 2800);
+    }
+  });
+})();
+</script>
+</body>
+</html>

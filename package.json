@@ -1,0 +1,47 @@
+{
+  "name": "listener",
+  "version": "0.8.0",
+  "description": "Listener — 完全オフラインの音声入力・議事録ツール（ローカルLLM要約 + 出典リンク付き）",
+  "main": "src/main.js",
+  "author": "You",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win portable",
+    "dist:installer": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^31.3.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "local.listener.app",
+    "productName": "Listener",
+    "files": [
+      "src/**/*",
+      "assets/icon.png",
+      "assets/icon.ico",
+      "package.json"
+    ],
+    "compression": "maximum",
+    "win": {
+      "target": [
+        "portable",
+        "nsis"
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "portable": {
+      "artifactName": "Listener-${version}-portable.exe"
+    },
+    "nsis": {
+      "artifactName": "Listener-${version}-setup.exe",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Listener"
+    }
+  }
+}
