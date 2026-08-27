@@ -20,6 +20,26 @@ const REPO = 'Kishi-Satoshi/Listener';
 const API_LATEST = `https://api.github.com/repos/${REPO}/releases/latest`;
 const ASSET_PATTERN = /^listener-src-.*\.zip$/i;
 
+/*
+ * 通信は Electron の net 経由で行う。
+ *
+ * Node のグローバル fetch は、Windowsのプロキシ設定も証明書ストアも見ない。
+ * 社内プロキシ（特にSSL検査あり）の環境では、それだけで
+ * 「ネットワークに接続できません」になる。
+ * Electron の net は Chromium のネットワークスタックを使うため、
+ * システムのプロキシ設定・PAC・資格情報・証明書ストアがそのまま効く。
+ *
+ * Electron の外（テスト）では net が無いので、Node の fetch に落とす。
+ */
+function httpFetch(url, opts) {
+  try {
+    // eslint-disable-next-line global-require
+    const { net } = require('electron');
+    if (net && typeof net.fetch === 'function') return net.fetch(url, opts);
+  } catch (_) { /* Electron 外 */ }
+  return fetch(url, opts);
+}
+
 function log(userDataPath, line) {
   try {
     fs.appendFileSync(path.join(userDataPath, 'update.log'),
@@ -44,7 +64,7 @@ function cmpVersion(a, b) {
  */
 async function check(currentVersion, userDataPath) {
   try {
-    const res = await fetch(API_LATEST, {
+    const res = await httpFetch(API_LATEST, {
       headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'Listener' },
       signal: AbortSignal.timeout(15000),
     });
@@ -69,8 +89,18 @@ async function check(currentVersion, userDataPath) {
       publishedAt: data.published_at || '',
     };
   } catch (e) {
-    const offline = /fetch failed|ENOTFOUND|ETIMEDOUT|abort/i.test(e.message || '');
-    return { ok: false, offline, error: offline ? 'ネットワークに接続できません' : e.message };
+    // 実際の失敗理由は update.log に残す。
+    // 「ネットワークに接続できません」だけでは、切断なのか
+    // プロキシなのか証明書なのかが切り分けられない。
+    log(userDataPath, `check failed: ${e.message}`);
+    const offline = /fetch failed|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|abort|ERR_/i.test(e.message || '');
+    return {
+      ok: false,
+      offline,
+      error: offline
+        ? 'ネットワークに接続できません（データ保存先の update.log に詳細が残ります）'
+        : e.message,
+    };
   }
 }
 
@@ -78,7 +108,7 @@ async function check(currentVersion, userDataPath) {
 async function download(url, dest, onProgress) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const res = await fetch(url, {
+      const res = await httpFetch(url, {
         headers: { 'User-Agent': 'Listener' },
         signal: AbortSignal.timeout(120000),
       });

@@ -115,6 +115,38 @@ test('check() は繋がらないときオフラインとして静かに諦める
   assert.strictEqual(r.offline, true);
 });
 
+test('Electron 内では net.fetch を通す（プロキシと証明書ストアを使うため）', async () => {
+  // Node のグローバル fetch は Windows のプロキシ設定も証明書ストアも見ない。
+  // 社内プロキシ環境では、そこを間違えるだけで更新確認が必ず失敗する。
+  const Module = require('node:module');
+  const orig = Module._load;
+  let usedNet = false;
+  Module._load = function (request, ...rest) {
+    if (request === 'electron') {
+      return { net: { fetch: (...a) => { usedNet = true; return fetch(...a); } } };
+    }
+    return orig.call(this, request, ...rest);
+  };
+  try {
+    const stub = path.join(work, 'updater-net.js');
+    fs.writeFileSync(stub, fs.readFileSync(path.join(REPO_ROOT, 'src', 'updater.js'), 'utf8')
+      .replace(/const API_LATEST = [^\n]+/, "const API_LATEST = 'http://127.0.0.1:1/latest';"));
+    delete require.cache[require.resolve(stub)];
+    const up = require(stub);
+    await up.check('0.8.0', work);
+    assert.ok(usedNet, 'Electron の net.fetch ではなく Node の fetch が使われている');
+  } finally {
+    Module._load = orig;
+  }
+});
+
+test('Electron の外では Node の fetch に落ちる（テストや解析で使えるように）', async () => {
+  // require('electron') は Electron 外では実行ファイルのパス文字列を返す。
+  // net が無いことを見て落とせているか。
+  const r = await updater.check('0.8.0', work);
+  assert.strictEqual(typeof r.ok, 'boolean');
+});
+
 // ---------------------------------------------------------------- apply()
 test('apply() が src を差し替え、失敗時は元に戻す', { skip: !CAN_PACK && 'zip コマンドが無い' }, async (t) => {
   const zip = packRelease(REPO_ROOT, work, '0.9.0');
