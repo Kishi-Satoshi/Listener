@@ -73,7 +73,20 @@ New-Item -ItemType Directory -Force -Path $llmRoot | Out-Null
 #    最新リリースのタグをGitHub APIで取得し、CPU版zipをダウンロード
 # ---------------------------------------------------------------------
 Write-Host "[1/2] llama.cpp バイナリをダウンロード中..." -ForegroundColor Cyan
-$latest = Invoke-RestMethod -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+# リリース情報の取得。Invoke-RestMethod が通らない環境があるので curl.exe に落とす
+$api = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+$latest = $null
+try {
+    $latest = Invoke-RestMethod -Uri $api
+}
+catch {
+    try { $latest = (& curl.exe -L -sS $api) | ConvertFrom-Json } catch { }
+}
+if (-not $latest) {
+    Write-Host "llama.cpp のリリース情報を取得できませんでした。" -ForegroundColor Red
+    Write-Host "  $api"
+    exit 1
+}
 $tag = $latest.tag_name
 
 $asset = $latest.assets | Where-Object { $_.name -like "llama-*-bin-win-cpu-x64.zip" } | Select-Object -First 1
@@ -88,7 +101,15 @@ if (-not $asset) {
 }
 
 $binZip = Join-Path $llmRoot $asset.name
-Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $binZip
+# ここも再開ありで取る。数十MBあり、社内回線では途中で切れることがある
+# （切れたまま展開すると壊れたzipになる）
+$binOk = Get-BigFile -Url $asset.browser_download_url -Out $binZip -MinBytes ([long]$asset.size)
+if (-not $binOk) {
+    Write-Host "llama.cpp バイナリを取得できませんでした。" -ForegroundColor Red
+    Write-Host "ブラウザで次のURLを開いて $llmRoot に置き、もう一度実行してください:"
+    Write-Host ("  " + $asset.browser_download_url)
+    exit 1
+}
 
 $binDir = Join-Path $llmRoot "bin"
 if (Test-Path $binDir) { Remove-Item -Recurse -Force $binDir }

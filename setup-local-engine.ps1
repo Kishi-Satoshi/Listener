@@ -103,7 +103,14 @@ else {
     Write-Host "[1/2] whisper.cpp バイナリをダウンロード中..." -ForegroundColor Cyan
     $binZip = Join-Path $root "whisper-bin-x64.zip"
     $binUrl = "https://github.com/ggml-org/whisper.cpp/releases/latest/download/whisper-bin-x64.zip"
-    Invoke-WebRequest -Uri $binUrl -OutFile $binZip
+    # 再開ありで取る。社内回線は大容量ダウンロードを途中で切ることがある
+    $binOk = Get-BigFile -Url $binUrl -Out $binZip -MinBytes 5MB
+    if (-not $binOk) {
+        Write-Host "whisper.cpp バイナリを取得できませんでした。" -ForegroundColor Red
+        Write-Host "ブラウザで次のURLを開いて $root に置き、もう一度実行してください:"
+        Write-Host ("  " + $binUrl)
+        exit 1
+    }
 
     if (Test-Path $binDir) { Remove-Item -Recurse -Force $binDir }
     Expand-Archive -Path $binZip -DestinationPath $binDir -Force
