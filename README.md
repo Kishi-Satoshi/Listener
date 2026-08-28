@@ -116,6 +116,16 @@ data/
 
 https://github.com/Kishi-Satoshi/Listener/releases/latest
 
+**ブラウザでのダウンロードが途中で止まる場合**（社内回線は大容量ダウンロードを
+切ることがあります）は、同じリリースに添付してある `get-installer.ps1` を使ってください。
+切断されても続きから再開し、最後にサイズと SHA256 を照合します。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\get-installer.ps1
+```
+
+この大きなファイルを落とすのは初回だけです。以降の更新は数百KBの差分のみを取得します。
+
 手元でビルドしたい場合は `npm run dist:installer` で `dist\Listener-<版>-setup.exe`
 ができます。ただし electron-builder が取得する `winCodeSign` に macOS 用の
 シンボリックリンクが含まれるため、Windows では特権が無いと展開に失敗します
