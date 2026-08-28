@@ -17,7 +17,8 @@
 # Windows PowerShell 5.1 / PowerShell 7 の両方で動作します。
 # =====================================================================
 param(
-    [string]$Model = "3b"
+    [string]$Model = "3b",
+    [string]$Tag = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -73,32 +74,91 @@ New-Item -ItemType Directory -Force -Path $llmRoot | Out-Null
 #    最新リリースのタグをGitHub APIで取得し、CPU版zipをダウンロード
 # ---------------------------------------------------------------------
 Write-Host "[1/2] llama.cpp バイナリをダウンロード中..." -ForegroundColor Cyan
-# リリース情報の取得。Invoke-RestMethod が通らない環境があるので curl.exe に落とす
-$api = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-$latest = $null
-try {
-    $latest = Invoke-RestMethod -Uri $api
+# リリース情報を取る。Invoke-RestMethod が通らない環境があるので curl.exe に落とす
+function Get-Json {
+    param([string]$Url)
+    $r = $null
+    try { $r = Invoke-RestMethod -Uri $Url }
+    catch {
+        try { $r = (& curl.exe -L -sS $Url) | ConvertFrom-Json } catch { }
+    }
+    return $r
 }
-catch {
-    try { $latest = (& curl.exe -L -sS $api) | ConvertFrom-Json } catch { }
-}
-if (-not $latest) {
-    Write-Host "llama.cpp のリリース情報を取得できませんでした。" -ForegroundColor Red
-    Write-Host "  $api"
-    exit 1
-}
-$tag = $latest.tag_name
 
-$asset = $latest.assets | Where-Object { $_.name -like "llama-*-bin-win-cpu-x64.zip" } | Select-Object -First 1
-if (-not $asset) {
-    # 旧命名（avx2）へのフォールバック
-    $asset = $latest.assets | Where-Object { $_.name -like "llama-*-bin-win-avx2-x64.zip" } | Select-Object -First 1
+# Windows の CPU版 zip を選ぶ。
+# llama.cpp は配布の命名を変えることがある（b#### 方式 -> v0.x.y 方式など）ので、
+# 既知の名前を順に試し、駄目なら「Windows の x64 zip で GPU 向けでないもの」で拾う。
+function Find-WinCpuAsset {
+    param($Assets)
+    if (-not $Assets) { return $null }
+    $patterns = @(
+        "*bin-win-cpu-x64.zip",
+        "*bin-win-avx2-x64.zip",
+        "*win-cpu-x64.zip",
+        "*win-x64.zip"
+    )
+    foreach ($p in $patterns) {
+        $hit = $Assets | Where-Object { $_.name -like $p } | Select-Object -First 1
+        if ($hit) { return $hit }
+    }
+    $hit = $Assets | Where-Object {
+        $_.name -like "*.zip" -and $_.name -like "*win*" -and $_.name -like "*x64*" -and
+        $_.name -notlike "*cuda*" -and $_.name -notlike "*cudart*" -and
+        $_.name -notlike "*hip*" -and $_.name -notlike "*vulkan*" -and
+        $_.name -notlike "*sycl*" -and $_.name -notlike "*arm*" -and
+        $_.name -notlike "*opencl*"
+    } | Select-Object -First 1
+    return $hit
 }
-if (-not $asset) {
-    Write-Host "Windows CPU版のバイナリが見つかりませんでした（リリース: $tag）。" -ForegroundColor Red
-    Write-Host "https://github.com/ggml-org/llama.cpp/releases から手動でダウンロードしてください。"
+
+$base = "https://api.github.com/repos/ggml-org/llama.cpp/releases"
+$candidates = @()
+if ($Tag -ne "") {
+    $one = Get-Json ($base + "/tags/" + $Tag)
+    if ($one) { $candidates += $one }
+}
+else {
+    $one = Get-Json ($base + "/latest")
+    if ($one) { $candidates += $one }
+    # 最新リリースに Windows バイナリが無いことがある（配布方針の変更など）ので、
+    # 直近のリリースも順に見る
+    $list = Get-Json ($base + "?per_page=20")
+    if ($list) { $candidates += $list }
+}
+if ($candidates.Count -eq 0) {
+    Write-Host "llama.cpp のリリース情報を取得できませんでした。" -ForegroundColor Red
+    Write-Host "  $base"
     exit 1
 }
+
+$rel = $null
+$asset = $null
+foreach ($r in $candidates) {
+    $a = Find-WinCpuAsset $r.assets
+    if ($a) { $rel = $r; $asset = $a; break }
+}
+
+if (-not $asset) {
+    Write-Host "Windows CPU版のバイナリが見つかりませんでした。" -ForegroundColor Red
+    Write-Host "配布の命名が変わった可能性があります。実際に公開されている名前は次のとおりです:"
+    $shown = 0
+    foreach ($r in $candidates) {
+        if ($shown -ge 3) { break }
+        Write-Host ("  [" + $r.tag_name + "]") -ForegroundColor Yellow
+        if ($r.assets) {
+            foreach ($a in $r.assets) { Write-Host ("    " + $a.name) }
+        }
+        else { Write-Host "    (添付なし)" }
+        $shown = $shown + 1
+    }
+    Write-Host ""
+    Write-Host "この一覧を伝えていただければ対応できます。"
+    Write-Host "特定のリリースを使う場合: -Tag v0.3.0 のように指定してください。"
+    exit 1
+}
+
+$tag = $rel.tag_name
+Write-Host ("  " + $tag + " / " + $asset.name) -ForegroundColor DarkGray
 
 $binZip = Join-Path $llmRoot $asset.name
 # ここも再開ありで取る。数十MBあり、社内回線では途中で切れることがある
