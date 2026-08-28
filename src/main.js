@@ -846,6 +846,40 @@ function createTray() {
   updateTray();
 }
 
+// ---------------------------------------------------------------- 更新の適用先
+/*
+ * 更新は src/ をファイル単位で差し替える方式なので、
+ * 「package.json と src/ が素のファイルとして置かれているか」が条件になる。
+ *
+ * app.getAppPath() は、開発時はプロジェクトフォルダ、
+ * インストーラー版（asar 無効）は <インストール先>\resources\app を返すので、
+ * どちらもそのまま適用先になる。asar 同梱でビルドすると書庫の中に入り、
+ * ファイル単位では差し替えられない（package.json の build.asar を参照）。
+ *
+ * 「インストーラー版かどうか」ではなく「実際に差し替えられるか」で判断する。
+ */
+let updateTargetCache = null;
+function updateTarget() {
+  if (updateTargetCache) return updateTargetCache;
+  const root = app.getAppPath();
+  let result;
+  if (/\.asar$/i.test(root)) {
+    result = { ok: false, error: 'このビルドは asar 同梱のため、この方法では更新できません。新しいインストーラーを実行してください。' };
+  } else {
+    // Windows の access() は ACL を見ないので、実際に書いて確かめる
+    try {
+      const probe = path.join(root, `.write-test-${process.pid}`);
+      fs.writeFileSync(probe, '');
+      fs.unlinkSync(probe);
+      result = { ok: true, root };
+    } catch (_) {
+      result = { ok: false, error: `インストール先に書き込めないため更新できません（${root}）。新しいインストーラーを実行してください。` };
+    }
+  }
+  updateTargetCache = result;
+  return result;
+}
+
 // ---------------------------------------------------------------- IPC
 function setupIpc() {
   ipcMain.handle('settings:get', () => settings);
@@ -976,16 +1010,13 @@ function setupIpc() {
   ipcMain.handle('app:version', () => ({ version: app.getVersion(), repo: updater.REPO }));
   ipcMain.handle('update:check', async () => {
     const r = await updater.check(app.getVersion(), app.getPath('userData'));
-    // インストーラー版は src の差し替えでは更新できない（下の update:apply 参照）。
-    // 画面側が「更新して再起動」を出すかどうかの判断に使う。
-    return { ...r, applyable: !app.isPackaged };
+    // 画面側が「更新して再起動」を出すか「ダウンロード」を出すかの判断に使う
+    return { ...r, applyable: updateTarget().ok };
   });
   ipcMain.handle('update:apply', async (_e, url) => {
-    const root = app.isPackaged ? path.dirname(app.getPath('exe')) : app.getAppPath();
-    if (app.isPackaged) {
-      return { ok: false, error: 'インストーラー版はこの方法で更新できません。新しいインストーラーを実行してください。' };
-    }
-    return updater.apply(url, root, app.getPath('userData'),
+    const t = updateTarget();
+    if (!t.ok) return { ok: false, error: t.error };
+    return updater.apply(url, t.root, app.getPath('userData'),
       (msg) => sendToMainWin('update:progress', { message: msg }));
   });
   ipcMain.handle('app:restart', () => {
@@ -1046,7 +1077,7 @@ if (!gotLock) {
     // 起動から少し置いて更新確認。オフラインなら黙って諦める
     setTimeout(async () => {
       const r = await updater.check(app.getVersion(), app.getPath('userData'));
-      if (r.ok && r.update) sendToMainWin('update:available', { ...r, applyable: !app.isPackaged });
+      if (r.ok && r.update) sendToMainWin('update:available', { ...r, applyable: updateTarget().ok });
     }, 8000);
   });
   app.on('window-all-closed', () => { /* トレイ常駐 */ });

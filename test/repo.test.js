@@ -221,6 +221,19 @@ test('preload に公開したまま main.js 側が無い API がない', () => {
 });
 
 // ---------------------------------------------------------------- その他
+test('パッケージ版でもアプリ内更新ができる設定になっている', () => {
+  const pkg = JSON.parse(read('package.json'));
+  assert.strictEqual(pkg.build.asar, false,
+    'asar 同梱だと src/ が書庫の中に入り、ファイル単位で差し替えられなくなる');
+});
+
+test('更新の可否はビルド種別ではなく「差し替えられるか」で判断する', () => {
+  assert.ok(main.includes('function updateTarget'), 'updateTarget が無い');
+  assert.ok(/\\.asar\$/.test(main), 'asar 同梱を検出していない');
+  assert.ok(!/applyable:\s*!app\.isPackaged/.test(main),
+    'インストーラー版というだけで更新を拒否している');
+});
+
 test('package.json のバージョンが semver 形式', () => {
   const pkg = JSON.parse(read('package.json'));
   assert.match(pkg.version, /^\d+\.\d+\.\d+$/);

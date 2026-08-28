@@ -109,11 +109,34 @@ data/
 
 ## 起動方法
 
-1. **ショートカット**: `create-shortcut.ps1` を一度実行すると、デスクトップと
-   スタートメニューに登録されます（コンソールは出ません）
-2. **バッチ**: `start-listener.bat`
-3. **exe化**: `npm run dist`（ポータブル）/ `npm run dist:installer`（インストーラー）
-   ※ 設定の「自動起動」はインストーラー版でのみ動作します
+### インストーラー（配布するならこれ）
+
+```powershell
+npm run dist:installer
+```
+
+`dist\Listener-<版>-setup.exe` ができます。ユーザー単位のインストールなので
+管理者権限は不要で、`%LOCALAPPDATA%\Programs\Listener\Listener.exe` に入り、
+デスクトップとスタートメニューにショートカットが作られます。
+設定の「Windowsサインイン時に自動起動」もこの形でのみ動作します。
+
+`build.asar` を `false` にしてあるため、`src/` は素のファイルとして置かれ、
+**インストーラー版でもアプリ内更新（数百KB）がそのまま使えます**。
+
+### ソースから起動（開発時）
+
+```powershell
+npm start
+```
+
+`create-shortcut.ps1` を一度実行すると、`node_modules` の electron を指す
+ショートカットがデスクトップとスタートメニューに作られます（コンソールは出ません）。
+`start-listener.bat` でも起動できます。
+
+### ポータブル版について
+
+`npm run dist` で単体exeも作れますが、**起動のたびに一時フォルダへ展開して動く**ため、
+アプリ内更新が次回起動に残りません。自動更新を使うならインストーラー版にしてください。
 
 ## 高速化
 
