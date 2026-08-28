@@ -33,13 +33,20 @@ const LOOPBACK = 'loopback';
  * 空オブジェクトを返すと要求元の Promise が reject する。これは想定どおりの
  * 失敗で、呼び出し側はマイクだけの録音へ落ちる。
  *
- * @param {{platform: string, frame: any}} ctx
+ * @param {{platform: string, frame: any, enabled: boolean, url: string}} ctx
  * @returns {{video?: any, audio?: string}}
  */
 function chooseDisplayMedia(ctx) {
-  const { platform, frame } = ctx || {};
+  const { platform, frame, enabled, url } = ctx || {};
   if (platform !== 'win32') return {};   // Windows 以外は取り込まない
+  if (!enabled) return {};               // 設定がオフなら誰にも渡さない
   if (!frame) return {};
+  // 要求元が分かるなら、録音オーバーレイ以外には渡さない。
+  // 分からない場合は通す（ここで固く弾くと、URLの取れない環境で
+  // 機能そのものが黙って死ぬ。守りたいのは「別の画面からの要求」であって、
+  // 素性の分からない要求ではない）。
+  const u = String(url || '');
+  if (u && !/overlay\.html/i.test(u)) return {};
   return { video: frame, audio: LOOPBACK };
 }
 

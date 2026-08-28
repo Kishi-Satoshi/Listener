@@ -14,32 +14,47 @@ const path = require('node:path');
 
 const { chooseDisplayMedia, LOOPBACK } = require('../src/loopback');
 
+const OK = { platform: 'win32', enabled: true, url: 'file:///c/app/src/renderer/overlay.html' };
+
 test('Windows では映像と loopback を返す', () => {
   const frame = { id: 1 };
-  assert.deepStrictEqual(chooseDisplayMedia({ platform: 'win32', frame }),
-    { video: frame, audio: 'loopback' });
+  assert.deepStrictEqual(chooseDisplayMedia({ ...OK, frame }), { video: frame, audio: 'loopback' });
 });
 
 test('映像を必ず返す（音声だけを要求すると必ず失敗する仕様のため）', () => {
-  const r = chooseDisplayMedia({ platform: 'win32', frame: { id: 1 } });
+  const r = chooseDisplayMedia({ ...OK, frame: { id: 1 } });
   assert.ok(r.video, '映像を外すと getDisplayMedia が TypeError になる');
 });
 
 test('既定の再生デバイスをミュートする loopbackWithMute は使わない', () => {
   // 使うと録音中に会議相手の声が自分に聞こえなくなる
   assert.strictEqual(LOOPBACK, 'loopback');
-  assert.strictEqual(chooseDisplayMedia({ platform: 'win32', frame: {} }).audio, 'loopback');
+  assert.strictEqual(chooseDisplayMedia({ ...OK, frame: {} }).audio, 'loopback');
 });
 
 test('Windows 以外では取り込まない（ループバックは Windows 限定）', () => {
   for (const platform of ['darwin', 'linux', 'freebsd', '']) {
-    assert.deepStrictEqual(chooseDisplayMedia({ platform, frame: {} }), {}, platform);
+    assert.deepStrictEqual(chooseDisplayMedia({ ...OK, platform, frame: {} }), {}, platform);
   }
 });
 
+test('設定がオフなら誰にも渡さない', () => {
+  assert.deepStrictEqual(chooseDisplayMedia({ ...OK, enabled: false, frame: {} }), {});
+  assert.deepStrictEqual(chooseDisplayMedia({ platform: 'win32', frame: {} }), {});
+});
+
+test('録音オーバーレイ以外の画面からの要求は断る', () => {
+  // メイン画面から無警告でシステム音声を取れてはいけない
+  assert.deepStrictEqual(
+    chooseDisplayMedia({ ...OK, frame: {}, url: 'file:///c/app/src/renderer/app.html' }), {});
+  // 素性が分からない場合は通す。ここで固く弾くと、URLの取れない環境で
+  // 機能そのものが黙って死ぬ。
+  assert.ok(chooseDisplayMedia({ ...OK, frame: {}, url: '' }).audio);
+});
+
 test('要求元フレームが無ければ何も返さない', () => {
-  assert.deepStrictEqual(chooseDisplayMedia({ platform: 'win32', frame: null }), {});
-  assert.deepStrictEqual(chooseDisplayMedia({ platform: 'win32' }), {});
+  assert.deepStrictEqual(chooseDisplayMedia({ ...OK, frame: null }), {});
+  assert.deepStrictEqual(chooseDisplayMedia({ ...OK }), {});
   assert.deepStrictEqual(chooseDisplayMedia(), {});
 });
 
@@ -120,4 +135,53 @@ test('新しい設定キーがエンジンの再起動条件に入っていな�
   for (const key of ['useSystemAudio', 'useBuiltinTerms']) {
     assert.ok(!sig[0].includes(key), `${key} が engineSignature に入っている`);
   }
+});
+
+test('openStream の待ちが明けたら、押された停止・破棄を見ている', () => {
+  // 見ないと、押したあともマイクと画面キャプチャを掴んだまま録り続ける
+  const st = overlayHtml.match(/async function start\(\)[\s\S]*?\n {2}\}/);
+  assert.ok(st, 'start が見つからない');
+  const after = st[0].slice(st[0].indexOf('await openStream()'));
+  assert.match(after, /if \(cancelled\)/);
+  assert.match(after, /if \(stopping\)/);
+});
+
+test('相手の声が途中で切れたら main へ報告し直す', () => {
+  // しないと、マイクしか録れていないのに「相手の声も」と表示し続ける
+  const open = overlayHtml.match(/async function openStream\(\)[\s\S]*?\n {2}\}/);
+  assert.ok(open, 'openStream が見つからない');
+  const ended = open[0].slice(open[0].indexOf("addEventListener('ended'"));
+  assert.match(ended, /reportSource\(false, true\)/);
+});
+
+test('マイクだけが死んだ状態を相手の声でマスクしない', () => {
+  const chk = overlayHtml.match(/function checkSilence\([\s\S]*?\n {2}\}/);
+  assert.ok(chk, 'checkSilence が見つからない');
+  assert.match(chk[0], /micSilentSince/);
+  assert.match(chk[0], /sysOn/);
+});
+
+test('二重起動を止めるガードがあり、解除もされる', () => {
+  // executeJavaScript と IPC の両方が届くと MediaRecorder が2つになり、
+  // chunks が混ざって全区間が壊れる
+  assert.match(overlayHtml, /if \(starting \|\| pill\.dataset\.phase === 'recording'\) return;/);
+  const cl = overlayHtml.match(/function cleanup\(\)[\s\S]*?\n {2}\}/);
+  assert.ok(cl && cl[0].includes('starting = false'), 'cleanup で解除していない');
+});
+
+test('日本語以外では既定語彙を渡さない', () => {
+  // 英語や自動判定で日本語の語を渡すと、その語が出力に漏れ、
+  // 言語の推定も日本語へ引っぱられる
+  const bp = main.match(/function buildPrompt\([\s\S]*?\n\}/);
+  assert.ok(bp, 'buildPrompt が見つからない');
+  assert.match(bp[0], /const ja = settings\.language === 'ja'/);
+  assert.match(bp[0], /if \(ja && settings\.useBuiltinTerms !== false\)/);
+});
+
+test('ユーザー辞書は予算で切らない', () => {
+  // 辞書を育ててきた利用者の認識精度が黙って落ちるのを防ぐ
+  const bp = main.match(/function buildPrompt\([\s\S]*?\n\}/)[0];
+  const userLoop = bp.slice(bp.indexOf('settings.dictionary'), bp.indexOf('if (ja &&'));
+  assert.ok(!userLoop.includes('budget'), 'ユーザー辞書に予算を掛けている');
+  assert.ok(!/break;/.test(bp), '長い語ひとつで後続を捨てている');
 });

@@ -134,6 +134,8 @@
   let sysStream = null;    // getDisplayMedia の生ストリーム（相手の声）
   let mixDest = null;
   let sysAnalyser = null;
+  let sysGain = null;      // 開始ビープを録らないよう、鳴らす瞬間だけ閉じる
+  let starting = false;    // 二重起動よけ
   let sysWanted = false;   // 設定でオンになっているか
   let sysOn = false;       // 実際に取り込めたか
   let recorder = null;
@@ -251,6 +253,12 @@
   let silentWarned = false;
   const SILENT_WARN_MS = 8000;
   const SILENT_LEVEL = 0.02;
+  // 相手の声も録っているとき、マイクだけが死んでいると
+  // 両側の合計では音が入っているので上の見張りに引っかからない。
+  // 自分の発言だけが会議まるごと欠けるので、別に数える。
+  // 聞き役に回っているだけのときに警告しないよう、こちらは長めにとる。
+  let micSilentSince = 0;
+  const MIC_SILENT_WARN_MS = 60000;
   // 声の大きさ（RMS）。マイクと相手の声で同じ計算を使う。
   function rmsOf(node) {
     const data = new Uint8Array(node.fftSize);
@@ -349,7 +357,7 @@
       // [相手の声] → sysGain ──┼→ mixBus(1ch) → mixDest → MediaRecorder
       //                        └→ sysAnalyser（相手のレベル）
       const micGain = audioCtx.createGain(); micGain.gain.value = 1.0;
-      const sysGain = audioCtx.createGain(); sysGain.gain.value = 1.0;
+      sysGain = audioCtx.createGain(); sysGain.gain.value = 1.0;
 
       // ここでモノラルに確定させる。explicit + 1ch にすると「足す前に」
       // 各入力がモノラルへ落ちるので、相手の声が 2ch でも取りこぼさない。
@@ -373,17 +381,24 @@
       sysSrc.connect(sysGain).connect(mixBus);
       sysGain.connect(sysAnalyser);
 
-      // 開始のビープはスピーカーへ出る＝ループバックにも乗る。最初だけ閉じる。
-      const t0 = audioCtx.currentTime;
-      sysGain.gain.setValueAtTime(0, t0);
-      sysGain.gain.setValueAtTime(1.0, t0 + 0.3);
+      // 開始のビープはスピーカーへ出る＝ループバックにも乗る。
+      // 閉じるのはビープを鳴らす瞬間（start 側の muteSystemForBeep）。
+      // ここで閉じてしまうと、下のチャンネル数待ちの分だけ先に明けてしまう。
 
       mixBus.connect(mixDest);
 
       // 途中で取り込みが切れてもマイクだけで録り続ける。
       // 録音対象は mixDest.stream で固定なので、MediaRecorder は影響を受けない。
       const st = sysStream.getAudioTracks()[0];
-      st.addEventListener('ended', () => { sysAnalyser = null; sysOn = false; });
+      st.addEventListener('ended', () => {
+        if (!sysOn) return;                  // releaseStream の stop() では発火しないが念のため
+        sysAnalyser = null; sysOn = false;
+        sysGain = null;
+        // 報告し直さないと、以後マイクしか録れていないのに
+        // ピルもアプリのバーも「相手の声も」と言い続ける。
+        window.koeOverlay.reportSource(false, true);
+        if (!stopping && !cancelled) setPhase('recording', recordingLabel());
+      });
 
       mediaStream = mixDest.stream;
       // Chromium は音が1量子流れるまで、この出力を 2ch と名乗り続けることがある。
@@ -404,6 +419,14 @@
     drawWave();
   }
 
+  // 開始・停止のビープが相手の声として録音に混ざらないよう、鳴らす前後だけ閉じる
+  function muteSystemForBeep() {
+    if (!sysGain || !audioCtx) return;
+    const t = audioCtx.currentTime;
+    sysGain.gain.setValueAtTime(0, t);
+    sysGain.gain.setValueAtTime(1.0, t + 0.3);
+  }
+
   function newRecorder() {
     const mime = pickMime();
     const rec = new MediaRecorder(
@@ -415,13 +438,15 @@
   }
 
   async function start() {
-    cleanup();
+    cleanup();            // 立っていれば starting もここで倒れる
+    starting = true;      // openStream を待っている間の二重起動を止める
     cancelled = false;
     stopping = false;
     chunks = [];
     ampHist = [];
     silentSince = 0;
     silentWarned = false;
+    micSilentSince = 0;
     firstSegDone = false;
     setPhase('recording', recordingLabel());   // 取り込みの成否が決まったら openStream が貼り直す
     timerEl.textContent = '0:00';
@@ -435,12 +460,26 @@
       window.koeOverlay.sendError('マイクにアクセスできません（OSのマイク許可を確認してください）');
       return;
     }
+    // ここに来るまでに数秒かかることがある（相手の声の取り込み・デバイスの
+    // オープン）。その間に「終了」「破棄」が押されていることがあるので、
+    // 進む前にもう一度見る。見ないと、押したあともマイクと画面キャプチャを
+    // 掴んだまま最初の区間が終わるまで（最大20秒）録り続ける。
+    if (cancelled) { cleanup(); return; }
+    if (stopping) {
+      cleanup();
+      // main は終了処理に入って最後の区間を待っている。空で閉じてやる。
+      if (mode === 'meeting') window.koeOverlay.sendSegment(new Uint8Array(0), 0, true);
+      else window.koeOverlay.sendError('録音を開始できませんでした');
+      return;
+    }
+    muteSystemForBeep();
     beep(SND.start);
     startedAt = Date.now();
     timerId = setInterval(() => { timerEl.textContent = fmt(Date.now() - startedAt); }, 250);
 
     if (mode === 'meeting') startMeetingSegment();
     else startDictation();
+    starting = false;   // ここから先は phase='recording' が二重起動を止める
   }
 
   // --- 音声入力（1本録り） ---
@@ -507,6 +546,7 @@
     stopping = true;
     if (autoStopId) clearTimeout(autoStopId);
     setPhase('processing', mode === 'meeting' ? '議事録を作成中…' : '文字起こし中…');
+    muteSystemForBeep();   // 終了のビープを最後の区間に録り込まない
     beep(SND.stop);
     if (recorder && recorder.state === 'recording') recorder.stop();
   }
@@ -531,6 +571,16 @@
     if (stopping || cancelled || pill.dataset.phase !== 'recording') return;
     const level = Math.max(micLevel, sysLevel || 0);
     const now = Date.now();
+
+    // 相手の声が来ているのにマイクだけ無音、が続く場合
+    if (micLevel > SILENT_LEVEL) micSilentSince = 0;
+    else if (micSilentSince === 0) micSilentSince = now;
+    else if (sysOn && !silentWarned && now - micSilentSince >= MIC_SILENT_WARN_MS) {
+      silentWarned = true;
+      setPhase('recording', 'マイクの音が入っていません');
+      return;
+    }
+
     if (level > SILENT_LEVEL) {
       silentSince = 0;
       if (silentWarned) {
@@ -557,6 +607,7 @@
     analyser = null;
     sysAnalyser = null;
     mixDest = null;
+    sysGain = null;
     ctx2d.clearRect(0, 0, canvas.width, canvas.height);
   }
   function releaseStream() {
@@ -578,6 +629,7 @@
     stopMeters();
     releaseStream();
     chunks = [];
+    starting = false;
   }
 
   document.getElementById('okBtn').addEventListener('click', () => window.koeOverlay.confirmStop());
@@ -587,6 +639,9 @@
   // getDisplayMedia は「ユーザー操作の直後」を求めることがあり、
   // IPC 経由だとその扱いにならない場合があるため。
   window.__koeStart = (p) => {
+    // main は executeJavaScript と IPC の2経路で呼ぶ（前者が失敗したら後者）。
+    // 両方届くと MediaRecorder が2つになり、chunks が混ざって全区間が壊れる。
+    if (starting || pill.dataset.phase === 'recording') return;
     mode = (p && p.mode) || 'dictation';
     segmentMs = ((p && p.segmentSec) || 75) * 1000;
     micId = (p && p.micId) || '';

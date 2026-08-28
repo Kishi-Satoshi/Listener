@@ -161,20 +161,29 @@ const PROMPT_MAX_CHARS = 200;
 
 function buildPrompt(extraTail) {
   const parts = [];
-  if (settings.language === 'ja') parts.push('以下は日本語の会議の録音です。句読点を含めて正確に書き起こします。');
+  const ja = settings.language === 'ja';
+  if (ja) parts.push('以下は日本語の会議の録音です。句読点を含めて正確に書き起こします。');
   const tail = String(extraTail || '');
-  let budget = PROMPT_MAX_CHARS - parts.join(' ').length - tail.length - 4;
 
-  // ユーザーが入れた固有名詞を先に確保し、余った分だけ既定語彙を足す。
-  // 予算に収まらなければ既定語彙側から落ちる。
-  const user = Array.isArray(settings.dictionary) ? settings.dictionary : [];
-  const builtin = settings.useBuiltinTerms === false ? [] : BUILTIN_TERMS;
+  // ユーザーが入れた語は今までどおり全部渡す。ここを予算で切ると、
+  // 辞書を育ててきた利用者の認識精度が黙って落ちる。
   const terms = [];
-  for (const raw of user.concat(builtin)) {
+  for (const raw of (Array.isArray(settings.dictionary) ? settings.dictionary : [])) {
     const w = String(raw || '').trim();
-    if (!w || terms.includes(w)) continue;
-    if (budget - (w.length + 1) < 0) break;
-    terms.push(w); budget -= w.length + 1;
+    if (w && !terms.includes(w)) terms.push(w);
+  }
+
+  // 既定語彙は日本語のときだけ。英語や自動判定で日本語の語を渡すと、
+  // その語がそのまま出力に漏れたり、言語の推定を日本語へ引っぱったりする。
+  // 余った予算に収まる分だけ足す（長い語が1つあっても後続を捨てないよう continue）。
+  if (ja && settings.useBuiltinTerms !== false) {
+    let budget = PROMPT_MAX_CHARS - parts.join(' ').length - tail.length
+      - terms.join('、').length - 6;
+    for (const w of BUILTIN_TERMS) {
+      if (terms.includes(w)) continue;
+      if (budget - (w.length + 1) < 0) continue;
+      terms.push(w); budget -= w.length + 1;
+    }
   }
   if (terms.length) parts.push(`用語: ${terms.join('、')}`);
   if (tail) parts.push(tail);
@@ -1180,7 +1189,13 @@ if (!gotLock) {
     // 第2引数（useSystemPicker）は Electron 33 以降のもの。ここで渡すと
     // ハンドラごと無効になるので、引数はコールバック1つだけにする。
     session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
-      callback(chooseDisplayMedia({ platform: process.platform, frame: request.frame }));
+      const frame = request && request.frame;
+      callback(chooseDisplayMedia({
+        platform: process.platform,
+        frame,
+        enabled: Boolean(settings.useSystemAudio),   // 設定がオフなら誰にも渡さない
+        url: frame ? frame.url : '',
+      }));
     });
     createOverlay();
     createTray();

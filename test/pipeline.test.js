@@ -11,7 +11,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { markdownToBlocks } = require('../src/minutes');
+const { markdownToBlocks, dropRedundantEmpty } = require('../src/minutes');
 const { attachCitations } = require('../src/cite');
 const { enrichActionBlocks } = require('../src/actions');
 const mtype = require('../src/meetingType');
@@ -21,7 +21,9 @@ const { STANDUP_SEGMENTS, STANDUP_SUMMARY_MD, STANDUP_UNGROUNDED } = require('./
 // 担当・期限の抽出が先。出典の突き合わせは「（担当: ○○ / 期限: ○○）」を
 // 落とした本文に対して行う（書式が残るとその語がクエリに混ざって一致がぶれる）。
 function runPipeline(md, segments, baseDate) {
-  const blocks = markdownToBlocks(md);
+  // 「特になし」の混入を先に落とす。ここで落とさないと
+  // 「- [ ] 特になし」がアクション1件として数えられる。
+  const blocks = dropRedundantEmpty(markdownToBlocks(md));
   const actionStat = enrichActionBlocks(blocks, baseDate);
   const citeStat = attachCitations(blocks, segments);
   return { blocks, citeStat, actionStat };

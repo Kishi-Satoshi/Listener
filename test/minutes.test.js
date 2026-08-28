@@ -154,21 +154,23 @@ test('書き出し → 読み戻しで議事録の中身が保たれる', () => 
 // 実機の議事録に「**受注管理システムの回収**: …」がそのまま出た。
 // 表示が汚いだけでなく、cite.js の突き合わせで記号がバイグラムに残り、
 // 短い要点では出典が丸ごと消える。
-test('太字・斜体・コードの記号を落とす', () => {
+test('太字とコードの記号を落とす', () => {
   assert.strictEqual(markdownToBlocks('- **受注管理の改修**: 完了')[0].text, '受注管理の改修: 完了');
-  assert.strictEqual(markdownToBlocks('- *強調* する')[0].text, '強調 する');
   assert.strictEqual(markdownToBlocks('- ***両方*** の指定')[0].text, '両方 の指定');
-  assert.strictEqual(markdownToBlocks('- __下線風__ の指定')[0].text, '下線風 の指定');
   assert.strictEqual(markdownToBlocks('- `npm test` を流す')[0].text, 'npm test を流す');
   assert.strictEqual(markdownToBlocks('## **見出しも**')[0].text, '見出しも');
   assert.strictEqual(markdownToBlocks('地の文の **太字** も')[0].text, '地の文の 太字 も');
 });
 
-test('書式でないアスタリスクは触らない', () => {
+test('数字を書き換えるくらいなら記号を残す', () => {
+  // 「*」1個の強調と「__…__」は扱わない。
+  // 「工数は 3人*2日*5週」が「3人2日5週」になる方が、装飾が残るより遥かに悪い。
+  assert.strictEqual(stripInlineMarkdown('工数は 3人*2日*5週'), '工数は 3人*2日*5週');
+  assert.strictEqual(stripInlineMarkdown('単価100円*3個で300円'), '単価100円*3個で300円');
+  assert.strictEqual(stripInlineMarkdown('__init__ を直す'), '__init__ を直す');
   assert.strictEqual(markdownToBlocks('- 注記*1 を参照')[0].text, '注記*1 を参照');
   assert.strictEqual(markdownToBlocks('- 売上は 2*3 の関係')[0].text, '売上は 2*3 の関係');
-  assert.strictEqual(stripInlineMarkdown('a * b * c'), 'a * b * c');   // 空白始まりは強調ではない
-  assert.strictEqual(stripInlineMarkdown('5% * 3'), '5% * 3');
+  assert.strictEqual(stripInlineMarkdown('a * b * c'), 'a * b * c');
 });
 
 test('チェックボックスの本文からも書式を落とす', () => {
@@ -232,4 +234,19 @@ test('全部が定型句なら1行も落とさない', () => {
 
 test('空配列でも落ちない', () => {
   assert.deepStrictEqual(dropRedundantEmpty([]), []);
+});
+
+test('「特になし」のチェックボックスはアクションに数えない', () => {
+  // チェックボックスのままだと「アクション 1件」と数えられ、
+  // 横断アクション一覧にも架空のタスクとして並ぶ
+  const r = dropRedundantEmpty(markdownToBlocks('## アクションアイテム\n- [ ] 特になし'));
+  assert.deepStrictEqual(r.map((b) => `${b.type}:${b.text}`),
+    ['heading:アクションアイテム', 'bullet:特になし']);
+  assert.strictEqual(r[1].checked, undefined);
+});
+
+test('本物のアクションはチェックボックスのまま残す', () => {
+  const r = dropRedundantEmpty(markdownToBlocks('## アクションアイテム\n- [ ] 実行計画を確認する'));
+  assert.strictEqual(r[1].type, 'todo');
+  assert.strictEqual(r[1].checked, false);
 });
