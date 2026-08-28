@@ -135,7 +135,11 @@
   let mixDest = null;
   let sysAnalyser = null;
   let sysGain = null;      // 開始ビープを録らないよう、鳴らす瞬間だけ閉じる
-  let starting = false;    // 二重起動よけ
+  // 二重起動よけ。表示の状態（pill.dataset.phase）で判定してはいけない。
+  // マークアップの初期値が data-phase="recording" なので、起動後の1回目が
+  // 必ず弾かれる。表示は表示、録っているかは録っているかで持つ。
+  let starting = false;    // start() の中で、まだ録り始めていない
+  let active = false;      // 録音中（stop / cancel / 変換完了で倒す）
   let sysWanted = false;   // 設定でオンになっているか
   let sysOn = false;       // 実際に取り込めたか
   let recorder = null;
@@ -250,7 +254,6 @@
   // 無音の続いた時間。マイクが塞がれていると、エラーも出ないまま
   // 無音のまま録り続けてしまい、文字起こしが空になるまで気づけない。
   let silentSince = 0;
-  let silentWarned = false;
   const SILENT_WARN_MS = 8000;
   const SILENT_LEVEL = 0.02;
   // 相手の声も録っているとき、マイクだけが死んでいると
@@ -259,6 +262,14 @@
   // 聞き役に回っているだけのときに警告しないよう、こちらは長めにとる。
   let micSilentSince = 0;
   const MIC_SILENT_WARN_MS = 60000;
+  // いま出している文言。二つの見張りがフラグを取り合うと、
+  // 相手が喋っている間じゅう警告と通常表示が毎フレーム入れ替わって読めなくなる。
+  // 「出すべき文言」を毎フレーム決め、変わったときだけ書き換える。
+  let shownLabel = '';
+  function showRecording(label) {
+    shownLabel = label;
+    setPhase('recording', label);
+  }
   // 声の大きさ（RMS）。マイクと相手の声で同じ計算を使う。
   function rmsOf(node) {
     const data = new Uint8Array(node.fftSize);
@@ -397,7 +408,8 @@
         // 報告し直さないと、以後マイクしか録れていないのに
         // ピルもアプリのバーも「相手の声も」と言い続ける。
         window.koeOverlay.reportSource(false, true);
-        if (!stopping && !cancelled) setPhase('recording', recordingLabel());
+        // 次のフレームで checkSilence が出すべき文言を決め直す
+        shownLabel = '';
       });
 
       mediaStream = mixDest.stream;
@@ -414,8 +426,12 @@
       mediaStream = micStream;   // 従来どおりの1本録り
     }
 
+    // 待っている間に「終了」「破棄」が押されていることがある。
+    // ここで表示を 'recording' に戻すと、押した後なのに録音中に見えるうえ、
+    // 二度と録音を始められなくなる（表示の状態を起動条件に使っていた頃の名残）。
+    if (cancelled || stopping) return;
     if (sysWanted) window.koeOverlay.reportSource(sysOn, true);
-    setPhase('recording', recordingLabel());
+    showRecording(recordingLabel());
     drawWave();
   }
 
@@ -445,10 +461,10 @@
     chunks = [];
     ampHist = [];
     silentSince = 0;
-    silentWarned = false;
     micSilentSince = 0;
+    shownLabel = '';
     firstSegDone = false;
-    setPhase('recording', recordingLabel());   // 取り込みの成否が決まったら openStream が貼り直す
+    showRecording(recordingLabel());   // 取り込みの成否が決まったら openStream が貼り直す
     timerEl.textContent = '0:00';
     pill.classList.toggle('meeting', mode === 'meeting');
 
@@ -479,7 +495,8 @@
 
     if (mode === 'meeting') startMeetingSegment();
     else startDictation();
-    starting = false;   // ここから先は phase='recording' が二重起動を止める
+    starting = false;
+    active = true;      // ここから先は active が二重起動を止める
   }
 
   // --- 音声入力（1本録り） ---
@@ -566,34 +583,27 @@
   // 表示を書き換えるだけで、録音そのものには手を触れない。
   // 相手の声も録っているときは、どちらかに音が入っていれば無音ではない。
   // 聞き役に回っている間じゅう警告を出すと、本当にマイクが死んだときに
-  // 誰も見なくなる。
+  // 誰も見なくなる。一方、マイクだけが死んでいる状態は相手の声に隠れるので、
+  // そちらは別に数える（自分の発言が会議まるごと欠ける）。
   function checkSilence(micLevel, sysLevel) {
     if (stopping || cancelled || pill.dataset.phase !== 'recording') return;
-    const level = Math.max(micLevel, sysLevel || 0);
     const now = Date.now();
+    const level = Math.max(micLevel, sysLevel || 0);
 
-    // 相手の声が来ているのにマイクだけ無音、が続く場合
+    if (level > SILENT_LEVEL) silentSince = 0;
+    else if (silentSince === 0) silentSince = now;
+
     if (micLevel > SILENT_LEVEL) micSilentSince = 0;
     else if (micSilentSince === 0) micSilentSince = now;
-    else if (sysOn && !silentWarned && now - micSilentSince >= MIC_SILENT_WARN_MS) {
-      silentWarned = true;
-      setPhase('recording', 'マイクの音が入っていません');
-      return;
-    }
 
-    if (level > SILENT_LEVEL) {
-      silentSince = 0;
-      if (silentWarned) {
-        silentWarned = false;
-        setPhase('recording', recordingLabel());
-      }
-      return;
+    // 両方無音の方を優先する。マイクだけの警告より事態が重い。
+    let label = recordingLabel();
+    if (silentSince && now - silentSince >= SILENT_WARN_MS) {
+      label = '音が入っていません。マイクを確認してください';
+    } else if (sysOn && micSilentSince && now - micSilentSince >= MIC_SILENT_WARN_MS) {
+      label = 'マイクの音が入っていません';
     }
-    if (silentSince === 0) { silentSince = now; return; }
-    if (!silentWarned && now - silentSince >= SILENT_WARN_MS) {
-      silentWarned = true;
-      setPhase('recording', '音が入っていません。マイクを確認してください');
-    }
+    if (label !== shownLabel) showRecording(label);
   }
 
   function stopMeters() {
@@ -624,12 +634,15 @@
     mediaStream = null;
     sysOn = false;
     recorder = null;
+    // 音声入力の正常終了は cleanup を通らず、ここだけを通る。
+    // 倒し忘れると次の録音が永久に始まらない。
+    starting = false;
+    active = false;
   }
   function cleanup() {
     stopMeters();
-    releaseStream();
+    releaseStream();   // starting / active はここで倒れる
     chunks = [];
-    starting = false;
   }
 
   document.getElementById('okBtn').addEventListener('click', () => window.koeOverlay.confirmStop());
@@ -641,7 +654,7 @@
   window.__koeStart = (p) => {
     // main は executeJavaScript と IPC の2経路で呼ぶ（前者が失敗したら後者）。
     // 両方届くと MediaRecorder が2つになり、chunks が混ざって全区間が壊れる。
-    if (starting || pill.dataset.phase === 'recording') return;
+    if (starting || active) return;
     mode = (p && p.mode) || 'dictation';
     segmentMs = ((p && p.segmentSec) || 75) * 1000;
     micId = (p && p.micId) || '';

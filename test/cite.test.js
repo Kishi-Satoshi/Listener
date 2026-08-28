@@ -124,3 +124,27 @@ test('再実行しても結果が変わらない（冪等）', () => {
   const b = mk(); attachCitations(b, SEGS); attachCitations(b, SEGS);
   assert.deepStrictEqual(a[0].cites, b[0].cites);
 });
+
+// ---------------------------------------------------------------- 記号の正規化
+//
+// 要約に「**内定**: 0名」のような装飾が残ると、索引に無いバイグラムが増えて
+// 被覆率のふるいに掛かり、出典が丸ごと消える。要約側で落としてはいるが、
+// ユーザーが手で書いた記号もあるので、ここでも落とす。
+test('装飾の記号は突き合わせの前に落ちる', () => {
+  assert.strictEqual(normalize('**内定**: 0名'), '内定0名');
+  assert.strictEqual(normalize('__強調__'), '強調');
+  assert.strictEqual(normalize('内定は0名'), '内定は0名');
+});
+
+test('装飾が付いていても同じ発言に当たる', () => {
+  const segs = [
+    { id: 's1', text: '採用の状況ですが、応募は8名で、内定は0名です。' },
+    { id: 's2', text: '来週の定例で、在庫連携のバッチ処理の話をします。' },
+  ];
+  const idx = buildIndex(segs);
+  const plain = matchOne('内定は0名', idx);
+  const decorated = matchOne('**内定**は0名', idx);
+  assert.deepStrictEqual(decorated.map((h) => h.id), plain.map((h) => h.id),
+    '装飾の有無で出典が変わってはいけない');
+  assert.ok(plain.length > 0, '素の文でも出典が付いていない（前提が崩れている）');
+});
