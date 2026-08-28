@@ -228,6 +228,12 @@
       : `${m}:${String(sec).padStart(2, '0')}`;
   }
   let ampHist = [];
+  // 無音の続いた時間。マイクが塞がれていると、エラーも出ないまま
+  // 無音のまま録り続けてしまい、文字起こしが空になるまで気づけない。
+  let silentSince = 0;
+  let silentWarned = false;
+  const SILENT_WARN_MS = 8000;
+  const SILENT_LEVEL = 0.02;
   function drawWave() {
     const w = canvas.width, h = canvas.height;
     ctx2d.clearRect(0, 0, w, h);
@@ -241,6 +247,7 @@
       sum += v * v;
     }
     const level = Math.min(1, Math.sqrt(sum / data.length) * 3.4);
+    checkSilence(level);
     ampHist.push(level);
     const bars = 40;
     if (ampHist.length > bars) ampHist.shift();
@@ -304,6 +311,8 @@
     stopping = false;
     chunks = [];
     ampHist = [];
+    silentSince = 0;
+    silentWarned = false;
     firstSegDone = false;
     setPhase('recording', mode === 'meeting' ? '議事録を記録中' : '聞き取り中…');
     timerEl.textContent = '0:00';
@@ -400,6 +409,26 @@
     else cleanup();
     setTimeout(() => pill.classList.remove('visible'), 400);
     setTimeout(() => window.koeOverlay.requestHide(), 650);
+  }
+
+  // 音が入っていないまま録り続けていないか見張る。
+  // 表示を書き換えるだけで、録音そのものには手を触れない。
+  function checkSilence(level) {
+    if (stopping || cancelled || pill.dataset.phase !== 'recording') return;
+    const now = Date.now();
+    if (level > SILENT_LEVEL) {
+      silentSince = 0;
+      if (silentWarned) {
+        silentWarned = false;
+        setPhase('recording', mode === 'meeting' ? '議事録を記録中' : '聞き取り中…');
+      }
+      return;
+    }
+    if (silentSince === 0) { silentSince = now; return; }
+    if (!silentWarned && now - silentSince >= SILENT_WARN_MS) {
+      silentWarned = true;
+      setPhase('recording', '音が入っていません。マイクを確認してください');
+    }
   }
 
   function stopMeters() {
