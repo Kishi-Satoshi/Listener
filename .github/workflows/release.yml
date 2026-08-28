@@ -164,8 +164,11 @@ jobs:
       - name: 依存を入れる（electron / electron-builder）
         run: npm install --no-audit --no-fund
 
+      # --publish never を渡す。CI では electron-builder が自分で
+      # GitHub へ publish しようとして GH_TOKEN を要求し、失敗する。
+      # 添付は下のステップで自分で行う（リリースの作り方を握っておきたい）。
       - name: インストーラーを作る
-        run: npm run dist:installer
+        run: npm run dist:installer -- --publish never
 
       - name: Release に添付する
         env:
