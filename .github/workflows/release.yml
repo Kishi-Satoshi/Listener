@@ -164,20 +164,41 @@ jobs:
         with:
           node-version: '22'
 
+      # 同じ版で二度ビルドすると、埋め込まれる時刻などの違いでハッシュが変わる。
+      # 公開済みの exe を差し替えると、先に落とした人と中身が食い違うので、
+      # 既に添付されていれば何もしない（作り直したい場合は版を上げる）。
+      - name: 公開済みか確認する
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+               --json assets --jq '.assets[].name' | grep -q -- '-setup\.exe$'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "$TAG には既にインストーラーが添付されています。作り直しません。"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 依存を入れる（electron / electron-builder）
+        if: steps.exists.outputs.skip == 'false'
         run: npm install --no-audit --no-fund
 
       # --publish never を渡す。CI では electron-builder が自分で
       # GitHub へ publish しようとして GH_TOKEN を要求し、失敗する。
       # 添付は下のステップで自分で行う（リリースの作り方を握っておきたい）。
       - name: インストーラーを作る
+        if: steps.exists.outputs.skip == 'false'
         run: npm run dist:installer -- --publish never
 
       - name: Release に添付する
+        if: steps.exists.outputs.skip == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.release.outputs.tag }}
         shell: bash
         run: |
           ls -l dist/*.exe
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/*-setup.exe
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" dist/*-setup.exe
