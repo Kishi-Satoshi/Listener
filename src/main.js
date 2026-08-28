@@ -795,17 +795,29 @@ function applyHotkeys(hk, mhk) {
   return { ok: true };
 }
 
+/*
+ * トレイのアイコン。
+ *
+ * nativeImage が読めるのは PNG / JPEG（Windows なら ICO も）だけで、
+ * SVG は読めない。以前は SVG のデータURLから作っていたため常に空の画像になり、
+ * タスクトレイのアイコンが透明になっていた。
+ *
+ * 図柄は src/assets に置く。src/ 配下ならアプリ内更新で一緒に入れ替わる
+ * （更新は src/ をまるごと差し替える方式のため）。
+ * ICO は 16/20/24/32/48/64 を含むので、Windows が画面のDPIに合うものを選ぶ。
+ */
 function makeTrayIcon(recording) {
-  const glyph = recording
-    ? '<circle cx="16" cy="16" r="7" fill="#fff"/>'
-    : '<rect x="12.5" y="6" width="7" height="12" rx="3.5" fill="#fff"/>'
-      + '<path d="M9 13a7 7 0 0 0 14 0" stroke="#fff" stroke-width="2.4" fill="none" stroke-linecap="round"/>'
-      + '<path d="M16 20v5" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>'
-      + '<path d="M12 26h8" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>';
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32">`
-    + `<rect x="1" y="1" width="30" height="30" rx="8" fill="${recording ? '#8b9bff' : '#5b6ee1'}"/>${glyph}</svg>`;
-  const img = nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`);
-  return img.isEmpty() ? img : img.resize({ width: 16, height: 16 });
+  const base = path.join(__dirname, 'assets', recording ? 'tray-rec' : 'tray');
+  const candidates = process.platform === 'win32'
+    ? [`${base}.ico`, `${base}.png`]
+    : [`${base}.png`];
+  for (const file of candidates) {
+    const img = nativeImage.createFromPath(file);
+    if (!img.isEmpty()) return img;
+  }
+  // 見つからなければアプリのアイコンで代用する（透明なトレイよりはよい）
+  const fallback = nativeImage.createFromPath(path.join(__dirname, '..', 'assets', 'icon.png'));
+  return fallback.isEmpty() ? fallback : fallback.resize({ width: 16, height: 16 });
 }
 
 function updateTray() {

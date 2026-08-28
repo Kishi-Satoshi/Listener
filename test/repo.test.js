@@ -234,6 +234,27 @@ test('更新の可否はビルド種別ではなく「差し替えられるか�
     'インストーラー版というだけで更新を拒否している');
 });
 
+test('トレイのアイコンが nativeImage の読める形式で置かれている', () => {
+  // Electron の nativeImage は PNG / JPEG（Windows は ICO も）だけ。
+  // SVG を渡すと空の画像になり、タスクトレイが透明になる。
+  for (const f of ['src/assets/tray.ico', 'src/assets/tray-rec.ico',
+    'src/assets/tray.png', 'src/assets/tray-rec.png']) {
+    const b = fs.readFileSync(path.join(ROOT, f));
+    const isPng = b[0] === 0x89 && b.toString('binary', 1, 4) === 'PNG';
+    const isIco = b[0] === 0 && b[1] === 0 && b[2] === 1 && b[3] === 0;
+    assert.ok(isPng || isIco, `${f} が PNG でも ICO でもない`);
+  }
+  assert.ok(!/image\/svg\+xml/.test(main), 'SVG から nativeImage を作っている（透明になる）');
+});
+
+test('トレイのアイコンは src 配下にある（アプリ内更新で一緒に入れ替わるように）', () => {
+  const files = trackedFiles();
+  if (!files) return;
+  for (const f of ['src/assets/tray.ico', 'src/assets/tray-rec.ico']) {
+    assert.ok(files.includes(f), `${f} が追跡されていない`);
+  }
+});
+
 test('package.json のバージョンが semver 形式', () => {
   const pkg = JSON.parse(read('package.json'));
   assert.match(pkg.version, /^\d+\.\d+\.\d+$/);
