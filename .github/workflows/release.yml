@@ -41,6 +41,8 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,6 +54,7 @@ jobs:
 
       # 入力は env 経由で渡す（run の中へ直接展開しない）
       - name: バージョンとタグを決める
+        id: ver
         env:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
@@ -76,6 +79,7 @@ jobs:
           echo "VER=$VER" >> "$GITHUB_ENV"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
           echo "CLEANUP=$CLEANUP" >> "$GITHUB_ENV"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG / package.json=$VER"
 
       # 追加のnpm依存は無いので install は不要（テストは Node 同梱のランナー）
@@ -139,3 +143,35 @@ jobs:
       - name: 一時ブランチを片付ける
         if: success() && env.CLEANUP != ''
         run: git push origin --delete "$CLEANUP"
+
+  # インストーラーは Windows ランナーで作る。
+  # electron-builder が取ってくる winCodeSign には macOS 用のシンボリックリンクが
+  # 入っており、Windows で展開するには特権が要る。手元の環境では
+  # 「クライアントは要求された特権を保有していません」で止まるため、
+  # ここで作って Release に添付する。配布先はこれを落として入れるだけでよい。
+  #
+  # 更新は軽量zip（数百KB）で配るので、この exe を落とすのは初回だけ。
+  installer:
+    needs: release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 依存を入れる（electron / electron-builder）
+        run: npm install --no-audit --no-fund
+
+      - name: インストーラーを作る
+        run: npm run dist:installer
+
+      - name: Release に添付する
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        shell: bash
+        run: |
+          ls -l dist/*.exe
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/*-setup.exe

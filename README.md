@@ -111,11 +111,20 @@ data/
 
 ### インストーラー（配布するならこれ）
 
-```powershell
-npm run dist:installer
-```
+リリースページに `Listener-<版>-setup.exe` が添付されています。配布先はこれを
+落として実行するだけです。手元でビルドする必要はありません。
 
-`dist\Listener-<版>-setup.exe` ができます。ユーザー単位のインストールなので
+https://github.com/Kishi-Satoshi/Listener/releases/latest
+
+手元でビルドしたい場合は `npm run dist:installer` で `dist\Listener-<版>-setup.exe`
+ができます。ただし electron-builder が取得する `winCodeSign` に macOS 用の
+シンボリックリンクが含まれるため、Windows では特権が無いと展開に失敗します
+（「クライアントは要求された特権を保有していません」）。その場合は
+開発者モードを有効にするか、管理者権限で一度だけ実行してください。
+リリース用のインストーラーは GitHub Actions の Windows ランナーで作っているので、
+通常はそちらを使えば足ります。
+
+インストーラーはユーザー単位のインストールなので
 管理者権限は不要で、`%LOCALAPPDATA%\Programs\Listener\Listener.exe` に入り、
 デスクトップとスタートメニューにショートカットが作られます。
 設定の「Windowsサインイン時に自動起動」もこの形でのみ動作します。
