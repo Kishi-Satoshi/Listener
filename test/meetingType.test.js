@@ -105,3 +105,20 @@ test('キーワードに重複が無い（重複すると同じ語で二重加�
       `${key} のキーワードが重複: ${kws.filter((k, i) => kws.indexOf(k) !== i)}`);
   }
 });
+
+// ---------------------------------------------------------------- アジェンダ雛形
+test('一般以外の全タイプにアジェンダの雛形がある', () => {
+  for (const t of mtype.listTypes()) {
+    if (t.key === 'general') {
+      assert.strictEqual(t.agenda, '', '「一般」に雛形を押し付けない');
+      continue;
+    }
+    assert.ok(t.agenda && t.agenda.includes('・'), `${t.key} に雛形が無い`);
+  }
+});
+
+test('getAgenda は未知のタイプで空を返す', () => {
+  assert.strictEqual(mtype.getAgenda('nope'), '');
+  assert.strictEqual(mtype.getAgenda(''), '');
+  assert.ok(mtype.getAgenda('standup').length > 0);
+});

@@ -147,6 +147,12 @@
 
   /* ---------- ブロック ---------- */
   .blk { display: flex; align-items: flex-start; gap: 8px; padding: 3px 0; position: relative; }
+  .blk .grip { opacity: 0; flex: none; cursor: grab; color: var(--faint); user-select: none;
+    line-height: 1.85; font-size: 12px; letter-spacing: -3px; padding: 0 2px; }
+  .blk:hover .grip { opacity: .55; }
+  .blk.dragging { opacity: .35; }
+  .blk.dropmark { box-shadow: 0 -2px 0 0 var(--accent); }
+  .blk.dropmark-after { box-shadow: 0 2px 0 0 var(--accent); }
   .blk .bullet { color: var(--faint); flex: none; line-height: 1.85; user-select: none; }
   .blk .txt { flex: 1; line-height: 1.85; outline: none; border-radius: 6px; padding: 1px 5px; min-width: 0;
     word-break: break-word; }
@@ -491,6 +497,10 @@
           <label class="check"><input type="checkbox" id="autoLaunch" />
             <span>Windowsサインイン時に自動起動<br />
               <span class="d">インストーラー版でのみ動作します。</span></span></label>
+          <label class="check"><input type="checkbox" id="stayInTray" />
+            <span>ウィンドウを閉じてもタスクトレイに残す<br />
+              <span class="d">オフのときは、閉じるとアプリも終了します。
+                終了中はホットキーの音声入力も使えません。</span></span></label>
         </div>
 
         <div class="card">
@@ -549,6 +559,9 @@
   let pane = 'note';
   let mtTimer = null;
   let mtStartedAt = null;
+  let mtStoppedAt = null;
+  let mtWasActive = false;
+  let dragBlockId = null;   // 並べ替え中のブロック
 
   // ---------------- タブ ----------------
   function showTab(n) {
@@ -780,11 +793,14 @@
     // 会議タイプ
     const sel = $('pType'); sel.textContent = '';
     for (const t of mtypes) sel.add(new Option(t.label, t.key));
-    sel.value = curPage.meetingType || 'general';
+    sel.value = curPage.meetingType || 'standup';   // 既定は「定例・進捗報告」
     const def = mtypes.find((t) => t.key === sel.value);
     // 手で選んだ場合も、自動判定が何と言ったかを併記する。
     // これが無いと自動判定の精度を実機で確かめる手段が無い。
     let src = '自動判定';
+    if (curPage.typeAuto !== false && curPage.autoType === 'general' && sel.value === 'standup') {
+      src = '既定（判定材料なし）';
+    }
     if (curPage.typeAuto === false) {
       const a = curPage.autoType ? mtypes.find((t) => t.key === curPage.autoType) : null;
       src = a ? `手動指定（自動判定は「${a.label}」${curPage.autoType === sel.value ? '＝一致' : '＝不一致'}）`
@@ -795,6 +811,15 @@
       await window.koeApp.pageSetType(curId, sel.value);
       curPage.meetingType = sel.value; curPage.typeAuto = false;
       const d2 = mtypes.find((t) => t.key === sel.value);
+      // アジェンダの雛形をメモ欄に入れる。人が書いたメモは絶対に上書きしない。
+      // 空か、別タイプの雛形がそのまま残っているときだけ差し替える。
+      const cur = String(curPage.memo || '').trim();
+      const isPreset = !cur || mtypes.some((t) => (t.agenda || '').trim() === cur);
+      if (isPreset && d2 && d2.agenda) {
+        await window.koeApp.pageSetMemo(curId, d2.agenda);
+        curPage.memo = d2.agenda;
+        renderMemo();
+      }
       $('pTypeHint').textContent = `手動指定 ・ ${d2 ? d2.hint : ''}`;
       toast('会議タイプを変更しました。「要約を再生成」で反映されます');
       refreshList();
@@ -823,10 +848,6 @@
       else toast(`議事録を作成しました（出典 ${r.stat.linked}/${r.stat.total}）`);
       await openPage(curId);
     }, !curPage.blocks.length);
-    mk('Markdown保存', async () => {
-      const r = await window.koeApp.pageExport(curId);
-      if (r.ok) toast('保存しました'); else if (r.error) toast(r.error);
-    });
     mk('コピー', async () => {
       const md = curPage.blocks.map((b) => b.type === 'heading' ? `\n## ${b.text}`
         : b.type === 'todo' ? `- [${b.checked?'x':' '}] ${b.text}` : b.type === 'bullet' ? `- ${b.text}` : b.text).join('\n');
@@ -880,8 +901,43 @@
     inp.onblur = () => finish(true);
   }
 
+  // 挿入位置: ドラッグ中の行を除いた並びの中で、カーソルより下にある最初の行の位置。
+  // store 側も「抜いてから挿す」ので、この数え方がそのまま挿入位置になる。
+  function dropIndexAt(box, clientY) {
+    const els = [...box.querySelectorAll('.blk')].filter((x) => x.dataset.id !== dragBlockId);
+    for (let i = 0; i < els.length; i++) {
+      const r = els[i].getBoundingClientRect();
+      if (clientY < r.top + r.height / 2) return { idx: i, els };
+    }
+    return { idx: els.length, els };
+  }
+  function clearDropMarks(box) {
+    for (const e of box.querySelectorAll('.dropmark, .dropmark-after')) {
+      e.classList.remove('dropmark', 'dropmark-after');
+    }
+  }
+
   function renderBlocks() {
     const box = $('pNote'); box.textContent = '';
+    box.ondragover = (ev) => {
+      if (!dragBlockId) return;
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect = 'move';
+      clearDropMarks(box);
+      const { idx, els } = dropIndexAt(box, ev.clientY);
+      if (!els.length) return;
+      if (idx < els.length) els[idx].classList.add('dropmark');
+      else els[els.length - 1].classList.add('dropmark-after');
+    };
+    box.ondrop = async (ev) => {
+      if (!dragBlockId) return;
+      ev.preventDefault();
+      const { idx } = dropIndexAt(box, ev.clientY);
+      const id = dragBlockId; dragBlockId = null;
+      clearDropMarks(box);
+      await window.koeApp.blockMove(curId, id, idx);
+      await openPage(curId);
+    };
     if (curPage.summaryError) {
       const n = document.createElement('div'); n.className = 'note'; n.textContent = curPage.summaryError;
       box.appendChild(n);
@@ -900,6 +956,23 @@
       const el = document.createElement('div');
       el.className = `blk ${b.type}` + (b.type === 'todo' && b.checked ? ' done' : '');
       el.dataset.id = b.id;
+
+      // 並べ替えハンドル。行全体を draggable にすると本文のテキスト選択と
+      // 衝突するので、つまみを押している間だけドラッグできるようにする。
+      const grip = document.createElement('span');
+      grip.className = 'grip'; grip.textContent = '⋮⋮'; grip.title = 'ドラッグで並べ替え';
+      grip.onmousedown = () => { el.draggable = true; };
+      grip.onmouseup = () => { el.draggable = false; };
+      el.ondragstart = (ev) => {
+        dragBlockId = b.id; el.classList.add('dragging');
+        ev.dataTransfer.effectAllowed = 'move';
+        try { ev.dataTransfer.setData('text/plain', b.id); } catch (_) { /* noop */ }
+      };
+      el.ondragend = () => {
+        el.draggable = false; el.classList.remove('dragging');
+        dragBlockId = null; clearDropMarks(box);
+      };
+      el.appendChild(grip);
 
       if (b.type === 'todo') {
         const cb = document.createElement('input');
@@ -1061,10 +1134,22 @@
   // ---------------- 録音セッション ----------------
   function mtClock() {
     if (!mtStartedAt) return '0:00';
-    return fmtClock(Date.now() - mtStartedAt);
+    // 停止後は止まった時計を出す。作成中も進み続けると、
+    // 会議が実際より長かったように見える。
+    return fmtClock((mtStoppedAt || Date.now()) - mtStartedAt);
   }
   function setMeetingUi(st) {
     mtStartedAt = st.startedAt;
+    mtStoppedAt = st.stoppedAt || null;
+    // 記録を新しく始めた瞬間は、開いていた議事録を閉じて白紙から始める。
+    // 前の議事録が開いたままだと、その画面に記録中バーだけが刺さり、
+    // 新しい記録が始まったように見えない。
+    // （記録中に一覧から過去の議事録を開き直すのは今までどおりできる）
+    if (st.active && !mtWasActive && curId) {
+      curId = null; curPage = null; curSegs = [];
+      renderList(); renderPage();
+    }
+    mtWasActive = Boolean(st.active);
     $('mtToggleBtn').textContent = st.finalizing ? '作成中…' : st.active ? '■ 終了して作成' : '● 記録開始';
     $('mtToggleBtn').disabled = Boolean(st.finalizing);
     $('mtDiscardBtn').style.display = st.active && !st.finalizing ? '' : 'none';
@@ -1249,6 +1334,7 @@
     $('autoLaunch').checked = Boolean(s.autoLaunch);
     $('dictionary').value = (s.dictionary || []).join('\n');
     $('useBuiltinTerms').checked = s.useBuiltinTerms !== false;   // 既定 true
+    $('stayInTray').checked = Boolean(s.stayInTray);              // 既定 false
     $('useSystemAudio').checked = Boolean(s.useSystemAudio);      // 既定 false
     loadMics(s.micId || '');
   }
@@ -1334,6 +1420,7 @@
       autoLaunch: $('autoLaunch').checked,
       dictionary: $('dictionary').value.split('\n').map((s) => s.trim()).filter(Boolean),
       useBuiltinTerms: $('useBuiltinTerms').checked,
+      stayInTray: $('stayInTray').checked,
       useSystemAudio: $('useSystemAudio').checked,
     };
     const r = await window.koeApp.saveSettings(next);

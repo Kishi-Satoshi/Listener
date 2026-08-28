@@ -325,3 +325,43 @@ test('HTML 内のスクリプトが構文的に正しい', () => {
     }
   }
 });
+
+// ---------------------------------------------------------------- v0.9.6 の機能の結線
+test('会議の所要時間は開始から停止までで計る', () => {
+  // 文字起こし待ちを混ぜると、4分の会議が12分と記録される
+  assert.match(main, /meeting\.stoppedAt = Date\.now\(\)/);
+  assert.match(main, /m\.stoppedAt \|\| Date\.now\(\)/);
+  assert.ok(appHtml.includes('(mtStoppedAt || Date.now()) - mtStartedAt'));
+});
+
+test('判定材料が無いときの会議タイプは「定例・進捗報告」', () => {
+  assert.match(main, /autoType === 'general' \? 'standup' : autoType/);
+  assert.ok(appHtml.includes("curPage.meetingType || 'standup'"));
+});
+
+test('Markdown保存は IPC ごと撤去済み', () => {
+  assert.ok(!appHtml.includes('Markdown保存'));
+  assert.ok(!main.includes("'page:export'"));
+  assert.ok(!preload.includes('pageExport'));
+});
+
+test('閉じるボタンは既定でアプリを終了する（設定でトレイ常駐に戻せる）', () => {
+  assert.match(main, /stayInTray:\s*false/);
+  assert.match(main, /if \(settings\.stayInTray\) \{ e\.preventDefault\(\); mainWin\.hide\(\); return; \}/);
+  assert.ok(appHtml.includes("stayInTray: $('stayInTray').checked"));
+});
+
+test('記録を新しく始めたら、開いていた議事録を閉じる', () => {
+  assert.ok(appHtml.includes('st.active && !mtWasActive && curId'));
+});
+
+test('タイプ変更のアジェンダ挿入は、人が書いたメモを上書きしない', () => {
+  // 空か、別タイプの雛形そのままのときだけ差し替える
+  assert.match(appHtml, /const isPreset = !cur \|\| mtypes\.some/);
+});
+
+test('並べ替えはハンドルからだけ（本文のテキスト選択と衝突させない）', () => {
+  assert.match(appHtml, /grip\.onmousedown = \(\) => \{ el\.draggable = true; \}/);
+  // 行全体を常時 draggable にしていないこと
+  assert.ok(!/el\.draggable = true;\s*$/m.test(appHtml.replace(/grip\.onmousedown.*$/m, '')));
+});

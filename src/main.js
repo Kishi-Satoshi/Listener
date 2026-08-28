@@ -22,7 +22,7 @@ const mtype = require('./meetingType');
 const { enrichActionBlocks } = require('./actions');
 const updater = require('./updater');
 const { chooseDisplayMedia } = require('./loopback');
-const { markdownToBlocks, blocksToMarkdown, dropRedundantEmpty } = require('./minutes');
+const { markdownToBlocks, dropRedundantEmpty } = require('./minutes');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
 const CPU_DEFAULT_THREADS = Math.max(4, os.cpus().length - 2);
@@ -55,6 +55,8 @@ const DEFAULT_SETTINGS = {
   removeFillers: true,
   soundFeedback: true,
   autoLaunch: false,
+  // ウィンドウを閉じたときにタスクトレイへ残すか。既定は残さない＝そのまま終了。
+  stayInTray: false,
   dictionary: [],
   // 業務日本語の既定語彙をエンジンへ渡すか。dictionary の既定を非空にすると、
   // 既に [] を保存済みの環境には既定値が届かないので、別のキーで持つ。
@@ -162,7 +164,11 @@ const PROMPT_MAX_CHARS = 200;
 function buildPrompt(extraTail) {
   const parts = [];
   const ja = settings.language === 'ja';
-  if (ja) parts.push('以下は日本語の会議の録音です。句読点を含めて正確に書き起こします。');
+  // ここは指示文ではなく「この後に続く文章の文例」。モデルは指示に従うのでは
+  // なく真似るだけで、実機では文例中の語がそのまま本文へ漏れた
+  // （「不具合の報告」が「句読報告」になった）。丸めの誘導は文例自体の
+  // 「、」「。」で行い、漏れても会議の発言として無害な語だけで書く。
+  if (ja) parts.push('お疲れさまです。よろしくお願いします。');
   const tail = String(extraTail || '');
 
   // ユーザーが入れた語は今までどおり全部渡す。ここを予算で切ると、
@@ -185,7 +191,8 @@ function buildPrompt(extraTail) {
       terms.push(w); budget -= w.length + 1;
     }
   }
-  if (terms.length) parts.push(`用語: ${terms.join('、')}`);
+  // 接頭辞は付けない。「用語:」のような不自然な語も文例として漏れうる。
+  if (terms.length) parts.push(`${terms.join('、')}。`);
   if (tail) parts.push(tail);
   return parts.join(' ');
 }
@@ -524,7 +531,23 @@ function createMainWindow() {
       sendToMainWin('page:open', id);
     });
   }
-  mainWin.on('close', (e) => { if (!quitting) { e.preventDefault(); mainWin.hide(); } });
+  // 閉じるボタンの挙動。既定はそのまま終了。設定でトレイ常駐に切り替えられる。
+  mainWin.on('close', (e) => {
+    if (quitting) return;
+    if (settings.stayInTray) { e.preventDefault(); mainWin.hide(); return; }
+    if (state === 'meeting' || state === 'meeting-finalizing') {
+      // 記録中の閉じ間違いで会議を失わせない。draft からの復旧はあるが、
+      // 要約前の状態に戻るので、一度は確認を挟む。
+      const r = dialog.showMessageBoxSync(mainWin, {
+        type: 'warning', buttons: ['終了する', 'キャンセル'], defaultId: 1, cancelId: 1,
+        message: '議事録を記録中です',
+        detail: '終了すると録音が止まります。ここまでの文字起こしは、次回起動時に復旧できます。',
+      });
+      if (r !== 0) { e.preventDefault(); return; }
+    }
+    quitting = true;
+    app.quit();
+  });
 }
 
 // ---------------------------------------------------------------- 音声入力
@@ -615,6 +638,7 @@ function meetingStatus() {
     memo: meeting ? meeting.memo : '',
     segments: meeting ? meeting.segments : [],
     pending: pendingSegs,
+    stoppedAt: meeting && meeting.stoppedAt ? meeting.stoppedAt : null,
     systemAudio: Boolean(meeting && meeting.systemAudio),
   };
 }
@@ -685,6 +709,9 @@ function stopMeeting() {
   if (state !== 'meeting') return { ok: false };
   state = 'meeting-finalizing';
   meeting.stopping = true;
+  // 会議の長さはここまで。以降の文字起こし待ちを所要時間に混ぜると、
+  // 実際の会議時間が分からなくなる（4分の会議が12分と記録されていた）。
+  meeting.stoppedAt = Date.now();
   sendToOverlay('overlay:stop', {});
   sendToOverlay('overlay:phase', { phase: 'processing', message: '議事録を作成中…' });
   sendToMainWin('meeting:progress', { message: '録音を終了し、残りの文字起こしを処理しています…' });
@@ -761,7 +788,7 @@ async function maybeFinalizeMeeting() {
   const m = meeting;
   meeting = null;
 
-  const durationSec = Math.round((Date.now() - m.startedAt) / 1000);
+  const durationSec = Math.round(((m.stoppedAt || Date.now()) - m.startedAt) / 1000);
   const dt = new Date(m.startedAt);
   const fallbackTitle = `${dt.getFullYear()}/${dt.getMonth() + 1}/${dt.getDate()} ${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')} の議事録`;
 
@@ -832,7 +859,10 @@ async function runSummary(pageId) {
   const autoType = mtype.detectType(page.title, plain.slice(0, 1200));
   page.autoType = autoType;
   if (!page.meetingType || page.typeAuto !== false) {
-    page.meetingType = autoType;
+    // 判定材料が無いときの既定は「定例・進捗報告」。タイトルを付けない
+    // 運用では自動判定はほぼ働かず（本文だけで5語必要）、一般テンプレート
+    // より定例の見出しの方が実務に合う。
+    page.meetingType = autoType === 'general' ? 'standup' : autoType;
     page.typeAuto = true;
   }
   // タイトルは書かない。1on1・面談の議事録は機微で、engine.log は
@@ -1048,6 +1078,7 @@ function setupIpc() {
   ipcMain.handle('block:update', (_e, { pageId, blockId, patch }) => store.updateBlock(pageId, blockId, patch));
   ipcMain.handle('block:insert', (_e, { pageId, afterBlockId, type }) => store.insertBlock(pageId, afterBlockId, type));
   ipcMain.handle('block:remove', (_e, { pageId, blockId }) => store.removeBlock(pageId, blockId));
+  ipcMain.handle('block:move', (_e, { pageId, blockId, toIndex }) => store.moveBlock(pageId, blockId, toIndex));
   ipcMain.handle('block:setAction', (_e, { pageId, blockId, assignee, dueRaw }) => {
     const p = store.getPage(pageId); if (!p) return null;
     const b = p.blocks.find((x) => x.id === blockId); if (!b) return null;
@@ -1067,20 +1098,6 @@ function setupIpc() {
     return store.savePage(p);
   });
   ipcMain.handle('meta:types', () => mtype.listTypes());
-  ipcMain.handle('page:export', async (_e, id) => {
-    const page = store.getPage(id);
-    if (!page) return { ok: false, error: 'ページが見つかりません' };
-    const segments = store.getTranscript(id);
-    const d = new Date(page.createdAt);
-    const def = `議事録_${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}_${String(d.getHours()).padStart(2, '0')}${String(d.getMinutes()).padStart(2, '0')}.md`;
-    const res = await dialog.showSaveDialog(mainWin, { defaultPath: def, filters: [{ name: 'Markdown', extensions: ['md'] }] });
-    if (res.canceled || !res.filePath) return { ok: false };
-    try {
-      fs.writeFileSync(res.filePath, blocksToMarkdown(page, segments), 'utf8');
-      return { ok: true, path: res.filePath };
-    } catch (e) { return { ok: false, error: e.message }; }
-  });
-
   ipcMain.handle('meeting:toggle', () => {
     if (state === 'idle') return startMeeting();
     if (state === 'meeting') return stopMeeting();

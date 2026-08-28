@@ -174,6 +174,20 @@ function insertBlock(pageId, afterBlockId, type) {
   return { page, blockId: block.id };
 }
 
+// ブロックの並べ替え。toIndex は「動かす行を抜いたあとの」挿入位置。
+// 画面側もドラッグ中の行を除いた並びで位置を数えるので、そのまま挿せる。
+function moveBlock(pageId, blockId, toIndex) {
+  const page = getPage(pageId);
+  if (!page) return null;
+  const from = page.blocks.findIndex((x) => x.id === blockId);
+  if (from < 0) return null;
+  const [b] = page.blocks.splice(from, 1);
+  const to = Math.max(0, Math.min(Math.trunc(Number(toIndex) || 0), page.blocks.length));
+  page.blocks.splice(to, 0, b);
+  savePage(page);
+  return page;
+}
+
 function removeBlock(pageId, blockId) {
   const page = getPage(pageId);
   if (!page) return null;
@@ -270,7 +284,7 @@ module.exports = {
   init, newId,
   listPages, getPage, getTranscript, savePage, saveTranscript,
   createPage, deletePage,
-  updateBlock, insertBlock, removeBlock, setTitle,
+  updateBlock, insertBlock, removeBlock, moveBlock, setTitle,
   searchIndex, searchFullText, openActions, assigneeList,
   readDraft, writeDraft, clearDraft,
 };

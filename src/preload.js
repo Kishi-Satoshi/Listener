@@ -55,10 +55,10 @@ contextBridge.exposeInMainWorld('koeApp', {
   pageSetTitle: (id, title) => ipcRenderer.invoke('page:setTitle', { id, title }),
   pageSetMemo: (id, memo) => ipcRenderer.invoke('page:setMemo', { id, memo }),
   pageSummarize: (id) => ipcRenderer.invoke('page:summarize', id),
-  pageExport: (id) => ipcRenderer.invoke('page:export', id),
   blockUpdate: (pageId, blockId, patch) => ipcRenderer.invoke('block:update', { pageId, blockId, patch }),
   blockInsert: (pageId, afterBlockId, type) => ipcRenderer.invoke('block:insert', { pageId, afterBlockId, type }),
   blockRemove: (pageId, blockId) => ipcRenderer.invoke('block:remove', { pageId, blockId }),
+  blockMove: (pageId, blockId, toIndex) => ipcRenderer.invoke('block:move', { pageId, blockId, toIndex }),
 
   // 議事録セッション
   meetingToggle: () => ipcRenderer.invoke('meeting:toggle'),

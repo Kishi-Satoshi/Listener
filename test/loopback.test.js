@@ -147,7 +147,7 @@ test('新しい設定キーがエンジンの再起動条件に入っていな�
   // 入れると設定を保存するたびに whisper-server が再起動する
   const sig = main.match(/function engineSignature[\s\S]*?\n\}/);
   assert.ok(sig, 'engineSignature が見つからない');
-  for (const key of ['useSystemAudio', 'useBuiltinTerms']) {
+  for (const key of ['useSystemAudio', 'useBuiltinTerms', 'stayInTray']) {
     assert.ok(!sig[0].includes(key), `${key} が engineSignature に入っている`);
   }
 });
@@ -225,4 +225,14 @@ test('ユーザー辞書は予算で切らない', () => {
   const userLoop = bp.slice(bp.indexOf('settings.dictionary'), bp.indexOf('if (ja &&'));
   assert.ok(!userLoop.includes('budget'), 'ユーザー辞書に予算を掛けている');
   assert.ok(!/break;/.test(bp), '長い語ひとつで後続を捨てている');
+});
+
+test('文字起こしへ渡す文例に、漏れて困る語を入れない', () => {
+  // 初期プロンプトは指示ではなく「この後に続く文章の文例」。モデルは
+  // 従うのではなく真似るだけで、実機では文例の語が本文へ漏れた
+  // （「不具合の報告」が「句読報告」になった）。
+  const m = code(main);
+  assert.ok(!m.includes('句読点'), '漏れの実績がある語が残っている');
+  assert.ok(!m.includes('書き起こします'), '指示文が残っている（従わないのに漏れだけする）');
+  assert.ok(!m.includes('用語:'), '不自然な接頭辞が残っている');
 });

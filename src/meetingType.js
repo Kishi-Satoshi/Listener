@@ -18,6 +18,7 @@ const TYPES = {
   standup: {
     label: '定例・進捗報告',
     hint: '朝会・週次定例など、各担当の報告が中心の会議',
+    agenda: '議題:\n・各担当の進捗報告\n・課題・相談ごと\n・決定事項の確認\n・次回までのアクション',
     keywords: ['朝会', '定例', '週次', 'デイリー', '日次', 'スタンドアップ', '進捗確認', '状況共有', 'レビュー会議'],
     format: `## 概要
 （会議全体を3〜5行で要約）
@@ -38,6 +39,7 @@ ${ACTION_RULE}
   review: {
     label: '部会・報告会',
     hint: '月次部会や事業報告など、数値報告と方針決定を含む会議',
+    agenda: '議題:\n・各チームの数値報告\n・全体への共有事項\n・審議・決定事項\n・アクションアイテム',
     keywords: ['部会', '報告会', '月次', '事業本部', '管理職会議', '経営', '本部報告'],
     format: `## 概要
 （会議全体を3〜5行で要約）
@@ -61,6 +63,7 @@ ${ACTION_RULE}
   oneonone: {
     label: '1on1・面談',
     hint: 'メンバーとの個別面談、キャリア相談、処遇の打診など',
+    agenda: '話したいこと:\n・最近の調子・近況\n・困っていること\n・キャリア・今後のこと\n・会社・チームへの要望',
     // 同じ語を二度書くとその語だけ二重に加点され、他タイプの正当な一致に競り勝ってしまう。
     // 全角で入力されることがあるため「１ｏｎ１」も見る。
     keywords: ['1on1', '１ｏｎ１', '面談', 'キャリア', '打診', '個別', 'メンタリング', '評価面談', '就業状況'],
@@ -83,6 +86,7 @@ ${ACTION_RULE}`,
   sales: {
     label: '商談・協業検討',
     hint: '顧客・パートナーとの商談、協業や契約の検討',
+    agenda: '議題:\n・先方の状況・課題のヒアリング\n・こちらからの提案\n・価格・条件\n・次のステップ',
     keywords: ['商談', '協業', '提案', '見積', '契約', '再販', '価格', 'ベンダー選定', '紹介', 'ビジネス'],
     format: `## 概要
 （商談の目的と結論を3〜5行で要約）
@@ -106,6 +110,7 @@ ${ACTION_RULE}`,
   interview: {
     label: '採用面接・顔合わせ',
     hint: '候補者の面接、入社前の顔合わせ、オンボーディング面談',
+    agenda: '確認したいこと:\n・経歴・スキル\n・志望動機\n・条件面\n・候補者からの質問',
     keywords: ['面接', '顔合わせ', 'オンボーディング', '候補者', '選考', '入社', '採用面談', 'スキル確認'],
     format: `## 概要
 （面接の対象と全体の印象を3〜5行で要約）
@@ -126,6 +131,7 @@ ${ACTION_RULE}`,
   brainstorm: {
     label: 'ブレスト・意見交換',
     hint: 'アイデア出し、方針の議論、結論を急がない会議',
+    agenda: 'テーマ:\n・アイデア出し\n・観点の整理\n・次に試すこと',
     keywords: ['ブレスト', '意見交換', 'アイデア', '検討会', 'ディスカッション', '壁打ち', '構想'],
     format: `## 概要
 （何について議論したかを3〜5行で要約）
@@ -213,8 +219,13 @@ function getFormat(type) {
 function getLabel(type) {
   return (TYPES[type] || TYPES.general).label;
 }
+// タイプを選んだときにメモ欄へ入れるアジェンダの雛形。
+// 一般・その他には無い（何を話すか決まっていない会議に雛形を押し付けない）。
+function getAgenda(type) {
+  return (TYPES[type] && TYPES[type].agenda) || '';
+}
 function listTypes() {
-  return ORDER.map((k) => ({ key: k, label: TYPES[k].label, hint: TYPES[k].hint }));
+  return ORDER.map((k) => ({ key: k, label: TYPES[k].label, hint: TYPES[k].hint, agenda: TYPES[k].agenda || '' }));
 }
 
-module.exports = { TYPES, ORDER, detectType, getFormat, getLabel, listTypes };
+module.exports = { TYPES, ORDER, detectType, getFormat, getLabel, getAgenda, listTypes };
