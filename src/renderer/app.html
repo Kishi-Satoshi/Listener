@@ -1076,8 +1076,11 @@
         live.innerHTML = '<span class="rec-dot"></span><span id="liveTitle">議事録を記録中</span><span class="tm" id="liveTm">0:00</span>';
         $('pBody').insertBefore(live, $('pBody').firstChild);
       }
+      // 相手の声も録れているかは、会議が終わってから気づくと手遅れなので
+      // 記録中のバーに出す。
+      const recLabel = st.systemAudio ? '議事録を記録中（相手の声も）' : '議事録を記録中';
       $('liveTitle').textContent = st.finalizing ? '議事録を作成しています…'
-        : st.pending > 0 ? `議事録を記録中（${st.pending}区間を文字起こし中）` : '議事録を記録中';
+        : st.pending > 0 ? `${recLabel}（${st.pending}区間を文字起こし中）` : recLabel;
       if (!mtTimer) mtTimer = setInterval(() => { const e = $('liveTm'); if (e) e.textContent = mtClock(); }, 500);
       // 記録中はライブ文字起こしを表示
       if (!curId) {

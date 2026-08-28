@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('koeOverlay', {
   sendAudio: (buffer, mimeType, durationMs) => ipcRenderer.send('audio:done', { buffer, mimeType, durationMs }),
   sendSegment: (buffer, durationMs, final) => ipcRenderer.send('audio:segment', { buffer, durationMs, final }),
   sendError: (message) => ipcRenderer.send('audio:error', { message }),
+  reportSource: (systemAudio, wanted) => ipcRenderer.send('overlay:source', { systemAudio, wanted }),
   confirmStop: () => ipcRenderer.send('overlay:confirm'),
   requestCancel: () => ipcRenderer.send('overlay:cancel-request'),
   requestHide: () => ipcRenderer.send('overlay:hidden-request'),

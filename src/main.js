@@ -9,7 +9,7 @@
 
 const {
   app, BrowserWindow, Tray, Menu, globalShortcut,
-  ipcMain, clipboard, nativeImage, screen, dialog, shell,
+  ipcMain, clipboard, nativeImage, screen, dialog, shell, session,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -21,6 +21,7 @@ const { attachCitations } = require('./cite');
 const mtype = require('./meetingType');
 const { enrichActionBlocks } = require('./actions');
 const updater = require('./updater');
+const { chooseDisplayMedia } = require('./loopback');
 const { markdownToBlocks, blocksToMarkdown, dropRedundantEmpty } = require('./minutes');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -605,6 +606,7 @@ function meetingStatus() {
     memo: meeting ? meeting.memo : '',
     segments: meeting ? meeting.segments : [],
     pending: pendingSegs,
+    systemAudio: Boolean(meeting && meeting.systemAudio),
   };
 }
 
@@ -639,7 +641,7 @@ function recoverDraftIfAny() {
 function startMeeting() {
   if (state !== 'idle') return { ok: false, error: '他の処理を実行中です' };
   if (!engineValid(whisperEng)) return { ok: false, error: '文字起こしエンジンが未設定です。設定タブでパスを指定してください。' };
-  meeting = { startedAt: Date.now(), memo: '', segments: [], offsetMs: 0, stopping: false, seq: 0 };
+  meeting = { startedAt: Date.now(), memo: '', segments: [], offsetMs: 0, stopping: false, seq: 0, systemAudio: false };
   segChain = Promise.resolve(); pendingSegs = 0;
   state = 'meeting';
   writeDraft();
@@ -647,10 +649,24 @@ function startMeeting() {
   if (engineValid(sumEng)) startEngine(sumEng);
   positionOverlay();
   overlayWin.showInactive();
-  sendToOverlay('overlay:start', {
+  // 音声入力の開始（上の 'dictation'）には systemAudio を渡さない。
+  // あちらは常にマイクだけで、今回の変更で挙動が変わってはいけない。
+  const payload = {
     mode: 'meeting', segmentSec: settings.segmentSec || 75,
     micId: settings.micId || '', sound: Boolean(settings.soundFeedback),
-  });
+    systemAudio: Boolean(settings.useSystemAudio),
+  };
+  if (payload.systemAudio && overlayWin && !overlayWin.isDestroyed()) {
+    // 相手の声の取り込みは「ユーザー操作の直後」でないと拒まれることがある。
+    // オーバーレイはホットキーで出る焦点の当たらない小窓なので、
+    // executeJavaScript の第2引数でその扱いにして呼ぶ。
+    // 失敗したら従来の IPC 経路へ落とす（マイクだけにはなるが録音は始まる）。
+    overlayWin.webContents
+      .executeJavaScript(`window.__koeStart(${JSON.stringify(payload)})`, true)
+      .catch(() => sendToOverlay('overlay:start', payload));
+  } else {
+    sendToOverlay('overlay:start', payload);
+  }
   updateTray();
   sendToMainWin('meeting:update', meetingStatus());
   return { ok: true };
@@ -1126,6 +1142,18 @@ function setupIpc() {
   ipcMain.on('overlay:cancel-request', () => { if (state === 'recording') cancelRecording(); });
   ipcMain.on('audio:done', (_e, { buffer, durationMs }) => handleDictationAudio(Buffer.from(buffer), durationMs));
   ipcMain.on('audio:segment', (_e, { buffer, durationMs, final }) => onMeetingSegment(Buffer.from(buffer), durationMs, Boolean(final)));
+  // 録音側が実際に何を録れているかを受け取る。設定がオンでも、再生デバイスが
+  // 無い・他のアプリが排他で掴んでいる等で失敗しうる。黙ってマイクだけで進むと、
+  // 会議が終わってから片側しか残っていないことに気づく——それが一番まずい。
+  ipcMain.on('overlay:source', (_e, { systemAudio, wanted }) => {
+    if (!meeting) return;
+    meeting.systemAudio = Boolean(systemAudio);
+    sendToMainWin('meeting:update', meetingStatus());
+    if (wanted && !systemAudio) {
+      sendToMainWin('app:notice',
+        'パソコンから出ている音を取り込めませんでした。マイクの音だけで議事録を記録します。');
+    }
+  });
   ipcMain.on('audio:error', (_e, { message }) => {
     if (state === 'meeting' || state === 'meeting-finalizing') {
       if (meeting) {
@@ -1147,6 +1175,13 @@ if (!gotLock) {
     loadStores();
     recoverDraftIfAny();
     setupIpc();
+    // 相手の声（パソコンから出ている音）を録るための受け口。
+    // これを設定しないと getDisplayMedia は必ず失敗する。
+    // 第2引数（useSystemPicker）は Electron 33 以降のもの。ここで渡すと
+    // ハンドラごと無効になるので、引数はコールバック1つだけにする。
+    session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+      callback(chooseDisplayMedia({ platform: process.platform, frame: request.frame }));
+    });
     createOverlay();
     createTray();
     if (!applyHotkeys(settings.hotkey, settings.meetingHotkey).ok) {
