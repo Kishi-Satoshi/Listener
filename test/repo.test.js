@@ -208,6 +208,24 @@ test('更新の告知が設定タブの外にも出る', () => {
   assert.ok(body.includes('renderUpdateBadge(r)'), '更新を検出したのに告知を出していない');
 });
 
+test('公開したのに画面から呼ばれない API がない', () => {
+  // 使われないまま残っていると「機能があるはず」と誤解する。
+  // 録音中のメモ入力は、API はあるのに画面から呼んでいなかったため
+  // 長く使えないままになっていた。
+  const block = (name) => {
+    const i = preload.indexOf(`exposeInMainWorld('${name}'`);
+    const rest = preload.slice(i);
+    const end = rest.indexOf('\n});');
+    return rest.slice(0, end > 0 ? end : rest.length);
+  };
+  for (const [ns, html] of [['koeApp', appHtml], ['koeOverlay', overlayHtml]]) {
+    const names = all(/^\s{2}([A-Za-z][\w$]*):/gm, block(ns));
+    const used = new Set(all(new RegExp(`${ns}\\.(\\w+)`, 'g'), html));
+    const dead = names.filter((n) => !used.has(n));
+    assert.deepStrictEqual(dead, [], `${ns} に呼ばれていない API がある`);
+  }
+});
+
 test('preload に公開したまま main.js 側が無い API がない', () => {
   const handled = new Set([
     ...all(/ipcMain\.handle\('([^']+)'/g, main),

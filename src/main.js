@@ -945,7 +945,6 @@ function setupIpc() {
   ipcMain.handle('history:clear', () => { history = []; persistHistory(); return history; });
   ipcMain.handle('app:toggle-recording', () => { toggleRecording(); return state; });
 
-  ipcMain.handle('pages:list', () => store.listPages());
   ipcMain.handle('pages:search', (_e, q) => store.searchIndex(q || ''));
   ipcMain.handle('pages:searchFull', (_e, q) => store.searchFullText(q || '', 60));
   ipcMain.handle('pages:openActions', () => store.openActions());

@@ -42,7 +42,6 @@ contextBridge.exposeInMainWorld('koeApp', {
   toggleRecording: () => ipcRenderer.invoke('app:toggle-recording'),
 
   // ページ（議事録）
-  pagesList: () => ipcRenderer.invoke('pages:list'),
   pagesSearch: (q) => ipcRenderer.invoke('pages:search', q),
   pagesSearchFull: (q) => ipcRenderer.invoke('pages:searchFull', q),
   openActions: () => ipcRenderer.invoke('pages:openActions'),

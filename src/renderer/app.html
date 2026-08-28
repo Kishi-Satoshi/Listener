@@ -316,7 +316,7 @@
           <div class="phead">
             <div class="ptitle" id="pTitle" contenteditable="true" spellcheck="false"></div>
             <div class="pprops" id="pProps"></div>
-            <div style="margin-top:8px;display:flex;align-items:center;gap:8px">
+            <div id="pTypeRow" style="margin-top:8px;display:flex;align-items:center;gap:8px">
               <span style="font-size:11px;color:var(--muted)">会議タイプ</span>
               <select class="typeSel" id="pType"></select>
               <span style="font-size:11px;color:var(--faint)" id="pTypeHint"></span>
@@ -752,11 +752,16 @@
       $('pTitle').textContent = '';
       $('pProps').textContent = '';
       $('pActs').textContent = '';
+      // 議事録を選ぶ前は中身の無いセレクタを出さない（選べない物を見せない）
+      $('pTypeRow').style.display = 'none';
       $('pNote').innerHTML = '<div class="empty"><div class="big">左の一覧から議事録を選んでください</div>会議を録音すると、要約とアクションアイテムが自動で作られます。</div>';
-      $('pScript').textContent = ''; $('pMemo').textContent = '';
+      $('pScript').textContent = '';
+      // 記録中はメモを書けるようにするので、ここでは消さない
+      if (!$('pMemo').querySelector('textarea')) $('pMemo').textContent = '';
       setPane('note');
       return;
     }
+    $('pTypeRow').style.display = '';
     $('pTitle').textContent = curPage.title;
 
     // 会議タイプ
@@ -1047,6 +1052,28 @@
       if (!mtTimer) mtTimer = setInterval(() => { const e = $('liveTm'); if (e) e.textContent = mtClock(); }, 500);
       // 記録中はライブ文字起こしを表示
       if (!curId) {
+        // 記録中もメモを書けるようにする。ここで書いた内容は
+        // 「会議メモ・アジェンダ」として要約のヒントに使われる。
+        // 区間ごとに setMeetingUi が呼ばれるので、入力中を壊さないよう一度だけ作る。
+        const memoBox = $('pMemo');
+        if (!memoBox.querySelector('textarea')) {
+          memoBox.textContent = '';
+          const wrap = document.createElement('div'); wrap.className = 'field';
+          const l = document.createElement('label');
+          l.textContent = 'メモ・アジェンダ（要約のヒントとして使われます）';
+          const ta = document.createElement('textarea');
+          ta.rows = 10;
+          ta.value = st.memo || '';
+          ta.placeholder = '例: 週次定例。議題: 売上見込み / 案件進捗 / 採用状況';
+          let mt = null;
+          ta.oninput = () => {
+            clearTimeout(mt);
+            mt = setTimeout(() => window.koeApp.meetingSetMemo(ta.value), 500);
+          };
+          wrap.append(l, ta);
+          memoBox.appendChild(wrap);
+        }
+
         curSegs = st.segments || [];
         const box = $('pScript'); box.textContent = '';
         for (const s of curSegs) {
@@ -1067,6 +1094,8 @@
       if (live) live.remove();
       if (mtTimer) { clearInterval(mtTimer); mtTimer = null; }
       if (!st.finalizing) $('pProgress').style.display = 'none';
+      // 記録中のメモ欄は片付ける。この後、作られたページ側の表示に切り替わる
+      if (!curId) $('pMemo').textContent = '';
     }
   }
 
