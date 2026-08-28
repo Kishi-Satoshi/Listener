@@ -199,7 +199,8 @@
   .cites { display: inline-flex; gap: 3px; margin-left: 6px; vertical-align: middle; }
   .cite { background: rgba(91,110,225,.13); color: var(--accent-deep); border: none;
     font: inherit; font-size: 10px; font-weight: 700; line-height: 1;
-    padding: 3px 6px; border-radius: 5px; cursor: pointer; }
+    padding: 3px 6px; border-radius: 5px; cursor: pointer;
+    white-space: nowrap; font-variant-numeric: tabular-nums; }
   .cite:hover { background: var(--accent); color: #fff; }
   .nocite { display: inline-block; margin-left: 6px; font-size: 10px; color: var(--faint);
     border: 1px dashed rgba(56,60,70,.28); border-radius: 5px; padding: 2px 6px; vertical-align: middle; }
@@ -467,6 +468,14 @@
               <button class="ghost" id="micReloadBtn" type="button">更新</button>
             </div>
           </div>
+          <label class="check"><input type="checkbox" id="useSystemAudio" />
+            <span>議事録で相手の声も録る（パソコンから出ている音）<br />
+              <span class="d">マイクに加えて、スピーカーやイヤホンへ流れている音も一緒に記録します。
+                Web会議の相手の発言を議事録に残せます。Windows でのみ動作します。<br />
+                パソコンで鳴っている音はすべて入ります（通知音や動画の音も）。
+                二重に入るのを避けるため、イヤホンの使用をおすすめします。
+                音声入力（ホットキー）ではこれまで通りマイクだけを使います。<br />
+                ※ 録音していることは、会議の参加者へ伝えてください。</span></span></label>
           <div class="field">
             <label for="language">認識言語</label>
             <select id="language">
@@ -490,6 +499,10 @@
             <textarea id="dictionary" rows="5" placeholder="1行に1語ずつ&#10;自社名&#10;製品名&#10;部署名"></textarea>
             <div class="desc">固有名詞・社内用語をエンジンへ渡し、認識精度を上げます。</div>
           </div>
+          <label class="check"><input type="checkbox" id="useBuiltinTerms" />
+            <span>業務でよく使う言葉のヒントも渡す<br />
+              <span class="d">「不具合」「改修」「結合テスト」「今週」などをあらかじめ渡します。
+                上の辞書が優先で、余った分だけ使われます。</span></span></label>
         </div>
 
         <div class="card">
@@ -769,8 +782,15 @@
     for (const t of mtypes) sel.add(new Option(t.label, t.key));
     sel.value = curPage.meetingType || 'general';
     const def = mtypes.find((t) => t.key === sel.value);
-    $('pTypeHint').textContent = (curPage.typeAuto === false ? '手動指定' : '自動判定')
-      + (def ? ` ・ ${def.hint}` : '');
+    // 手で選んだ場合も、自動判定が何と言ったかを併記する。
+    // これが無いと自動判定の精度を実機で確かめる手段が無い。
+    let src = '自動判定';
+    if (curPage.typeAuto === false) {
+      const a = curPage.autoType ? mtypes.find((t) => t.key === curPage.autoType) : null;
+      src = a ? `手動指定（自動判定は「${a.label}」${curPage.autoType === sel.value ? '＝一致' : '＝不一致'}）`
+        : '手動指定';
+    }
+    $('pTypeHint').textContent = src + (def ? ` ・ ${def.hint}` : '');
     sel.onchange = async () => {
       await window.koeApp.pageSetType(curId, sel.value);
       curPage.meetingType = sel.value; curPage.typeAuto = false;
@@ -873,7 +893,7 @@
     }
     const info = document.createElement('div');
     info.className = 'note info';
-    info.textContent = '各要点の [1] をクリックすると、根拠になった発言へ移動します。テキストはクリックで直接編集できます。';
+    info.textContent = '各要点の時刻をクリックすると、根拠になった発言へ移動します。テキストはクリックで直接編集できます。';
     box.appendChild(info);
 
     for (const b of curPage.blocks) {
@@ -944,14 +964,23 @@
         const wrap = document.createElement('span'); wrap.className = 'cites';
         const cites = Array.isArray(b.cites) ? b.cites : [];
         if (cites.length) {
-          cites.forEach((sid, i) => {
-            const c = document.createElement('button');
-            c.className = 'cite'; c.textContent = String(i + 1);
-            const seg = curSegs.find((s) => s.id === sid);
-            c.title = seg ? `${fmtClock(seg.atMs)} ${seg.text.slice(0, 60)}` : '該当の発言';
-            c.onclick = () => jumpToSegment(sid);
-            wrap.appendChild(c);
-          });
+          // チップには発言の時刻を出す。以前は「そのブロック内で何番目の出典か」を
+          // 出していたので、出典1件のブロックは必ず「1」になり、
+          // 要約の全要点が同じ1区間に貼り付いていても気づけなかった。
+          // 文字起こしタブが同じ時刻表記なので、そのまま突き合わせられる。
+          cites
+            .map((sid) => ({ sid, i: curSegs.findIndex((s) => s.id === sid) }))
+            .sort((a, z) => a.i - z.i)   // 表示は発言の時系列。保存はスコア順のまま
+            .forEach(({ sid, i }) => {
+              const seg = i >= 0 ? curSegs[i] : null;
+              const c = document.createElement('button');
+              c.className = 'cite';
+              c.textContent = seg ? fmtClock(seg.atMs) : '?';
+              c.title = seg ? `${fmtClock(seg.atMs)} 時点の発言\n${seg.text.slice(0, 80)}`
+                : '該当の発言が見つかりません';
+              c.onclick = () => jumpToSegment(sid);
+              wrap.appendChild(c);
+            });
         } else if (txt.textContent.trim().length >= 6) {
           const n = document.createElement('span'); n.className = 'nocite';
           n.textContent = '根拠なし'; n.title = '文字起こしに対応する発言が見つかりませんでした';
@@ -1216,6 +1245,8 @@
     $('soundFeedback').checked = s.soundFeedback !== false;
     $('autoLaunch').checked = Boolean(s.autoLaunch);
     $('dictionary').value = (s.dictionary || []).join('\n');
+    $('useBuiltinTerms').checked = s.useBuiltinTerms !== false;   // 既定 true
+    $('useSystemAudio').checked = Boolean(s.useSystemAudio);      // 既定 false
     loadMics(s.micId || '');
   }
 
@@ -1299,6 +1330,8 @@
       soundFeedback: $('soundFeedback').checked,
       autoLaunch: $('autoLaunch').checked,
       dictionary: $('dictionary').value.split('\n').map((s) => s.trim()).filter(Boolean),
+      useBuiltinTerms: $('useBuiltinTerms').checked,
+      useSystemAudio: $('useSystemAudio').checked,
     };
     const r = await window.koeApp.saveSettings(next);
     const m = $('saveMsg');

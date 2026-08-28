@@ -18,6 +18,21 @@ function fmtClock(ms) {
     : `${m}:${String(sec).padStart(2, '0')}`;
 }
 
+// インライン Markdown（**太字** など）を落とす。
+// 見た目の問題だけではない。cite.js の正規化は「*」を落とさないため、
+// 記号がバイグラムに残ると索引に無い gram が増えて被覆率が薄まり、
+// 短い要点では出典が丸ごと消える。出典が消えるのはこの製品では最も痛い壊れ方。
+// 対になっているものだけを落とす。「注記*1」「2*3」は書式ではないので触らない。
+function stripInlineMarkdown(s) {
+  return String(s || '')
+    .replace(/\*\*\*(?!\s)([^*\n]*[^*\s\n])\*\*\*/g, '$1')
+    .replace(/\*\*(?!\s)([^*\n]*[^*\s\n])\*\*/g, '$1')
+    .replace(/(?<![*\w])\*(?!\s)([^*\n]*[^*\s\n])\*(?!\*)/g, '$1')
+    .replace(/__(?!\s)([^_\n]*[^_\s\n])__/g, '$1')
+    .replace(/`([^`\n]+)`/g, '$1')
+    .trim();
+}
+
 // Markdown → ブロック配列（Notion のブロックモデル相当）
 function markdownToBlocks(md) {
   const blocks = [];
@@ -26,22 +41,63 @@ function markdownToBlocks(md) {
     if (!line.trim()) continue;
     let m;
     if ((m = line.match(/^#{1,4}\s+(.*)$/))) {
-      blocks.push({ id: store.newId('b'), type: 'heading', text: m[1].trim(), cites: [] });
+      blocks.push({ id: store.newId('b'), type: 'heading', text: stripInlineMarkdown(m[1]), cites: [] });
     // 「]」「・」の直後に空白が無い書き方をモデルがよくする。
     // ここで拾い損ねるとその行は paragraph になり、出典リンクも
     // 担当・期限の抽出も対象外になって、静かに機能が欠ける。
     // 「-」「*」は空白必須のまま（"*強調*" や "-5%" を誤って箇条書きにしないため）。
     } else if ((m = line.match(/^\s*[-*]\s*\[([ xX])\]\s*(.*)$/))) {
-      blocks.push({ id: store.newId('b'), type: 'todo', text: m[2].trim(), checked: m[1].toLowerCase() === 'x', cites: [] });
+      blocks.push({ id: store.newId('b'), type: 'todo', text: stripInlineMarkdown(m[2]), checked: m[1].toLowerCase() === 'x', cites: [] });
     } else if ((m = line.match(/^\s*(?:[-*]\s+|・\s*)(.*)$/))) {
-      blocks.push({ id: store.newId('b'), type: 'bullet', text: m[1].trim(), cites: [] });
+      blocks.push({ id: store.newId('b'), type: 'bullet', text: stripInlineMarkdown(m[1]), cites: [] });
     } else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
-      blocks.push({ id: store.newId('b'), type: 'bullet', text: m[1].trim(), cites: [] });
+      blocks.push({ id: store.newId('b'), type: 'bullet', text: stripInlineMarkdown(m[1]), cites: [] });
     } else {
-      blocks.push({ id: store.newId('b'), type: 'paragraph', text: line.trim(), cites: [] });
+      blocks.push({ id: store.newId('b'), type: 'paragraph', text: stripInlineMarkdown(line), cites: [] });
     }
   }
   return blocks;
+}
+
+// 「特になし」だけの行を、中身のある節から落とす。
+//
+// テンプレートが各節に「なければ『特になし』」と条件付きで指示しているが、
+// ローカルの小型モデルはこの条件を守り切れず、実項目を書いたうえで
+// 「特になし」も並べてくる。放っておくとアクションの件数が水増しされ、
+// Markdown 書き出しにも残る。
+//
+// 誤って本物の内容を消さないため、次の3条件を全て満たすときだけ落とす。
+//   1. 対象は見出し配下の bullet / todo のみ（見出しと地の文は絶対に触らない）
+//   2. 定型句に完全一致（「決定事項は特になし、次回に持ち越す」のような
+//      中身のある行は残す）
+//   3. 同じ節に定型句でない bullet / todo が1つ以上ある
+//      （全部が定型句なら、その節は本当に空なので1行も落とさない）
+const EMPTY_PHRASE = /^(?:特に(?:は)?(?:なし|無し|ありません|ございません)|なし|無し|該当(?:なし|無し)|不要)[。.、,]?$/;
+
+function isEmptyPhrase(text) {
+  return EMPTY_PHRASE.test(String(text || '').replace(/[\s（）()「」]/g, ''));
+}
+
+function dropRedundantEmpty(blocks) {
+  const out = [];
+  let section = [];          // 現在の節の bullet / todo
+  const flush = () => {
+    if (!section.length) return;
+    const real = section.filter((b) => !isEmptyPhrase(b.text));
+    // 実項目が1つでもあれば、定型句だけの行を捨てる
+    for (const b of section) {
+      if (real.length && isEmptyPhrase(b.text)) continue;
+      out.push(b);
+    }
+    section = [];
+  };
+  for (const b of blocks) {
+    if (b.type === 'bullet' || b.type === 'todo') { section.push(b); continue; }
+    flush();
+    out.push(b);            // 見出し・地の文が節の切れ目になる
+  }
+  flush();
+  return out;
 }
 
 function blocksToMarkdown(page, segments) {
@@ -60,4 +116,4 @@ function blocksToMarkdown(page, segments) {
   return md;
 }
 
-module.exports = { fmtClock, markdownToBlocks, blocksToMarkdown };
+module.exports = { fmtClock, markdownToBlocks, blocksToMarkdown, stripInlineMarkdown, dropRedundantEmpty };

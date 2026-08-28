@@ -8,7 +8,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { markdownToBlocks, blocksToMarkdown, fmtClock } = require('../src/minutes');
+const { markdownToBlocks, blocksToMarkdown, fmtClock,
+  stripInlineMarkdown, dropRedundantEmpty } = require('../src/minutes');
 
 const types = (md) => markdownToBlocks(md).map((b) => b.type);
 
@@ -146,4 +147,89 @@ test('書き出し → 読み戻しで議事録の中身が保たれる', () => 
   assert.ok(back.some((b) => b.type === 'heading' && b.text === 'アクションアイテム'));
   assert.ok(back.some((b) => b.type === 'todo' && b.text === '資料を作る' && b.checked === false));
   assert.ok(back.some((b) => b.type === 'bullet' && b.text === '応募は8名'));
+});
+
+// ---------------------------------------------------------------- インライン書式
+//
+// 実機の議事録に「**受注管理システムの回収**: …」がそのまま出た。
+// 表示が汚いだけでなく、cite.js の突き合わせで記号がバイグラムに残り、
+// 短い要点では出典が丸ごと消える。
+test('太字・斜体・コードの記号を落とす', () => {
+  assert.strictEqual(markdownToBlocks('- **受注管理の改修**: 完了')[0].text, '受注管理の改修: 完了');
+  assert.strictEqual(markdownToBlocks('- *強調* する')[0].text, '強調 する');
+  assert.strictEqual(markdownToBlocks('- ***両方*** の指定')[0].text, '両方 の指定');
+  assert.strictEqual(markdownToBlocks('- __下線風__ の指定')[0].text, '下線風 の指定');
+  assert.strictEqual(markdownToBlocks('- `npm test` を流す')[0].text, 'npm test を流す');
+  assert.strictEqual(markdownToBlocks('## **見出しも**')[0].text, '見出しも');
+  assert.strictEqual(markdownToBlocks('地の文の **太字** も')[0].text, '地の文の 太字 も');
+});
+
+test('書式でないアスタリスクは触らない', () => {
+  assert.strictEqual(markdownToBlocks('- 注記*1 を参照')[0].text, '注記*1 を参照');
+  assert.strictEqual(markdownToBlocks('- 売上は 2*3 の関係')[0].text, '売上は 2*3 の関係');
+  assert.strictEqual(stripInlineMarkdown('a * b * c'), 'a * b * c');   // 空白始まりは強調ではない
+  assert.strictEqual(stripInlineMarkdown('5% * 3'), '5% * 3');
+});
+
+test('チェックボックスの本文からも書式を落とす', () => {
+  const b = markdownToBlocks('- [ ] **山田**へ確認を依頼（担当: 山田）')[0];
+  assert.strictEqual(b.type, 'todo');
+  assert.strictEqual(b.text, '山田へ確認を依頼（担当: 山田）');
+});
+
+test('書式を落としても行数は変わらない', () => {
+  const md = '## 報告事項\n- **A**: あり\n- *B*: なし\n地の文';
+  assert.strictEqual(markdownToBlocks(md).length, 4);
+});
+
+// ---------------------------------------------------------------- 「特になし」
+//
+// テンプレートの「なければ特になし」を小型モデルが守り切れず、
+// 実項目を書いたうえで「特になし」も並べてくる。
+// アクション件数の水増しと Markdown 書き出しの汚れになる。
+const B = (md) => dropRedundantEmpty(markdownToBlocks(md)).map((b) => `${b.type}:${b.text}`);
+
+test('実項目がある節の「特になし」だけを落とす', () => {
+  assert.deepStrictEqual(
+    B('## アクションアイテム\n- [ ] 実行計画を確認する\n- 特になし'),
+    ['heading:アクションアイテム', 'todo:実行計画を確認する']);
+});
+
+test('本当に空の節の「特になし」は残す', () => {
+  assert.deepStrictEqual(
+    B('## 決定事項\n- 特になし'),
+    ['heading:決定事項', 'bullet:特になし']);
+});
+
+test('節をまたいで判定しない', () => {
+  assert.deepStrictEqual(
+    B('## 報告事項\n- 結合テストが完了\n## 決定事項\n- 特になし'),
+    ['heading:報告事項', 'bullet:結合テストが完了', 'heading:決定事項', 'bullet:特になし']);
+});
+
+test('中身のある行は「特になし」を含んでいても消さない', () => {
+  assert.deepStrictEqual(
+    B('## 決定事項\n- 価格は据え置き\n- 決定事項は特になし、次回に持ち越す'),
+    ['heading:決定事項', 'bullet:価格は据え置き', 'bullet:決定事項は特になし、次回に持ち越す']);
+});
+
+test('言い回しの揺れを拾う', () => {
+  for (const w of ['特になし', '特に無し', 'なし', '無し', '該当なし', '特にありません', '特になし。', '（特になし）']) {
+    assert.deepStrictEqual(
+      B(`## X\n- 本物の項目\n- ${w}`), ['heading:X', 'bullet:本物の項目'], w);
+  }
+});
+
+test('見出しと地の文は絶対に落とさない', () => {
+  assert.deepStrictEqual(
+    B('## 決定事項\n特になし\n## 課題\n- 本物\n- なし'),
+    ['heading:決定事項', 'paragraph:特になし', 'heading:課題', 'bullet:本物']);
+});
+
+test('全部が定型句なら1行も落とさない', () => {
+  assert.deepStrictEqual(B('## X\n- 特になし\n- なし'), ['heading:X', 'bullet:特になし', 'bullet:なし']);
+});
+
+test('空配列でも落ちない', () => {
+  assert.deepStrictEqual(dropRedundantEmpty([]), []);
 });

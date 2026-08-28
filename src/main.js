@@ -21,7 +21,7 @@ const { attachCitations } = require('./cite');
 const mtype = require('./meetingType');
 const { enrichActionBlocks } = require('./actions');
 const updater = require('./updater');
-const { markdownToBlocks, blocksToMarkdown } = require('./minutes');
+const { markdownToBlocks, blocksToMarkdown, dropRedundantEmpty } = require('./minutes');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
 const CPU_DEFAULT_THREADS = Math.max(4, os.cpus().length - 2);
@@ -55,6 +55,12 @@ const DEFAULT_SETTINGS = {
   soundFeedback: true,
   autoLaunch: false,
   dictionary: [],
+  // 業務日本語の既定語彙をエンジンへ渡すか。dictionary の既定を非空にすると、
+  // 既に [] を保存済みの環境には既定値が届かないので、別のキーで持つ。
+  useBuiltinTerms: true,
+  // 議事録のときだけ、パソコンから出ている音（Web会議の相手の声）も録る。
+  // 既定は false。同席者の声を残すかどうかは、その場で人が決めること。
+  useSystemAudio: false,
   maxHistory: 500,
   segmentSec: 75,
 };
@@ -137,13 +143,40 @@ function removeFillersRule(text) {
     .trim();
 }
 
+// 業務日本語でよく化ける語。固有名詞ではないのでユーザーに登録させる筋ではなく、
+// 既定で渡す。実機で「不具合→風買い」「改修→回収」「今週→本週」が出たことによる。
+// 数詞の聞き違い（12件→22件）には効かない。効くのはマイクとモデルの大きさ。
+const BUILTIN_TERMS = [
+  '不具合', '改修', '仕様', '要件', '結合テスト', '単体テスト', '検収', 'リリース',
+  '課題', '懸案', '進捗', '稼働', '納期', '見積', '工数', '案件', '所感',
+  '今週', '来週', '今月', '来月', '月末', '期末',
+  '定例', '共有', '対応', '確認', '検討', '展開', '棚卸し',
+];
+
+// whisper.cpp の初期プロンプトは n_text_ctx/2（既定 224 トークン）で切られる。
+// どちら側から切られるかはビルドで変わりうるので、そもそも溢れさせない。
+// 日本語は最悪 1文字 1トークンとみて、文字数で見積もる。
+const PROMPT_MAX_CHARS = 200;
+
 function buildPrompt(extraTail) {
   const parts = [];
   if (settings.language === 'ja') parts.push('以下は日本語の会議の録音です。句読点を含めて正確に書き起こします。');
-  if (Array.isArray(settings.dictionary) && settings.dictionary.length > 0) {
-    parts.push(`用語: ${settings.dictionary.join('、')}`);
+  const tail = String(extraTail || '');
+  let budget = PROMPT_MAX_CHARS - parts.join(' ').length - tail.length - 4;
+
+  // ユーザーが入れた固有名詞を先に確保し、余った分だけ既定語彙を足す。
+  // 予算に収まらなければ既定語彙側から落ちる。
+  const user = Array.isArray(settings.dictionary) ? settings.dictionary : [];
+  const builtin = settings.useBuiltinTerms === false ? [] : BUILTIN_TERMS;
+  const terms = [];
+  for (const raw of user.concat(builtin)) {
+    const w = String(raw || '').trim();
+    if (!w || terms.includes(w)) continue;
+    if (budget - (w.length + 1) < 0) break;
+    terms.push(w); budget -= w.length + 1;
   }
-  if (extraTail) parts.push(extraTail);
+  if (terms.length) parts.push(`用語: ${terms.join('、')}`);
+  if (tail) parts.push(tail);
   return parts.join(' ');
 }
 
@@ -279,7 +312,13 @@ async function transcribeLocal(wavBuffer, extraPromptTail) {
   form.append('temperature', '0.0');
   if (settings.language && settings.language !== 'auto') form.append('language', settings.language);
   const prompt = buildPrompt(extraPromptTail);
-  if (prompt) form.append('prompt', prompt);
+  if (prompt) {
+    form.append('prompt', prompt);
+    // これが無いと語彙のヒントが各リクエストの最初の30秒にしか効かない。
+    // 1区間は75秒あるので、2/3が素の状態で書き起こされていた。
+    // 古いビルドでは黙って無視されるだけで害は無い。
+    form.append('carry_initial_prompt', 'true');
+  }
 
   const res = await fetch(`http://127.0.0.1:${settings.localPort}/inference`,
     { method: 'POST', body: form, signal: AbortSignal.timeout(240000) });
@@ -314,6 +353,15 @@ async function llmChat(messages, maxTokens) {
 
 async function generateMinutes(plain, memo, onProgress, type) {
   const MINUTES_FORMAT = mtype.getFormat(type);
+  // 節ごとに「なければ特になし」と書くと、小型モデルが条件を守り切れず
+  // 実項目と「特になし」を両方並べてくる。ルールは全体で1回だけ言う。
+  // （それでも混ざるので minutes.js の dropRedundantEmpty で後始末する）
+  // 装飾を禁じるのは見た目のためではない。「**」が残ると出典の一致が
+  // 薄まり、短い要点でリンクが消えるため。
+  const OUTPUT_RULE = '書き方のきまり:\n'
+    + '- 該当する内容が本当に一つも無い見出しにだけ「特になし」と書く。'
+    + '一つでも書くことがあれば「特になし」は書かない。\n'
+    + '- 太字（**）や斜体などの装飾は使わない。素の文章で書く。';
   const ok = await ensureEngineReady(sumEng);
   if (!ok) throw new Error(sumEng.lastError || '要約エンジンが起動していません');
   const sys = 'あなたは優秀な議事録作成アシスタントです。会議の文字起こしを分析し、正確で実用的な議事録を日本語のMarkdownで作成します。'
@@ -328,7 +376,7 @@ async function generateMinutes(plain, memo, onProgress, type) {
   if (plain.length + memoBlock.length <= CHUNK + 1500) {
     const one = await llmChat([
       { role: 'system', content: sys },
-      { role: 'user', content: `${memoBlock}【会議の文字起こし】\n${plain}\n\n上記から、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${MINUTES_FORMAT}` },
+      { role: 'user', content: `${memoBlock}【会議の文字起こし】\n${plain}\n\n上記から、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${MINUTES_FORMAT}\n\n${OUTPUT_RULE}` },
     ], SUM_MAX_TOKENS);
     return { md: one.text, truncated: one.truncated };
   }
@@ -353,7 +401,7 @@ async function generateMinutes(plain, memo, onProgress, type) {
   if (onProgress) onProgress('議事録をまとめています…');
   const final = await llmChat([
     { role: 'system', content: sys },
-    { role: 'user', content: `${memoBlock}【会議の要点メモ（時系列）】\n${notes.join('\n\n')}\n\n上記の要点メモを統合し、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${MINUTES_FORMAT}` },
+    { role: 'user', content: `${memoBlock}【会議の要点メモ（時系列）】\n${notes.join('\n\n')}\n\n上記の要点メモを統合し、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${MINUTES_FORMAT}\n\n${OUTPUT_RULE}` },
   ], SUM_MAX_TOKENS);
   return { md: final.text, truncated: truncated || final.truncated };
 }
@@ -752,11 +800,20 @@ async function runSummary(pageId) {
     return { ok: false, error: page.summaryError };
   }
 
-  // 会議タイプ: 手動指定があればそれを尊重し、無ければタイトルと冒頭から推定
+  // 会議タイプ: 手動指定があればそれを尊重し、無ければタイトルと冒頭から推定。
+  // 自動判定は手動指定があっても必ず走らせ、結果を別に残す。こうしないと
+  // 「自動判定が当たっていたか」を後から誰も確かめられない
+  // （手で選んだ議事録では detectType が一度も呼ばれていなかった）。
+  const autoType = mtype.detectType(page.title, plain.slice(0, 1200));
+  page.autoType = autoType;
   if (!page.meetingType || page.typeAuto !== false) {
-    page.meetingType = mtype.detectType(page.title, plain.slice(0, 1200));
+    page.meetingType = autoType;
     page.typeAuto = true;
   }
+  // タイトルは書かない。1on1・面談の議事録は機微で、engine.log は
+  // 不具合報告に添付されうる。
+  engineLog(`会議タイプ: 採用=${page.meetingType} 自動判定=${autoType}`
+    + ` 手動=${page.typeAuto === false} 区間数=${usable.length}`);
 
   sendToMainWin('meeting:progress', {
     message: `要約エンジンで議事録を作成中…（${mtype.getLabel(page.meetingType)}として要約します）`,
@@ -767,7 +824,9 @@ async function runSummary(pageId) {
       (msg) => sendToMainWin('meeting:progress', { message: msg }),
       page.meetingType,
     );
-    const blocks = markdownToBlocks(md);
+    // 「特になし」の混入を先に落とす。ここで落とさないと
+    // 「- [ ] 特になし」がアクション1件として数えられてしまう。
+    const blocks = dropRedundantEmpty(markdownToBlocks(md));
     // 担当・期限を先に抜く。出典の突き合わせは
     // 「（担当: ○○ / 期限: ○○）」を落とした本文に対して行いたい。
     // 書式が残ったままだと、その語がクエリに混ざって一致がぶれる。
@@ -780,6 +839,7 @@ async function runSummary(pageId) {
     saved.blocks = blocks;
     saved.meetingType = page.meetingType;
     saved.typeAuto = page.typeAuto;
+    saved.autoType = page.autoType;
     saved.citeStat = stat;
     saved.actionStat = actStat;
     saved.summaryError = truncated
