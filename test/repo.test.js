@@ -255,6 +255,26 @@ test('トレイのアイコンは src 配下にある（アプリ内更新で一
   }
 });
 
+test('設定と履歴の保存が一時ファイル経由で行われる', () => {
+  // 直接書くと、書き込み中に落ちたときに壊れたJSONが残り、
+  // 次回起動で既定値に戻って設定が消える
+  const i = main.indexOf('function saveJson');
+  assert.ok(i >= 0, 'saveJson が無い');
+  const fn = main.slice(i, main.indexOf('\nconst persist', i));
+  assert.ok(fn.includes('renameSync'), 'saveJson が一時ファイル経由になっていない');
+});
+
+test('READMEのデータ保存先が実際の保存先と一致する', () => {
+  // Electron の app.getName() と同じ解決順（setName は使っていない）
+  const pkg = JSON.parse(read('package.json'));
+  const name = pkg.productName || pkg.name;
+  const readme = read('README.md');
+  assert.ok(readme.includes(`%APPDATA%\\${name}`),
+    `README が %APPDATA%\\${name} を案内していない`);
+  assert.ok(!/%APPDATA%\\koetype/.test(readme),
+    '実在しない保存先（koetype）が README に残っている');
+});
+
 test('package.json のバージョンが semver 形式', () => {
   const pkg = JSON.parse(read('package.json'));
   assert.match(pkg.version, /^\d+\.\d+\.\d+$/);

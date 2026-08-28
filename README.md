@@ -94,7 +94,7 @@ llama.cpp と Qwen2.5-3B（約1.9GB）を取得します。`-Model 7b` で高品
 
 ## データ保存先
 
-`%APPDATA%\koetype\`（フォルダ名は互換のため据え置き）
+`%APPDATA%\listener\`
 ```
 settings.json          設定
 history.json           音声入力の履歴

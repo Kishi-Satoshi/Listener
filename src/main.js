@@ -84,13 +84,27 @@ const historyPath = () => path.join(app.getPath('userData'), 'history.json');
 function loadJson(file, fallback) {
   try {
     if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch (e) { console.error('loadJson', file, e.message); }
+  } catch (e) {
+    // 壊れていたら退避してから既定値に戻す。
+    // そのまま既定値で動くと、次の保存で上書きされて設定が復旧できなくなる。
+    console.error('loadJson', file, e.message);
+    try {
+      const broken = `${file}.broken-${Date.now()}`;
+      fs.renameSync(file, broken);
+      console.error('壊れた設定を退避しました:', broken);
+    } catch (_) { /* noop */ }
+  }
   return fallback;
 }
 function saveJson(file, data) {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+    // 一時ファイルに書いてから置き換える。直接書くと、書き込み中に落ちたときに
+    // 壊れたJSONが残り、次回起動で既定値に戻って設定が消える。
+    // （store.js の writeJson と同じ扱いにする）
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
+    fs.renameSync(tmp, file);
   } catch (e) { console.error('saveJson', file, e.message); }
 }
 const persistSettings = () => saveJson(settingsPath(), settings);
