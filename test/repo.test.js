@@ -508,3 +508,16 @@ test('スレッド数とポートに説明がある', () => {
   assert.ok(appHtml.includes('通常は変更不要です。スレッド数は文字起こしに使うCPUの数'));
   assert.ok(appHtml.includes('2つのエンジンのポートは別の番号にしてください'));
 });
+
+// ---------------------------------------------------------------- 検索の本文対応
+test('「すべて」の検索が要約の本文とメモに当たる', () => {
+  // タイトルと最初の1行しか見ていなかったため、実機で
+  // 「検索が全部壊れている」と報告された
+  const st = read('src/store.js');
+  assert.match(st, /searchText: page\.blocks\.map/);
+  const fn = st.slice(st.indexOf('function searchIndex'), st.indexOf('function searchFullText'));
+  assert.ok(fn.includes('p.searchText'), '検索が本文を見ていない');
+  assert.ok(fn.includes('snippet'), '当たった箇所を見せていない');
+  // 古い索引の作り直し（これが無いと既存の議事録は検索に出てこないまま）
+  assert.match(st, /typeof index\.pages\[i\]\.searchText === 'string'/);
+});

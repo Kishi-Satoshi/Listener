@@ -56,6 +56,15 @@ function init(userDataPath) {
   fs.mkdirSync(d.transcripts, { recursive: true });
   index = readJson(d.indexFile, { version: 2, pages: [] });
   if (!index || !Array.isArray(index.pages)) index = { version: 2, pages: [] };
+  // 古い世代の索引には searchText が無く、検索が本文に当たらない。
+  // 起動時に1回だけ、無い項目を作り直す。
+  let migrated = false;
+  for (let i = 0; i < index.pages.length; i++) {
+    if (typeof index.pages[i].searchText === 'string') continue;
+    const page = getPage(index.pages[i].id);
+    if (page) { index.pages[i] = summarize(page); migrated = true; }
+  }
+  if (migrated) writeJson(d.indexFile, index);
   return ROOT;
 }
 
@@ -79,6 +88,11 @@ function summarize(page) {
     nextDue: dues[0] || '',
     assignees: [...new Set(open.map((b) => b.assignee).filter(Boolean))],
     preview: firstBullet ? firstBullet.text.slice(0, 120) : '',
+    // 「すべて」の検索が見る本文。これが無いと検索はタイトルと最初の
+    // 1行しか当たらず、要約の中身を探せない（実機で「検索が全部壊れて
+    // いる」と報告された）。文字起こしは searchFullText が受け持つ。
+    searchText: page.blocks.map((b) => b.text).filter(Boolean).join(' ')
+      .concat(' ', String(page.memo || '')).slice(0, 4000),
     recovered: Boolean(page.recovered),
   };
 }
@@ -207,9 +221,17 @@ function setTitle(pageId, title) {
 function searchIndex(query) {
   const q = query.trim();
   if (!q) return index.pages;
-  return index.pages.filter(
-    (p) => p.title.includes(q) || (p.preview && p.preview.includes(q)),
-  );
+  const out = [];
+  for (const p of index.pages) {
+    if (p.title.includes(q)) { out.push(p); continue; }
+    const text = p.searchText || p.preview || '';
+    const at = text.indexOf(q);
+    if (at < 0) continue;
+    // どこに当たったかを一覧で見せる（前後を少し添える）
+    const from = Math.max(0, at - 20);
+    out.push({ ...p, snippet: (from > 0 ? '…' : '') + text.slice(from, at + q.length + 40) });
+  }
+  return out;
 }
 
 // 全文検索は文字起こしファイルを走査する（件数が増えると重いので呼び出し側で明示実行）
