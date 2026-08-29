@@ -484,3 +484,27 @@ test('README が現行の機能名と一致している', () => {
   assert.ok(readme.includes('要約タイプ'));
   assert.ok(readme.includes('文字起こし検索'));
 });
+
+// ---------------------------------------------------------------- v0.9.9 の結線
+test('エンジンの起動確認は /health を見る', () => {
+  // 「/」だと llama-server がモデル読み込み中でも 200 を返し、
+  // 準備完了と誤認して直後の推論が 503 になる（実機で発生）
+  assert.match(main, /\/health`;/);
+  assert.ok(!/`http:\/\/127\.0\.0\.1:\$\{enginePort\(eng\)\}\/`/.test(main), '「/」を見ている');
+});
+
+test('要約エンジンの 503 は待って引き直す', () => {
+  const fn = main.slice(main.indexOf('async function llmChat'), main.indexOf('async function generateMinutes'));
+  assert.ok(fn.includes('503'), '503 の扱いが無い');
+  assert.match(fn, /res\.status !== 503 \|\| Date\.now\(\) >= deadline/);
+});
+
+test('設定は自動保存（保存ボタンは無い）', () => {
+  assert.ok(!appHtml.includes('saveBtn'), '保存ボタンが残っている');
+  assert.ok(appHtml.includes("$('tabSettings').addEventListener('change'"), '自動保存の結線が無い');
+});
+
+test('スレッド数とポートに説明がある', () => {
+  assert.ok(appHtml.includes('通常は変更不要です。スレッド数は文字起こしに使うCPUの数'));
+  assert.ok(appHtml.includes('2つのエンジンのポートは別の番号にしてください'));
+});

@@ -444,6 +444,10 @@
               <div style="flex:1"><label for="localThreads">スレッド数</label><input type="text" id="localThreads" /></div>
               <div style="flex:1"><label for="localPort">ポート</label><input type="text" id="localPort" /></div>
             </div>
+            <div class="desc">通常は変更不要です。スレッド数は文字起こしに使うCPUの数
+              （初期値はこのPCのコア数−2。増やすと速くなりますが、他の作業が重くなります）。
+              ポートはこのPCの中だけで使う通信の番号で、他のソフトと番号が
+              ぶつかってエンジンが起動できないときだけ変えてください。</div>
           </div>
           <label class="check">
             <input type="checkbox" id="useVad" />
@@ -489,6 +493,8 @@
               <div style="flex:1"><label for="sumThreads">スレッド数</label><input type="text" id="sumThreads" /></div>
               <div style="flex:1"><label for="sumPort">ポート</label><input type="text" id="sumPort" /></div>
             </div>
+            <div class="desc">通常は変更不要です。意味は文字起こしエンジンの欄と同じです
+              （こちらは要約に使われます）。2つのエンジンのポートは別の番号にしてください。</div>
           </div>
           <div class="row" style="display:flex;gap:8px">
             <button class="ghost" id="testSumBtn" type="button">起動テスト</button>
@@ -598,7 +604,6 @@
         </div>
 
         <div style="display:flex;align-items:center;gap:12px;padding-bottom:20px">
-          <button class="action" id="saveBtn">設定を保存</button>
           <span class="save-msg" id="saveMsg"></span>
           <span style="flex:1"></span>
           <button class="ghost" id="openDataBtn" type="button">データ保存先を開く</button>
@@ -1513,7 +1518,10 @@
     m.textContent = r.error || '保存に失敗しました'; m.className = 'save-msg ng';
     return false;
   }
-  $('saveBtn').onclick = () => save(false);
+  // 設定は変更したら自動で保存する。change はテキスト欄では入力を終えて
+  // フォーカスを外したときに発火するので、パスを打っている途中で
+  // エンジンが再起動されることはない。トグルやセレクトは押した瞬間に効く。
+  $('tabSettings').addEventListener('change', () => save(false));
 
   // ---------------- アップデート ----------------
   let pendingUpdate = null;

@@ -320,7 +320,11 @@ function ensureEngineReady(eng) {
   eng.readyPromise = (async () => {
     if (!eng.proc) startEngine(eng);
     if (!eng.proc) return false;
-    const url = `http://127.0.0.1:${enginePort(eng)}/`;
+    // 「/」は見ない。llama-server はモデル読み込み中でも「/」に 200 を
+    // 返すため、準備完了と誤認して直後の推論が 503 になる（実機で発生）。
+    // /health は読み込み中 503・完了で 200 を返す。エンドポイントを持たない
+    // 古いビルドは 404 を返すので、その場合だけ「応答した」ことで良しとする。
+    const url = `http://127.0.0.1:${enginePort(eng)}/health`;
     const deadline = Date.now() + ENGINE_READY_TIMEOUT_MS;
     while (Date.now() < deadline) {
       if (!eng.proc) return false;
@@ -385,12 +389,20 @@ async function transcribeLocal(wavBuffer, extraPromptTail, durationMs) {
 
 // ---------------------------------------------------------------- 要約
 async function llmChat(messages, maxTokens) {
-  const res = await fetch(`http://127.0.0.1:${settings.sumPort}/v1/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages, temperature: 0.2, max_tokens: maxTokens }),
-    signal: AbortSignal.timeout(900000),
-  });
+  // 503 は「壊れた」ではなく「まだ準備中・手が塞がっている」。
+  // すぐ諦めるとモデル読み込みの数十秒を待てずにエラーで返してしまう。
+  let res;
+  const deadline = Date.now() + 120000;
+  for (;;) {
+    res = await fetch(`http://127.0.0.1:${settings.sumPort}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages, temperature: 0.2, max_tokens: maxTokens }),
+      signal: AbortSignal.timeout(900000),
+    });
+    if (res.status !== 503 || Date.now() >= deadline) break;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
   if (!res.ok) throw new Error(`要約エンジンエラー (${res.status})`);
   const data = await res.json();
   const text = data?.choices?.[0]?.message?.content?.trim();
