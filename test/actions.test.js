@@ -219,3 +219,25 @@ test('enrichActionBlocks は todo だけを対象にし、本文を空にしな�
 test('基準日を渡さなくても落ちない', () => {
   assert.doesNotThrow(() => parseAction('資料を作る（担当: 山田 / 期限: 来週）', undefined));
 });
+
+// ---------------------------------------------------------------- 情報ゼロの担当・期限
+//
+// モデルは「（担当なし）」「（担当: なし / 期限: 未定）」とも書いてくる。
+// 「なし」は情報ゼロなので本文から落とすだけにする。推測で埋めない。
+test('「担当なし」「期限未定」は落とすだけ（推測で埋めない）', () => {
+  const B = new Date(2026, 7, 29);
+  let p = parseAction('テスト環境の2台目の用意を検討する（担当なし）', B);
+  assert.strictEqual(p.text, 'テスト環境の2台目の用意を検討する');
+  assert.strictEqual(p.assignee, '');
+  p = parseAction('設計書の更新を依頼する（担当: なし / 期限: 未定）', B);
+  assert.strictEqual(p.text, '設計書の更新を依頼する');
+  assert.strictEqual(p.assignee, '');
+  assert.strictEqual(p.due, '');
+  // 情報のある括弧は今まで通り
+  p = parseAction('実行計画を確認する（担当: 山田 / 期限: 来週金曜）', B);
+  assert.strictEqual(p.assignee, '山田');
+  assert.strictEqual(p.due, '2026-09-04');
+  // 担当・期限と無関係な括弧は触らない
+  p = parseAction('リリース内容を確定する（費用は要確認）', B);
+  assert.strictEqual(p.text, 'リリース内容を確定する（費用は要確認）');
+});

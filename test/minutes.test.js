@@ -250,3 +250,26 @@ test('本物のアクションはチェックボックスのまま残す', () =>
   assert.strictEqual(r[1].type, 'todo');
   assert.strictEqual(r[1].checked, false);
 });
+
+// ---------------------------------------------------------------- 揺れたチェックボックス
+//
+// 実機のモデルは「・[ ] 手順書を確認する（鈴木）」「- [] 検討する」のような
+// 揺れた書き方をしてきた。拾い損ねると画面に「[ ]」がそのまま見え、
+// アクション件数にも担当・期限の抽出にも入らない。
+test('揺れたチェックボックス書式を拾う', () => {
+  const one = (md) => markdownToBlocks(md)[0];
+  assert.strictEqual(one('・[ ] 手順書を確認する').type, 'todo');
+  assert.strictEqual(one('- [] 2台目を検討する').type, 'todo');
+  assert.strictEqual(one('- ［ ］ 全角の括弧').type, 'todo');
+  assert.strictEqual(one('1. [ ] 番号つき').type, 'todo');
+  const done = one('- ［ｘ］ 済んだ項目');
+  assert.strictEqual(done.type, 'todo');
+  assert.strictEqual(done.checked, true);
+  assert.strictEqual(one('・[ ] 手順書を確認する').text, '手順書を確認する');
+});
+
+test('角括弧の引用・番号はチェックボックスにしない', () => {
+  assert.strictEqual(markdownToBlocks('- [1] を参照')[0].type, 'bullet');
+  assert.strictEqual(markdownToBlocks('- 出典[2]の件')[0].type, 'bullet');
+  assert.strictEqual(markdownToBlocks('[3] 脚注ふう')[0].type, 'paragraph');
+});

@@ -174,6 +174,14 @@ function parseAction(text, base) {
     if (assignee || dueRaw) body = body.slice(0, paren.index).trim();
   }
 
+  // モデルは「（担当なし）」「（担当: なし / 期限: 未定）」とも書いてくる。
+  // 「なし」は情報ゼロなので本文から落とすだけにする（推測で埋めない）。
+  body = body.replace(/[（(]\s*(?:担当|期限)[^）)]{0,14}[）)]\s*$/,
+    (mm) => (/なし|無し|未定|不明|TBD/i.test(mm) ? '' : mm)).trim();
+  const isNone = (v) => /^(?:なし|無し|未定|不明|TBD|-|－)$/i.test(String(v).trim());
+  if (isNone(assignee)) assignee = '';
+  if (isNone(dueRaw)) dueRaw = '';
+
   // (2) 括弧なしの定型: 担当: 山田 期限: 8/30
   if (!assignee && (m = body.match(/(?:担当者?)\s*[:：]\s*([^\s/,、|）)]+)/))) {
     assignee = m[1].trim(); body = body.replace(m[0], ' ').trim();

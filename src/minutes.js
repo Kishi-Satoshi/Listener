@@ -38,6 +38,13 @@ function stripInlineMarkdown(s) {
     .trim();
 }
 
+// 行頭のチェックボックス書式。実機のモデルは「- [ ]」だけでなく
+// 「・[ ]」「- []」「［ ］」のような揺れた書き方をしてくる。
+// 拾い損ねると箇条書きになり、画面に「[ ]」がそのまま見えるうえ、
+// アクション件数にも担当・期限の抽出にも入らない。
+// 「[1] を参照」のような角括弧は中身が空白/x でないので誤爆しない。
+const CHECKBOX_HEAD = /^[\[［]([ xXｘＸ×　]?)[\]］]\s*/;
+
 // Markdown → ブロック配列（Notion のブロックモデル相当）
 function markdownToBlocks(md) {
   const blocks = [];
@@ -53,10 +60,16 @@ function markdownToBlocks(md) {
     // 「-」「*」は空白必須のまま（"*強調*" や "-5%" を誤って箇条書きにしないため）。
     } else if ((m = line.match(/^\s*[-*]\s*\[([ xX])\]\s*(.*)$/))) {
       blocks.push({ id: store.newId('b'), type: 'todo', text: stripInlineMarkdown(m[2]), checked: m[1].toLowerCase() === 'x', cites: [] });
-    } else if ((m = line.match(/^\s*(?:[-*]\s+|・\s*)(.*)$/))) {
-      blocks.push({ id: store.newId('b'), type: 'bullet', text: stripInlineMarkdown(m[1]), cites: [] });
-    } else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
-      blocks.push({ id: store.newId('b'), type: 'bullet', text: stripInlineMarkdown(m[1]), cites: [] });
+    } else if ((m = line.match(/^\s*(?:[-*]\s+|・\s*)(.*)$/))
+        || (m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+      const c = m[1].match(CHECKBOX_HEAD);
+      if (c) {
+        blocks.push({ id: store.newId('b'), type: 'todo',
+          text: stripInlineMarkdown(m[1].slice(c[0].length)),
+          checked: /[xXｘＸ×]/.test(c[1] || ''), cites: [] });
+      } else {
+        blocks.push({ id: store.newId('b'), type: 'bullet', text: stripInlineMarkdown(m[1]), cites: [] });
+      }
     } else {
       blocks.push({ id: store.newId('b'), type: 'paragraph', text: stripInlineMarkdown(line), cites: [] });
     }
