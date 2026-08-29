@@ -5,6 +5,9 @@
 <title>Listener</title>
 <style>
   :root {
+    color-scheme: light;
+    --srf: 255, 255, 255;      /* 面の色（ガラス・ボタン・入力欄）のRGBチャンネル */
+    --inkrgb: 27, 30, 37;      /* 線・影に使う墨色のRGBチャンネル */
     --ink: #1b1e25;
     --muted: rgba(56, 60, 70, 0.64);
     --faint: rgba(56, 60, 70, 0.40);
@@ -13,15 +16,41 @@
     --rec: #e5484d;
     --danger: #d0453c;
     --green: #2f9e63;
-    --glass: rgba(255, 255, 255, 0.55);
-    --glass-soft: rgba(255, 255, 255, 0.40);
-    --glass-strong: rgba(255, 255, 255, 0.76);
-    --gline: rgba(255, 255, 255, 0.70);
-    --gline-dark: rgba(27, 30, 37, 0.08);
+    --glass: rgba(var(--srf), 0.55);
+    --glass-soft: rgba(var(--srf), 0.40);
+    --glass-strong: rgba(var(--srf), 0.76);
+    --gline: rgba(var(--srf), 0.70);
+    --gline-dark: rgba(var(--inkrgb), 0.08);
     --shadow: 0 8px 32px rgba(44, 62, 112, 0.13);
     --shadow-soft: 0 4px 16px rgba(44, 62, 112, 0.09);
     --r-lg: 20px;
     --r-md: 12px;
+  }
+  /* ダーク配色。設定の「画面の配色」は main 側で nativeTheme.themeSource を
+     切り替えるだけで、ここ（prefers-color-scheme）がそのまま反応する。 */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --srf: 50, 55, 68;
+      --inkrgb: 231, 233, 238;
+      --ink: #e7e9ee;
+      --muted: rgba(226, 230, 240, 0.60);
+      --faint: rgba(226, 230, 240, 0.36);
+      --accent: #7c8cf0;
+      --accent-deep: #9aa6f5;
+      --rec: #ff6b6b;
+      --danger: #ff7a70;
+      --green: #4cc98a;
+      --glass: rgba(50, 55, 68, 0.55);
+      --glass-soft: rgba(50, 55, 68, 0.40);
+      --glass-strong: rgba(50, 55, 68, 0.76);
+      --gline: rgba(255, 255, 255, 0.08);
+      --gline-dark: rgba(255, 255, 255, 0.10);
+      --shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+      --shadow-soft: 0 4px 16px rgba(0, 0, 0, 0.30);
+    }
+    body { background: #171a21; }
+    .bg { background: linear-gradient(165deg, #191d27 0%, #171a22 45%, #201b17 100%); }
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { height: 100%; }
@@ -44,10 +73,10 @@
   nav { margin-left: auto; display: flex; gap: 2px; padding: 4px;
     background: var(--glass-soft); border: 1px solid var(--gline); border-radius: 999px;
     backdrop-filter: blur(20px) saturate(150%); -webkit-backdrop-filter: blur(20px) saturate(150%);
-    box-shadow: inset 0 1px 0 rgba(255,255,255,.65), var(--shadow-soft); }
+    box-shadow: inset 0 1px 0 rgba(var(--srf),.65), var(--shadow-soft); }
   nav button { background: none; border: none; color: var(--muted); font: inherit;
     padding: 7px 16px; cursor: pointer; border-radius: 999px; }
-  nav button.active { background: rgba(255,255,255,.92); color: var(--ink); font-weight: 600;
+  nav button.active { background: rgba(var(--srf),.92); color: var(--ink); font-weight: 600;
     box-shadow: 0 2px 10px rgba(44,62,112,.18), inset 0 1px 0 #fff; }
   nav button:hover { color: var(--ink); }
 
@@ -57,36 +86,36 @@
 
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: rgba(27,30,37,.16); border-radius: 5px; }
-  ::-webkit-scrollbar-thumb:hover { background: rgba(27,30,37,.30); }
+  ::-webkit-scrollbar-thumb { background: rgba(var(--inkrgb),.16); border-radius: 5px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(var(--inkrgb),.30); }
 
   /* ---------- 部品 ---------- */
   button.action { background: linear-gradient(180deg, #7b8bef 0%, #5261dd 100%); color: #fff;
     border: none; font: inherit; font-weight: 600; padding: 9px 18px; border-radius: 999px; cursor: pointer;
     white-space: nowrap; flex: none;
-    box-shadow: 0 6px 18px rgba(82,97,221,.35), inset 0 1px 0 rgba(255,255,255,.4); }
-  button.action:hover { box-shadow: 0 8px 22px rgba(82,97,221,.45), inset 0 1px 0 rgba(255,255,255,.4); }
+    box-shadow: 0 6px 18px rgba(82,97,221,.35), inset 0 1px 0 rgba(var(--srf),.4); }
+  button.action:hover { box-shadow: 0 8px 22px rgba(82,97,221,.45), inset 0 1px 0 rgba(var(--srf),.4); }
   button.action:active { transform: scale(.98); }
   button.action:disabled { opacity: .5; cursor: default; box-shadow: none; }
-  button.ghost { background: rgba(255,255,255,.5); border: 1px solid var(--gline); color: #3c414c;
+  button.ghost { background: rgba(var(--srf),.5); border: 1px solid var(--gline); color: #3c414c;
     font: inherit; padding: 7px 14px; border-radius: 999px; cursor: pointer; white-space: nowrap; flex: none;
     backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-    box-shadow: inset 0 1px 0 rgba(255,255,255,.6), var(--shadow-soft); }
-  button.ghost:hover { background: rgba(255,255,255,.82); color: var(--ink); }
+    box-shadow: inset 0 1px 0 rgba(var(--srf),.6), var(--shadow-soft); }
+  button.ghost:hover { background: rgba(var(--srf),.82); color: var(--ink); }
   button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
   input[type="text"], select, textarea {
-    background: rgba(255,255,255,.62); border: 1px solid rgba(255,255,255,.78);
+    background: rgba(var(--srf),.62); border: 1px solid rgba(var(--srf),.78);
     color: var(--ink); font: inherit; padding: 8px 12px; border-radius: var(--r-md); width: 100%;
-    box-shadow: inset 0 1px 2px rgba(27,30,37,.06); }
+    box-shadow: inset 0 1px 2px rgba(var(--inkrgb),.06); }
   input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(91,110,225,.5);
-    background: rgba(255,255,255,.9); box-shadow: 0 0 0 3px rgba(91,110,225,.16); }
+    background: rgba(var(--srf),.9); box-shadow: 0 0 0 3px rgba(91,110,225,.16); }
   ::placeholder { color: rgba(56,60,70,.4); }
 
   .card { background: var(--glass); backdrop-filter: blur(28px) saturate(160%);
     -webkit-backdrop-filter: blur(28px) saturate(160%); border: 1px solid var(--gline);
     border-radius: var(--r-lg); padding: 20px; margin-bottom: 14px;
-    box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,.75); }
+    box-shadow: var(--shadow), inset 0 1px 0 rgba(var(--srf),.75); }
   .card h2 { font-size: 12px; font-weight: 700; color: var(--muted); letter-spacing: .1em; margin-bottom: 14px; }
   .field { margin-bottom: 13px; }
   .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
@@ -94,46 +123,57 @@
   .field .row > input, .field .row > select { flex: 1; min-width: 0; }
   .field .desc { font-size: 11px; color: var(--muted); margin-top: 4px; }
   .check { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 11px; cursor: pointer; }
-  .check input { width: 16px; height: 16px; margin-top: 2px; accent-color: var(--accent); }
+  /* 設定のオン・オフはトグルで表す。議事録のチェックボックス（.blk 内）は
+     完了の印なので四角のまま。 */
+  .check input { appearance: none; -webkit-appearance: none; flex: none;
+    width: 34px; height: 20px; margin-top: 1px; border-radius: 999px; cursor: pointer;
+    background: rgba(var(--inkrgb), .22); position: relative; transition: background .15s; }
+  .check input::after { content: ''; position: absolute; top: 2px; left: 2px;
+    width: 16px; height: 16px; border-radius: 50%; background: #fff;
+    box-shadow: 0 1px 3px rgba(0,0,0,.3); transition: left .15s; }
+  .check input:checked { background: var(--accent); }
+  .check input:checked::after { left: 16px; }
   .check .d { font-size: 11px; color: var(--muted); }
   .save-msg { font-size: 12px; color: var(--muted); }
   .save-msg.ok { color: var(--green); }
   .save-msg.ng { color: var(--danger); }
   .empty { text-align: center; color: var(--muted); padding: 48px 20px; line-height: 1.9; }
   .empty .big { font-size: 15px; color: var(--ink); margin-bottom: 6px; }
-  kbd { background: rgba(255,255,255,.72); border: 1px solid rgba(255,255,255,.9);
-    border-bottom: 2px solid rgba(27,30,37,.15); border-radius: 6px; padding: 2px 7px; font-size: 12px; }
+  kbd { background: rgba(var(--srf),.72); border: 1px solid rgba(var(--srf),.9);
+    border-bottom: 2px solid rgba(var(--inkrgb),.15); border-radius: 6px; padding: 2px 7px; font-size: 12px; }
 
   /* ================= 議事録: 2ペイン ================= */
   .notes { display: flex; gap: 14px; height: 100%; }
   .side { width: 300px; flex: none; display: flex; flex-direction: column; gap: 10px; }
   .side .tools { display: flex; gap: 6px; }
   .side .filters { display: flex; gap: 5px; }
-  .chip { background: rgba(255,255,255,.5); border: 1px solid var(--gline); color: var(--muted);
+  .chip { background: rgba(var(--srf),.5); border: 1px solid var(--gline); color: var(--muted);
     font: inherit; font-size: 11px; padding: 4px 11px; border-radius: 999px; cursor: pointer; }
-  .chip.on { background: rgba(255,255,255,.95); color: var(--ink); font-weight: 600;
+  .chip.on { background: rgba(var(--srf),.95); color: var(--ink); font-weight: 600;
     box-shadow: 0 2px 8px rgba(44,62,112,.16); }
   .plist { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; padding-right: 2px; }
-  .pitem { background: var(--glass-strong); border: 1px solid var(--gline); border-radius: 14px;
-    padding: 11px 13px; cursor: pointer; box-shadow: var(--shadow-soft);
+  .pitem { background: var(--glass-strong); border: 1px solid var(--gline); border-radius: 12px;
+    padding: 7px 11px; cursor: pointer; box-shadow: var(--shadow-soft);
     backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); }
-  .pitem:hover { background: #fff; }
+  .pitem:hover { background: rgba(var(--srf), .96); }
   .pitem.sel { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(91,110,225,.25), var(--shadow-soft); }
-  .pitem .t { font-weight: 600; font-size: 13px; line-height: 1.45;
-    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-  .pitem .m { font-size: 11px; color: var(--muted); margin-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; }
-  .pitem .badge { color: var(--accent); font-weight: 600; }
-  .pitem .snip { font-size: 11px; color: var(--faint); margin-top: 4px;
-    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  /* 高さを一定に保つ: タイトルもメタも1行で省略する */
+  .pitem .t { font-weight: 600; font-size: 13px; line-height: 1.5;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pitem .m { font-size: 11px; color: var(--muted); margin-top: 1px; display: flex; gap: 8px;
+    white-space: nowrap; overflow: hidden; }
+  .pitem .m > span { flex: none; }
+  .pitem .snip { font-size: 11px; color: var(--faint); margin-top: 1px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   /* ---------- ページ本体 ---------- */
   .page { flex: 1; min-width: 0; display: flex; flex-direction: column;
     background: var(--glass); backdrop-filter: blur(28px) saturate(160%);
     -webkit-backdrop-filter: blur(28px) saturate(160%); border: 1px solid var(--gline);
-    border-radius: var(--r-lg); box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,.75); overflow: hidden; }
+    border-radius: var(--r-lg); box-shadow: var(--shadow), inset 0 1px 0 rgba(var(--srf),.75); overflow: hidden; }
   .phead { padding: 18px 24px 12px; border-bottom: 1px solid var(--gline-dark); flex: none; }
   .ptitle { font-size: 21px; font-weight: 700; line-height: 1.4; outline: none; border-radius: 6px; padding: 2px 4px; }
-  .ptitle:focus { background: rgba(255,255,255,.8); box-shadow: 0 0 0 2px rgba(91,110,225,.3); }
+  .ptitle:focus { background: rgba(var(--srf),.8); box-shadow: 0 0 0 2px rgba(91,110,225,.3); }
   .pprops { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 8px; }
   .pacts { display: flex; gap: 7px; margin-top: 12px; flex-wrap: wrap; }
   .pacts button { font-size: 12px; padding: 6px 13px; }
@@ -147,8 +187,10 @@
 
   /* ---------- ブロック ---------- */
   .blk { display: flex; align-items: flex-start; gap: 8px; padding: 3px 0; position: relative; }
+  /* 点字の6点(U+283F)を使う。「⋮⋮」を字間で詰める方法は環境によって
+     3点に見えていた。 */
   .blk .grip { opacity: 0; flex: none; cursor: grab; color: var(--faint); user-select: none;
-    line-height: 1.85; font-size: 12px; letter-spacing: -3px; padding: 0 2px; }
+    line-height: 1.85; font-size: 13px; padding: 0 2px; }
   .blk:hover .grip { opacity: .55; }
   .blk.dragging { opacity: .35; }
   .blk.dropmark { box-shadow: 0 -2px 0 0 var(--accent); }
@@ -156,8 +198,8 @@
   .blk .bullet { color: var(--faint); flex: none; line-height: 1.85; user-select: none; }
   .blk .txt { flex: 1; line-height: 1.85; outline: none; border-radius: 6px; padding: 1px 5px; min-width: 0;
     word-break: break-word; }
-  .blk .txt:hover { background: rgba(255,255,255,.5); }
-  .blk .txt:focus { background: rgba(255,255,255,.92); box-shadow: 0 0 0 2px rgba(91,110,225,.3); }
+  .blk .txt:hover { background: rgba(var(--srf),.5); }
+  .blk .txt:focus { background: rgba(var(--srf),.92); box-shadow: 0 0 0 2px rgba(91,110,225,.3); }
   .blk.heading { margin-top: 18px; }
   .blk.heading .txt { font-size: 15px; font-weight: 700; letter-spacing: .02em; }
   .blk.heading .txt::before { content: ''; }
@@ -172,7 +214,7 @@
   .typeSel { background: rgba(91,110,225,.11); border: 1px solid rgba(91,110,225,.25);
     color: var(--accent-deep); font: inherit; font-size: 11px; font-weight: 600;
     padding: 3px 8px; border-radius: 7px; cursor: pointer; width: auto; box-shadow: none; }
-  .typeSel:focus { background: #fff; }
+  .typeSel:focus { background: rgba(var(--srf), .96); }
   .tbadge { font-size: 10px; font-weight: 700; color: var(--accent-deep);
     background: rgba(91,110,225,.12); border-radius: 5px; padding: 2px 6px; }
 
@@ -187,7 +229,7 @@
   .atag.add { background: transparent; color: var(--faint); border: 1px dashed rgba(56,60,70,.28); }
   .atag:hover { filter: brightness(.95); }
   .atag-edit { font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 5px;
-    width: 132px; border: 1px solid rgba(91,110,225,.5); background: #fff; color: var(--ink);
+    width: 132px; border: 1px solid rgba(91,110,225,.5); background: rgba(var(--srf), .96); color: var(--ink);
     font-family: inherit; box-shadow: 0 0 0 3px rgba(91,110,225,.16); }
 
   /* アクション横断ビュー */
@@ -220,7 +262,7 @@
 
   /* ---------- 進行中バー ---------- */
   .live { display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
-    background: rgba(255,255,255,.62); border: 1px solid var(--gline); border-radius: 14px; padding: 11px 14px; }
+    background: rgba(var(--srf),.62); border: 1px solid var(--gline); border-radius: 14px; padding: 11px 14px; }
   .rec-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent);
     animation: pulse 1.4s ease-in-out infinite; flex: none; }
   @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(91,110,225,.4); } 50% { box-shadow: 0 0 0 7px rgba(91,110,225,0); } }
@@ -261,19 +303,19 @@
     background: var(--glass-strong); backdrop-filter: blur(24px) saturate(160%);
     -webkit-backdrop-filter: blur(24px) saturate(160%);
     border: 1px solid var(--gline); border-radius: 14px; padding: 12px 14px;
-    box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,.7); }
+    box-shadow: var(--shadow), inset 0 1px 0 rgba(var(--srf),.7); }
   #updBadge[hidden] { display: none; }
   #updBadge .hd { display: flex; align-items: center; gap: 8px; }
   #updBadge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
   #updBadge .ttl { font-size: 13px; font-weight: 600; flex: 1; min-width: 0; }
   #updBadge .x { background: none; border: none; color: var(--faint); font: inherit; font-size: 14px;
     line-height: 1; cursor: pointer; padding: 3px 5px; border-radius: 6px; flex: none; }
-  #updBadge .x:hover { color: var(--ink); background: rgba(27,30,37,.08); }
+  #updBadge .x:hover { color: var(--ink); background: rgba(var(--inkrgb),.08); }
   #updBadge .row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
   #updBadge button.go { background: linear-gradient(180deg, #7b8bef 0%, #5261dd 100%); color: #fff;
     border: none; font: inherit; font-size: 12px; font-weight: 600; padding: 6px 14px;
     border-radius: 999px; cursor: pointer; white-space: nowrap;
-    box-shadow: 0 4px 12px rgba(82,97,221,.32), inset 0 1px 0 rgba(255,255,255,.4); }
+    box-shadow: 0 4px 12px rgba(82,97,221,.32), inset 0 1px 0 rgba(var(--srf),.4); }
   #updBadge button.go:disabled { opacity: .55; cursor: default; box-shadow: none; }
   #updBadge button.link { background: none; border: none; color: var(--muted); font: inherit;
     font-size: 12px; cursor: pointer; padding: 4px 2px; text-decoration: underline; }
@@ -282,7 +324,7 @@
   #updBadge .st.ng { color: var(--danger); }
   #updBadge .st:empty { display: none; }
   #updBadge .notes { display: none; margin-top: 10px; font-size: 11px; line-height: 1.7;
-    white-space: pre-wrap; background: rgba(255,255,255,.55); border-radius: 10px;
+    white-space: pre-wrap; background: rgba(var(--srf),.55); border-radius: 10px;
     padding: 10px; max-height: 160px; overflow-y: auto; }
   #updBadge .notes.open { display: block; }
 
@@ -314,7 +356,7 @@
           <div class="filters">
             <button class="chip on" id="fltAll">すべて</button>
             <button class="chip" id="fltActions">アクション</button>
-            <button class="chip" id="fltFull">全文検索</button>
+            <button class="chip" id="fltFull">文字起こし検索</button>
           </div>
           <div class="plist" id="plist"></div>
         </aside>
@@ -324,7 +366,7 @@
             <div class="ptitle" id="pTitle" contenteditable="true" spellcheck="false"></div>
             <div class="pprops" id="pProps"></div>
             <div id="pTypeRow" style="margin-top:8px;display:flex;align-items:center;gap:8px">
-              <span style="font-size:11px;color:var(--muted)">会議タイプ</span>
+              <span style="font-size:11px;color:var(--muted)">要約タイプ</span>
               <select class="typeSel" id="pType"></select>
               <span style="font-size:11px;color:var(--faint)" id="pTypeHint"></span>
             </div>
@@ -441,6 +483,14 @@
         <div class="card">
           <h2>動作</h2>
           <div class="field">
+            <label for="themeSel">画面の配色</label>
+            <select id="themeSel">
+              <option value="system">Windowsの設定に合わせる</option>
+              <option value="light">ライト</option>
+              <option value="dark">ダーク</option>
+            </select>
+          </div>
+          <div class="field">
             <label for="hotkey">音声入力ホットキー（クリックしてキーを押す）</label>
             <input type="text" id="hotkey" readonly />
           </div>
@@ -524,7 +574,7 @@
             <span class="save-msg" id="updMsg"></span>
           </div>
           <div id="updNotes" style="display:none;margin-top:12px;font-size:12px;line-height:1.7;
-            white-space:pre-wrap;background:rgba(255,255,255,.5);border-radius:10px;padding:12px;max-height:200px;overflow-y:auto"></div>
+            white-space:pre-wrap;background:rgba(var(--srf),.5);border-radius:10px;padding:12px;max-height:200px;overflow-y:auto"></div>
           <div class="desc" style="margin-top:10px">
             更新はアプリ本体（数百KB）のみを取得します。エンジンやモデル、保存済みの議事録はそのままです。<br />
             更新前のバージョンは <code>src.backup-*</code> として1世代だけ残ります。
@@ -717,13 +767,6 @@
         const def = mtypes.find((t) => t.key === p.meetingType);
         tb.textContent = def ? def.label : p.meetingType; m.appendChild(tb);
       }
-      if (p.openActionCount > 0) {
-        const b = document.createElement('span'); b.className = 'badge';
-        const di = dueInfo(p.nextDue, false);
-        b.textContent = `未完了 ${p.openActionCount}` + (di ? `（最短 ${di.label}）` : '');
-        if (di && di.days < 0) b.style.color = 'var(--danger)';
-        m.appendChild(b);
-      }
       if (!p.hasSummary) {
         const b = document.createElement('span'); b.style.color = 'var(--danger)';
         b.textContent = '要約なし'; m.appendChild(b);
@@ -821,7 +864,7 @@
         renderMemo();
       }
       $('pTypeHint').textContent = `手動指定 ・ ${d2 ? d2.hint : ''}`;
-      toast('会議タイプを変更しました。「要約を再生成」で反映されます');
+      toast('要約タイプを変更しました。「要約を再生成」で反映されます');
       refreshList();
     };
 
@@ -848,10 +891,23 @@
       else toast(`議事録を作成しました（出典 ${r.stat.linked}/${r.stat.total}）`);
       await openPage(curId);
     }, !curPage.blocks.length);
+    // コピーは、いま開いているタブの中身を写す。議事録タブなら議事録、
+    // 文字起こしタブなら文字起こし、メモタブならメモ。
     mk('コピー', async () => {
-      const md = curPage.blocks.map((b) => b.type === 'heading' ? `\n## ${b.text}`
-        : b.type === 'todo' ? `- [${b.checked?'x':' '}] ${b.text}` : b.type === 'bullet' ? `- ${b.text}` : b.text).join('\n');
-      await window.koeApp.copy(md.trim()); toast('議事録をコピーしました');
+      let text = ''; let what = '';
+      if (pane === 'script') {
+        text = curSegs.map((sg) => `[${fmtClock(sg.atMs)}] ${sg.text}`).join('\n');
+        what = '文字起こし';
+      } else if (pane === 'memo') {
+        text = String(curPage.memo || '');
+        what = 'メモ';
+      } else {
+        text = curPage.blocks.map((b) => b.type === 'heading' ? `\n## ${b.text}`
+          : b.type === 'todo' ? `- [${b.checked?'x':' '}] ${b.text}` : b.type === 'bullet' ? `- ${b.text}` : b.text).join('\n');
+        what = '議事録';
+      }
+      if (!text.trim()) { toast(`${what}はまだ空です`); return; }
+      await window.koeApp.copy(text.trim()); toast(`${what}をコピーしました`);
     });
     mk('削除', async () => {
       if (!confirm('この議事録を削除します。よろしいですか？')) return;
@@ -960,7 +1016,7 @@
       // 並べ替えハンドル。行全体を draggable にすると本文のテキスト選択と
       // 衝突するので、つまみを押している間だけドラッグできるようにする。
       const grip = document.createElement('span');
-      grip.className = 'grip'; grip.textContent = '⋮⋮'; grip.title = 'ドラッグで並べ替え';
+      grip.className = 'grip'; grip.textContent = '⠿'; grip.title = 'ドラッグで並べ替え';
       grip.onmousedown = () => { el.draggable = true; };
       grip.onmouseup = () => { el.draggable = false; };
       el.ondragstart = (ev) => {
@@ -1335,6 +1391,7 @@
     $('dictionary').value = (s.dictionary || []).join('\n');
     $('useBuiltinTerms').checked = s.useBuiltinTerms !== false;   // 既定 true
     $('stayInTray').checked = Boolean(s.stayInTray);              // 既定 false
+    $('themeSel').value = ['light', 'dark'].includes(s.theme) ? s.theme : 'system';
     $('useSystemAudio').checked = Boolean(s.useSystemAudio);      // 既定 false
     loadMics(s.micId || '');
   }
@@ -1421,6 +1478,7 @@
       dictionary: $('dictionary').value.split('\n').map((s) => s.trim()).filter(Boolean),
       useBuiltinTerms: $('useBuiltinTerms').checked,
       stayInTray: $('stayInTray').checked,
+      theme: $('themeSel').value,
       useSystemAudio: $('useSystemAudio').checked,
     };
     const r = await window.koeApp.saveSettings(next);

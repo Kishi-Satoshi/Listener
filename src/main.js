@@ -10,6 +10,7 @@
 const {
   app, BrowserWindow, Tray, Menu, globalShortcut,
   ipcMain, clipboard, nativeImage, screen, dialog, shell, session,
+  nativeTheme, powerSaveBlocker,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -55,6 +56,8 @@ const DEFAULT_SETTINGS = {
   removeFillers: true,
   soundFeedback: true,
   autoLaunch: false,
+  // 画面の配色。system は Windows の設定に追従する
+  theme: 'system',
   // ウィンドウを閉じたときにタスクトレイへ残すか。既定は残さない＝そのまま終了。
   stayInTray: false,
   dictionary: [],
@@ -78,6 +81,27 @@ let trayIconRec = null;
 let overlayWin = null;
 let mainWin = null;
 let quitting = false;
+// 録音・文字起こし中は OS にアプリを眠らせない。省電力でプロセスが
+// 絞られると、録音の区切りも文字起こしも静かに止まる。
+let powerBlockId = null;
+function applyTheme() {
+  // themeSource を切り替えると、レンダラー側の prefers-color-scheme が
+  // 変わり、CSSのダーク定義がそのまま効く。画面側のJSは不要。
+  try {
+    nativeTheme.themeSource = settings.theme === 'light' || settings.theme === 'dark'
+      ? settings.theme : 'system';
+  } catch (_) { /* noop */ }
+}
+
+function updatePowerBlock() {
+  const busy = state !== 'idle';
+  if (busy && powerBlockId === null) {
+    try { powerBlockId = powerSaveBlocker.start('prevent-app-suspension'); } catch (_) { powerBlockId = null; }
+  } else if (!busy && powerBlockId !== null) {
+    try { powerSaveBlocker.stop(powerBlockId); } catch (_) { /* noop */ }
+    powerBlockId = null;
+  }
+}
 let pasterProc = null;
 let programmaticMove = false;
 let recoveredPageId = null;
@@ -320,7 +344,7 @@ function restartEnginesIfNeeded() {
 }
 
 // ---------------------------------------------------------------- 文字起こし
-async function transcribeLocal(wavBuffer, extraPromptTail) {
+async function transcribeLocal(wavBuffer, extraPromptTail, durationMs) {
   const ok = await ensureEngineReady(whisperEng);
   if (!ok) throw new Error(whisperEng.lastError || '文字起こしエンジンが起動していません');
   const form = new FormData();
@@ -337,8 +361,12 @@ async function transcribeLocal(wavBuffer, extraPromptTail) {
     form.append('carry_initial_prompt', 'true');
   }
 
+  // 処理時間は音声の長さにほぼ比例する。固定240秒だと、長くなった区間や
+  // 長い音声入力が時間切れで丸ごと失われる（実機で9分の区間が消えた）。
+  // 音声の5倍+60秒まで、上限30分で待つ。短い区間は今まで通り。
+  const waitMs = Math.min(1800000, Math.max(240000, Math.round(durationMs || 0) * 5 + 60000));
   const res = await fetch(`http://127.0.0.1:${settings.localPort}/inference`,
-    { method: 'POST', body: form, signal: AbortSignal.timeout(240000) });
+    { method: 'POST', body: form, signal: AbortSignal.timeout(waitMs) });
   if (!res.ok) {
     let detail = '';
     try { detail = (await res.json())?.error || ''; } catch (_) { /* noop */ }
@@ -378,10 +406,13 @@ async function generateMinutes(plain, memo, onProgress, type) {
   const OUTPUT_RULE = '書き方のきまり:\n'
     + '- 該当する内容が本当に一つも無い見出しにだけ「特になし」と書く。'
     + '一つでも書くことがあれば「特になし」は書かない。\n'
-    + '- 太字（**）や斜体などの装飾は使わない。素の文章で書く。';
+    + '- 太字（**）や斜体などの装飾は使わない。素の文章で書く。\n'
+    + '- 文体は報告文書として使える常体で書く（「〜を実施」「〜は完了」「〜する」）。'
+    + '「です」「ます」は使わない。';
   const ok = await ensureEngineReady(sumEng);
   if (!ok) throw new Error(sumEng.lastError || '要約エンジンが起動していません');
-  const sys = 'あなたは優秀な議事録作成アシスタントです。会議の文字起こしを分析し、正確で実用的な議事録を日本語のMarkdownで作成します。'
+  const sys = 'あなたは議事録作成の専門家です。会議の文字起こしを分析し、正確で実用的な議事録を日本語のMarkdownで作成します。'
+    + '文体は報告文書の常体（だ・である調、体言止め）で、「です・ます」は使いません。'
     + '文字起こしに無い情報を創作せず、雑談は省いてください。';
   // メモはユーザーが好きなだけ書けるうえ、そのままプロンプトに前置きされる。
   // 長すぎると文脈を食い潰して文字起こし側が押し出されるので上限を設ける。
@@ -410,7 +441,7 @@ async function generateMinutes(plain, memo, onProgress, type) {
     if (onProgress) onProgress(`要約中… (${i + 1}/${chunks.length})`);
     const part = await llmChat([
       { role: 'system', content: sys },
-      { role: 'user', content: `以下は長い会議の文字起こしの一部（${i + 1}/${chunks.length}）です。重要な発言・決定・依頼・課題・数字を漏らさず、簡潔な箇条書きで抽出してください。\n\n${chunks[i]}` },
+      { role: 'user', content: `以下は長い会議の文字起こしの一部（${i + 1}/${chunks.length}）です。重要な発言・決定・依頼・課題・数字を漏らさず、簡潔な箇条書きで抽出してください。文体は常体（だ・である調、体言止め）。\n\n${chunks[i]}` },
     ], NOTE_MAX_TOKENS);
     if (part.truncated) truncated = true;
     notes.push(`--- パート${i + 1} ---\n${part.text}`);
@@ -472,7 +503,13 @@ function createOverlay() {
     frame: false, transparent: true, resizable: false, movable: true,
     minimizable: false, maximizable: false, focusable: false,
     alwaysOnTop: true, skipTaskbar: true, show: false, hasShadow: false,
-    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false },
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false,
+      // 録音の区切りは setTimeout で刻んでいる。画面が隠れると Chromium が
+      // タイマーを間引き、75秒の区切りが数分遅れる。実機で1区間が9分になり、
+      // 文字起こしが時間切れで丸ごと失われた。この窓では間引かせない。
+      backgroundThrottling: false,
+    },
   });
   overlayWin.setAlwaysOnTop(true, 'screen-saver');
   overlayWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
@@ -596,7 +633,7 @@ async function handleDictationAudio(buffer, durationMs) {
   sendToOverlay('overlay:phase', { phase: 'processing', message: '文字起こし中…' });
   try {
     const t0 = Date.now();
-    const raw = await transcribeLocal(buffer);
+    const raw = await transcribeLocal(buffer, '', durationMs);
     if (!raw) throw new Error('音声を認識できませんでした');
     let text = settings.removeFillers ? removeFillersRule(raw) : raw;
     if (!text) text = raw;
@@ -757,7 +794,7 @@ function onMeetingSegment(buffer, durationMs, isFinal) {
     const tail = m.segments.length ? m.segments[m.segments.length - 1].text.slice(-100) : '';
     let text = '';
     try {
-      text = await transcribeLocal(buffer, tail);
+      text = await transcribeLocal(buffer, tail, durationMs);
     } catch (e) {
       if (meeting !== m) return;
       m.segments.push({ id: `s${++m.seq}`, atMs: segOffset, text: `（この区間の認識に失敗: ${e.message}）`, failed: true });
@@ -950,6 +987,7 @@ function makeTrayIcon(recording) {
 }
 
 function updateTray() {
+  updatePowerBlock();
   if (!tray) return;
   const recording = state === 'recording' || state === 'meeting';
   tray.setImage(recording ? trayIconRec : trayIconIdle);
@@ -1047,6 +1085,7 @@ function setupIpc() {
     if (merged.pillPos !== prevPillPos) merged.pillCustom = null;
     settings = merged;
     persistSettings();
+    applyTheme();
     restartEnginesIfNeeded();
     if (settings.autoLaunch !== prevAutoLaunch) {
       try { app.setLoginItemSettings({ openAtLogin: settings.autoLaunch }); } catch (_) { /* noop */ }
@@ -1200,6 +1239,7 @@ if (!gotLock) {
   app.whenReady().then(() => {
     loadStores();
     recoverDraftIfAny();
+    applyTheme();
     setupIpc();
     // 相手の声（パソコンから出ている音）を録るための受け口。
     // これを設定しないと getDisplayMedia は必ず失敗する。

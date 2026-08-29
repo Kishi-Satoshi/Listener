@@ -365,3 +365,65 @@ test('並べ替えはハンドルからだけ（本文のテキスト選択と�
   // 行全体を常時 draggable にしていないこと
   assert.ok(!/el\.draggable = true;\s*$/m.test(appHtml.replace(/grip\.onmousedown.*$/m, '')));
 });
+
+// ---------------------------------------------------------------- v0.9.7 の機能の結線
+test('文字起こしが切れる問題への3段の対策が入っている', () => {
+  // (1) 隠れた録音ウィンドウのタイマーを間引かせない
+  assert.match(main, /backgroundThrottling: false/);
+  // (2) 時間切れを音声の長さに比例させる（固定240秒で9分の区間が丸ごと消えた）
+  assert.match(main, /Math\.max\(240000, Math\.round\(durationMs \|\| 0\) \* 5/);
+  assert.match(main, /transcribeLocal\(buffer, tail, durationMs\)/);
+  assert.match(main, /transcribeLocal\(buffer, '', durationMs\)/);
+  // (3) 区切りの保険（音声パイプライン由来のイベントで見張る）
+  assert.match(overlayHtml,
+    /mode === 'meeting' && segDeadline && Date\.now\(\) >= segDeadline/, '区切りの保険が無い');
+  // (4) 録音・処理中はOSに眠らせない
+  assert.match(main, /powerSaveBlocker\.start\('prevent-app-suspension'\)/);
+});
+
+test('画面の配色の設定が結線されている', () => {
+  assert.match(main, /theme:\s*'system'/);
+  assert.match(main, /nativeTheme\.themeSource/);
+  assert.ok(appHtml.includes("theme: $('themeSel').value"));
+  assert.ok(appHtml.includes('@media (prefers-color-scheme: dark)'));
+});
+
+test('コピーは開いているタブの中身を写す', () => {
+  const cp = appHtml.slice(appHtml.indexOf("mk('コピー'"));
+  assert.ok(cp.includes("pane === 'script'"), '文字起こしタブの分岐が無い');
+  assert.ok(cp.includes("pane === 'memo'"), 'メモタブの分岐が無い');
+});
+
+test('検索は文字起こしだけを対象にする', () => {
+  const st = read('src/store.js');
+  const fn = st.slice(st.indexOf('function searchFullText'), st.indexOf('function openActions'));
+  assert.ok(!fn.includes('inBlocks'), '要約側も検索している');
+  assert.ok(fn.includes('getTranscript'));
+  assert.ok(appHtml.includes('文字起こし検索'));
+  assert.ok(!appHtml.includes('全文検索'));
+});
+
+test('一覧に未完了バッジを出さない（高さを一定に保つ）', () => {
+  assert.ok(!appHtml.includes('`未完了 ${'), '未完了バッジが残っている');
+  assert.match(appHtml, /\.pitem \.t \{[^}]*white-space: nowrap/);
+});
+
+test('設定のオン・オフはトグルで表す（議事録のチェックは四角のまま）', () => {
+  assert.match(appHtml, /\.check input \{[\s\S]{0,200}?appearance: none/);
+  // .blk のチェックボックス（完了の印）には appearance:none を掛けていない
+  assert.ok(!/\.blk[^\n]*input[^\n]*\{[\s\S]{0,200}?appearance: none/.test(appHtml));
+});
+
+test('画面の名称は「要約タイプ」', () => {
+  assert.ok(appHtml.includes('>要約タイプ</span>'));
+  assert.ok(!appHtml.includes('>会議タイプ</span>'));
+});
+
+test('並べ替えのつまみは6点の1文字', () => {
+  assert.ok(appHtml.includes("grip.textContent = '⠿'"));
+});
+
+test('要約の文体は報告文書の常体', () => {
+  assert.ok(main.includes('「です」「ます」は使わない'));
+  assert.match(main, /文体は報告文書の常体/);
+});

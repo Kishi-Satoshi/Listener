@@ -124,6 +124,7 @@
 
   let mode = 'dictation'; // 'dictation' | 'meeting'
   let segmentMs = 75000;
+  let segDeadline = 0;   // この時刻を過ぎたら区間を切る（setTimeout の保険）
   const FIRST_SEG_MS = 20000; // 最初のセグメントは短くして早く結果を見せる
   let firstSegDone = false;
   // mediaStream は MediaRecorder に渡すもの。相手の声を混ぜているときは
@@ -449,7 +450,16 @@
       mediaStream,
       mime ? { mimeType: mime, audioBitsPerSecond: 32000 } : { audioBitsPerSecond: 32000 },
     );
-    rec.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+    rec.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+      // 画面が隠れると setTimeout は間引かれ、75秒の区切りが数分遅れることが
+      // ある（実機で1区間が9分になり、文字起こしが時間切れで失われた）。
+      // このイベントは音声パイプラインが刻むので間引かれない。ここでも見張る。
+      if (mode === 'meeting' && segDeadline && Date.now() >= segDeadline + 2000
+          && rec === recorder && rec.state === 'recording' && !stopping && !cancelled) {
+        rec.stop();
+      }
+    };
     return rec;
   }
 
@@ -459,6 +469,7 @@
     cancelled = false;
     stopping = false;
     chunks = [];
+    segDeadline = 0;
     ampHist = [];
     silentSince = 0;
     micSilentSince = 0;
@@ -528,6 +539,9 @@
   function startMeetingSegment() {
     chunks = [];
     segStart = Date.now();
+    const thisSegMs = firstSegDone ? segmentMs : FIRST_SEG_MS;
+    firstSegDone = true;
+    segDeadline = segStart + thisSegMs;
     recorder = newRecorder();
     recorder.onstop = async () => {
       const durationMs = Date.now() - segStart;
@@ -551,8 +565,6 @@
         releaseStream();
       }
     };
-    const thisSegMs = firstSegDone ? segmentMs : FIRST_SEG_MS;
-    firstSegDone = true;
     autoStopId = setTimeout(() => {
       if (recorder && recorder.state === 'recording') recorder.stop();
     }, thisSegMs);

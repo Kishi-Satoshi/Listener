@@ -213,23 +213,22 @@ function searchIndex(query) {
 }
 
 // 全文検索は文字起こしファイルを走査する（件数が増えると重いので呼び出し側で明示実行）
+// 文字起こし（トランスクリプト）だけを対象に検索する。
+// 要約は編集や言い換えを経ているので、「言ったかどうか」を探す用途では
+// 原文の方が信頼できる。要約やタイトルは通常の検索（searchIndex）が受け持つ。
 function searchFullText(query, limit) {
   const q = query.trim();
   if (!q) return [];
   const hits = [];
   for (const entry of index.pages) {
     if (hits.length >= (limit || 50)) break;
-    const page = getPage(entry.id);
-    if (!page) continue;
-    const inBlocks = page.blocks.filter((b) => b.text && b.text.includes(q));
     const segments = getTranscript(entry.id);
     const inSegments = segments.filter((s) => s.text && s.text.includes(q));
-    if (inBlocks.length === 0 && inSegments.length === 0) continue;
+    if (inSegments.length === 0) continue;
     hits.push({
       ...entry,
-      blockHits: inBlocks.length,
       segmentHits: inSegments.length,
-      snippet: (inBlocks[0] && inBlocks[0].text) || (inSegments[0] && inSegments[0].text) || '',
+      snippet: inSegments[0].text,
     });
   }
   return hits;
