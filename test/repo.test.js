@@ -493,10 +493,15 @@ test('エンジンの起動確認は /health を見る', () => {
   assert.ok(!/`http:\/\/127\.0\.0\.1:\$\{enginePort\(eng\)\}\/`/.test(main), '「/」を見ている');
 });
 
-test('要約エンジンの 503 は待って引き直す', () => {
+test('要約エンジンの 503 は「準備中」として扱う', () => {
   const fn = main.slice(main.indexOf('async function llmChat'), main.indexOf('async function generateMinutes'));
-  assert.ok(fn.includes('503'), '503 の扱いが無い');
-  assert.match(fn, /res\.status !== 503 \|\| Date\.now\(\) >= deadline/);
+  assert.match(fn, /res\.status !== 503 \|\| Date\.now\(\) >= deadline/, '待って引き直していない');
+  // 待っている間は画面に「準備中」と出す。黙って待つと固まったように見える
+  assert.ok(fn.includes('要約エンジンを準備しています'), '待ちの表示が無い');
+  // 待ちきれなかったときも「エラー (503)」ではなく準備中だと分かる文で返す
+  assert.ok(fn.includes('要約エンジンがまだ準備中です'), '503 が生のエラー文のまま');
+  // 3か所の呼び出しすべてが表示付きで呼んでいる
+  assert.strictEqual((main.match(/await llmChatP\(/g) || []).length, 3);
 });
 
 test('設定は自動保存（保存ボタンは無い）', () => {

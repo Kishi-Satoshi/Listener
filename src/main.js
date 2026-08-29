@@ -388,10 +388,13 @@ async function transcribeLocal(wavBuffer, extraPromptTail, durationMs) {
 }
 
 // ---------------------------------------------------------------- 要約
-async function llmChat(messages, maxTokens) {
+async function llmChat(messages, maxTokens, onWait) {
   // 503 は「壊れた」ではなく「まだ準備中・手が塞がっている」。
   // すぐ諦めるとモデル読み込みの数十秒を待てずにエラーで返してしまう。
+  // 待っていることは画面に出す。黙って待つと固まったように見え、
+  // エラーで返すと壊れたように見える。どちらも実態と違う。
   let res;
+  let waited = false;
   const deadline = Date.now() + 120000;
   for (;;) {
     res = await fetch(`http://127.0.0.1:${settings.sumPort}/v1/chat/completions`, {
@@ -401,7 +404,15 @@ async function llmChat(messages, maxTokens) {
       signal: AbortSignal.timeout(900000),
     });
     if (res.status !== 503 || Date.now() >= deadline) break;
+    if (!waited && onWait) {
+      waited = true;
+      onWait('要約エンジンを準備しています（モデルの読み込み中）。そのままお待ちください…');
+    }
     await new Promise((r) => setTimeout(r, 2000));
+  }
+  if (res.status === 503) {
+    throw new Error('要約エンジンがまだ準備中です。モデルの読み込みに時間がかかっています。'
+      + '1〜2分おいてから、もう一度「要約を生成」を押してください。');
   }
   if (!res.ok) throw new Error(`要約エンジンエラー (${res.status})`);
   const data = await res.json();
@@ -431,6 +442,7 @@ async function generateMinutes(plain, memo, onProgress, type) {
     + '  悪い例: 「完了しました」「修正されました」「お願いします」「持ち越します」';
   const ok = await ensureEngineReady(sumEng);
   if (!ok) throw new Error(sumEng.lastError || '要約エンジンが起動していません');
+  const llmChatP = (messages, maxTokens) => llmChat(messages, maxTokens, onProgress);
   const sys = 'あなたは議事録作成の専門家です。会議の文字起こしを分析し、正確で実用的な議事録を日本語のMarkdownで作成します。'
     + '文体は報告文書の常体（だ・である調、体言止め）で、「です・ます」は使いません。'
     + '文字起こしに無い情報を創作せず、雑談は省いてください。';
@@ -442,7 +454,7 @@ async function generateMinutes(plain, memo, onProgress, type) {
   const CHUNK = 5500;
   // メモの分も含めて1回で収まるかを判断する
   if (plain.length + memoBlock.length <= CHUNK + 1500) {
-    const one = await llmChat([
+    const one = await llmChatP([
       { role: 'system', content: sys },
       { role: 'user', content: `${memoBlock}【会議の文字起こし】\n${plain}\n\n上記から、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${MINUTES_FORMAT}\n\n${OUTPUT_RULE}` },
     ], SUM_MAX_TOKENS);
@@ -459,7 +471,7 @@ async function generateMinutes(plain, memo, onProgress, type) {
   let truncated = false;
   for (let i = 0; i < chunks.length; i++) {
     if (onProgress) onProgress(`要約中… (${i + 1}/${chunks.length})`);
-    const part = await llmChat([
+    const part = await llmChatP([
       { role: 'system', content: sys },
       { role: 'user', content: `以下は長い会議の文字起こしの一部（${i + 1}/${chunks.length}）です。重要な発言・決定・依頼・課題・数字を漏らさず、簡潔な箇条書きで抽出してください。文体は常体（だ・である調、体言止め）。\n\n${chunks[i]}` },
     ], NOTE_MAX_TOKENS);
@@ -467,7 +479,7 @@ async function generateMinutes(plain, memo, onProgress, type) {
     notes.push(`--- パート${i + 1} ---\n${part.text}`);
   }
   if (onProgress) onProgress('議事録をまとめています…');
-  const final = await llmChat([
+  const final = await llmChatP([
     { role: 'system', content: sys },
     { role: 'user', content: `${memoBlock}【会議の要点メモ（時系列）】\n${notes.join('\n\n')}\n\n上記の要点メモを統合し、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${MINUTES_FORMAT}\n\n${OUTPUT_RULE}` },
   ], SUM_MAX_TOKENS);
