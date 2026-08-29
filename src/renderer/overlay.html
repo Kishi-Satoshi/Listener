@@ -457,6 +457,10 @@
       // このイベントは音声パイプラインが刻むので間引かれない。ここでも見張る。
       if (mode === 'meeting' && segDeadline && Date.now() >= segDeadline + 2000
           && rec === recorder && rec.state === 'recording' && !stopping && !cancelled) {
+        // 遅延中の setTimeout を必ず消してから切る。消さないと、そのタイマーが
+        // ID を失ったまま生き残り、あとから発火して「次の」区間を途中で切る。
+        // 以後ずっと前区間のタイマーが今の区間を切るずれが続いてしまう。
+        if (autoStopId) { clearTimeout(autoStopId); autoStopId = null; }
         rec.stop();
       }
     };
@@ -537,6 +541,7 @@
 
   // --- 議事録（セグメント録り） ---
   function startMeetingSegment() {
+    if (autoStopId) { clearTimeout(autoStopId); autoStopId = null; }   // 前区間の消し忘れ保険
     chunks = [];
     segStart = Date.now();
     const thisSegMs = firstSegDone ? segmentMs : FIRST_SEG_MS;

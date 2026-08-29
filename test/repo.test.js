@@ -372,13 +372,16 @@ test('文字起こしが切れる問題への3段の対策が入っている', (
   assert.match(main, /backgroundThrottling: false/);
   // (2) 時間切れを音声の長さに比例させる（固定240秒で9分の区間が丸ごと消えた）
   assert.match(main, /Math\.max\(240000, Math\.round\(durationMs \|\| 0\) \* 5/);
+  assert.match(main, /AbortSignal\.timeout\(waitMs\)/, '計算した待ち時間が使われていない');
   assert.match(main, /transcribeLocal\(buffer, tail, durationMs\)/);
   assert.match(main, /transcribeLocal\(buffer, '', durationMs\)/);
   // (3) 区切りの保険（音声パイプライン由来のイベントで見張る）
   assert.match(overlayHtml,
     /mode === 'meeting' && segDeadline && Date\.now\(\) >= segDeadline/, '区切りの保険が無い');
-  // (4) 録音・処理中はOSに眠らせない
+  // (4) 録音・処理中はOSに眠らせない。updateTray は全ての状態遷移で
+  //     呼ばれるので、そこに結線されていることまで見る
   assert.match(main, /powerSaveBlocker\.start\('prevent-app-suspension'\)/);
+  assert.match(main, /function updateTray\(\) \{\n  updatePowerBlock\(\);/);
 });
 
 test('画面の配色の設定が結線されている', () => {
@@ -426,4 +429,55 @@ test('並べ替えのつまみは6点の1文字', () => {
 test('要約の文体は報告文書の常体', () => {
   assert.ok(main.includes('「です」「ます」は使わない'));
   assert.match(main, /文体は報告文書の常体/);
+});
+
+// ---------------------------------------------------------------- レビュー指摘の修正
+test('ダーク定義はすべての基底ルールより後ろにある', () => {
+  // @media は詳細度に影響しない。前に置くと body / .bg の上書きが
+  // カスケード順で負け、地色がライトのまま文字だけ白くなって読めない。
+  const mediaAt = appHtml.indexOf('@media (prefers-color-scheme: dark)');
+  const bodyAt = appHtml.indexOf('background: #e9edf5');
+  const bgAt = appHtml.indexOf('linear-gradient(165deg, #eef2fa');
+  assert.ok(mediaAt > 0 && bodyAt > 0 && bgAt > 0);
+  assert.ok(mediaAt > bodyAt && mediaAt > bgAt, 'ダーク定義が基底より前にある');
+  // ダークで読めなくなる固定色の上書きが入っている
+  const dark = appHtml.slice(mediaAt);
+  for (const sel of ['button.ghost', '::placeholder', '.atag.who', '.atag.due', '.blob']) {
+    assert.ok(dark.includes(sel), `ダーク上書きが無い: ${sel}`);
+  }
+});
+
+test('ウィンドウの地色がテーマに追従する', () => {
+  // ライト固定だとダークで開くたび・リサイズのたびに白くまたたく
+  assert.match(main, /backgroundColor: nativeTheme\.shouldUseDarkColors/);
+  assert.match(main, /setBackgroundColor\(nativeTheme\.shouldUseDarkColors/);
+});
+
+test('区切りの保険は遅延中のタイマーを必ず消してから切る', () => {
+  // 消さないと ID を失ったタイマーが生き残り、あとから発火して
+  // 「次の」区間を途中で切る。以後ずっとずれが続く
+  const guard = overlayHtml.slice(overlayHtml.indexOf("mode === 'meeting' && segDeadline"));
+  const upto = guard.slice(0, guard.indexOf('rec.stop()'));
+  assert.ok(upto.includes('clearTimeout(autoStopId)'), '旧タイマーを消していない');
+});
+
+test('メモのコピーは画面の入力欄の今の文字を写す', () => {
+  // 保存は500ms遅れで走る。書いた直後に押すと保存前の古い値が写る
+  const cp = appHtml.slice(appHtml.indexOf("mk('コピー'"));
+  assert.ok(cp.includes("$('pMemo').querySelector('textarea')"));
+});
+
+test('一覧の「要約なし」はタイプ章より左にある（右端で見切れない）', () => {
+  const list = appHtml.slice(appHtml.indexOf('function renderList'));
+  assert.ok(list.indexOf("textContent = '要約なし'") < list.indexOf('tbadge'),
+    '要約なしが右側にあり、狭い幅で見切れる');
+});
+
+test('README が現行の機能名と一致している', () => {
+  const readme = read('README.md');
+  assert.ok(!readme.includes('会議タイプ'), '旧名「会議タイプ」が残っている');
+  assert.ok(!readme.includes('全文検索'), '旧名「全文検索」が残っている');
+  assert.ok(!readme.includes('Markdown書き出し'), '無くなった機能の記述が残っている');
+  assert.ok(readme.includes('要約タイプ'));
+  assert.ok(readme.includes('文字起こし検索'));
 });

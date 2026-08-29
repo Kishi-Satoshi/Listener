@@ -26,34 +26,6 @@
     --r-lg: 20px;
     --r-md: 12px;
   }
-  /* ダーク配色。設定の「画面の配色」は main 側で nativeTheme.themeSource を
-     切り替えるだけで、ここ（prefers-color-scheme）がそのまま反応する。 */
-  @media (prefers-color-scheme: dark) {
-    :root {
-      color-scheme: dark;
-      --srf: 50, 55, 68;
-      --inkrgb: 231, 233, 238;
-      --ink: #e7e9ee;
-      --muted: rgba(226, 230, 240, 0.60);
-      --faint: rgba(226, 230, 240, 0.36);
-      --accent: #7c8cf0;
-      --accent-deep: #9aa6f5;
-      --rec: #ff6b6b;
-      --danger: #ff7a70;
-      --green: #4cc98a;
-      --glass: rgba(50, 55, 68, 0.55);
-      --glass-soft: rgba(50, 55, 68, 0.40);
-      --glass-strong: rgba(50, 55, 68, 0.76);
-      --gline: rgba(255, 255, 255, 0.08);
-      --gline-dark: rgba(255, 255, 255, 0.10);
-      --shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
-      --shadow-soft: 0 4px 16px rgba(0, 0, 0, 0.30);
-    }
-    body { background: #171a21; }
-    .bg { background: linear-gradient(165deg, #191d27 0%, #171a22 45%, #201b17 100%); }
-  }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { height: 100%; }
   body {
     color: var(--ink); background: #e9edf5;
     font-family: "Yu Gothic UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
@@ -329,6 +301,50 @@
   #updBadge .notes.open { display: block; }
 
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+  /* ============ ダーク配色 ============
+     設定の「画面の配色」は main 側で nativeTheme.themeSource を切り替える
+     だけで、ここ（prefers-color-scheme）がそのまま反応する。
+     このブロックは必ず全ての基底ルールより後ろに置くこと。@media は
+     詳細度に影響しないため、前に置くと同一セレクタ（body / .bg）の
+     上書きがカスケード順で負けて、地色がライトのまま文字だけ白くなる。 */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --srf: 50, 55, 68;
+      --inkrgb: 231, 233, 238;
+      --ink: #e7e9ee;
+      --muted: rgba(226, 230, 240, 0.60);
+      --faint: rgba(226, 230, 240, 0.36);
+      --accent: #7c8cf0;
+      --accent-deep: #9aa6f5;
+      --rec: #ff6b6b;
+      --danger: #ff7a70;
+      --green: #4cc98a;
+      --glass: rgba(50, 55, 68, 0.55);
+      --glass-soft: rgba(50, 55, 68, 0.40);
+      --glass-strong: rgba(50, 55, 68, 0.76);
+      --gline: rgba(255, 255, 255, 0.08);
+      --gline-dark: rgba(255, 255, 255, 0.10);
+      --shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+      --shadow-soft: 0 4px 16px rgba(0, 0, 0, 0.30);
+    }
+    body { background: #171a21; }
+    .bg { background: linear-gradient(165deg, #191d27 0%, #171a22 45%, #201b17 100%); }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%;
+    /* 変数化から漏れている固定色。ライトの墨色・純白は暗い地では読めない。 */
+    nav button.active { box-shadow: 0 2px 10px rgba(0,0,0,.35), inset 0 1px 0 rgba(var(--srf), .9); }
+    button.ghost { color: #c9cdd8; }
+    ::placeholder { color: rgba(226,230,240,.35); }
+    .atag.who { color: #6fd6a0; }
+    .atag.due { background: rgba(255,255,255,.08); color: #b9bec9; }
+    .atag.due.soon { color: #e8b169; }
+    .atag.add { border-color: rgba(255,255,255,.22); }
+    .nocite { border-color: rgba(255,255,255,.22); }
+    /* 背景の装飾ブロブはライト用のパステル。暗い地では光りすぎるので絞る */
+    .blob { opacity: .16; }
+  }
 </style>
 </head>
 <body>
@@ -762,14 +778,16 @@
       const m = document.createElement('div'); m.className = 'm';
       const s1 = document.createElement('span'); s1.textContent = `${p.date} ・ ${fmtDur(p.durationSec)}`;
       m.appendChild(s1);
+      // 1行に収まらない分は右端から切れる。「要約なし」は重要な印なので
+      // タイプ章より前（左）に置く。
+      if (!p.hasSummary) {
+        const b = document.createElement('span'); b.style.color = 'var(--danger)';
+        b.textContent = '要約なし'; m.appendChild(b);
+      }
       if (p.meetingType && p.meetingType !== 'general') {
         const tb = document.createElement('span'); tb.className = 'tbadge';
         const def = mtypes.find((t) => t.key === p.meetingType);
         tb.textContent = def ? def.label : p.meetingType; m.appendChild(tb);
-      }
-      if (!p.hasSummary) {
-        const b = document.createElement('span'); b.style.color = 'var(--danger)';
-        b.textContent = '要約なし'; m.appendChild(b);
       }
       el.append(t, m);
       if (p.snippet) {
@@ -899,7 +917,10 @@
         text = curSegs.map((sg) => `[${fmtClock(sg.atMs)}] ${sg.text}`).join('\n');
         what = '文字起こし';
       } else if (pane === 'memo') {
-        text = String(curPage.memo || '');
+        // 保存は500ms遅れで走るので、書いた直後に押すと保存前の古い値を
+        // 写してしまう。画面の入力欄にある「今の文字」をそのまま使う。
+        const ta = $('pMemo').querySelector('textarea');
+        text = ta ? ta.value : String(curPage.memo || '');
         what = 'メモ';
       } else {
         text = curPage.blocks.map((b) => b.type === 'heading' ? `\n## ${b.text}`

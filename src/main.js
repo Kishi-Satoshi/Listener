@@ -90,6 +90,9 @@ function applyTheme() {
   try {
     nativeTheme.themeSource = settings.theme === 'light' || settings.theme === 'dark'
       ? settings.theme : 'system';
+    if (mainWin && !mainWin.isDestroyed()) {
+      mainWin.setBackgroundColor(nativeTheme.shouldUseDarkColors ? '#171a21' : '#E9EDF5');
+    }
   } catch (_) { /* noop */ }
 }
 
@@ -364,6 +367,8 @@ async function transcribeLocal(wavBuffer, extraPromptTail, durationMs) {
   // 処理時間は音声の長さにほぼ比例する。固定240秒だと、長くなった区間や
   // 長い音声入力が時間切れで丸ごと失われる（実機で9分の区間が消えた）。
   // 音声の5倍+60秒まで、上限30分で待つ。短い区間は今まで通り。
+  // トレードオフ: エンジンが応答しないままハングした場合、この時間まで
+  // 待ち続ける（議事録は「破棄」で抜けられる）。喪失よりは待ちを選ぶ。
   const waitMs = Math.min(1800000, Math.max(240000, Math.round(durationMs || 0) * 5 + 60000));
   const res = await fetch(`http://127.0.0.1:${settings.localPort}/inference`,
     { method: 'POST', body: form, signal: AbortSignal.timeout(waitMs) });
@@ -555,7 +560,9 @@ function createMainWindow() {
     width: 1120, height: 780, minWidth: 820, minHeight: 560,
     title: 'Listener',
     icon: path.join(__dirname, '..', 'assets', 'icon.png'),
-    backgroundColor: '#E9EDF5',
+    // 地色は CSS が効く前の一瞬に見える色。ライト固定だとダークで
+    // 開くたび・リサイズのたびに白くまたたく。
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#171a21' : '#E9EDF5',
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false },
   });
   mainWin.setMenuBarVisibility(false);
