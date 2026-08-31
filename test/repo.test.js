@@ -654,3 +654,30 @@ test('画面全体で div の開閉が合っている', () => {
     assert.strictEqual(o, c, `${name} の div が ${o} 対 ${c} で合っていない`);
   }
 });
+
+// ---------------------------------------------------------------- 要素の存在
+//
+// 設定カードを並べ替えた際に、最後のカードより後ろにあった要素
+// （データ保存先を開くボタン等）ごと切り落とし、初期化が
+// null への代入で止まって設定画面が空になった（実機で発生）。
+test('画面が参照する要素がすべてHTMLに存在する', () => {
+  // 動的に作る要素だけを除外する。ここに足すときは、
+  // 必ず「無ければ作る」側のコードがあることを確かめること。
+  const DYNAMIC = new Set(['liveBar']);
+  for (const [name, html] of [['app.html', appHtml], ['overlay.html', overlayHtml]]) {
+    const script = html.slice(html.indexOf('<script>'), html.lastIndexOf('</script>'));
+    const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]));
+    const used = new Set([...script.matchAll(/\$\('([^']+)'\)/g)].map((m) => m[1]));
+    for (const u of used) {
+      if (DYNAMIC.has(u)) continue;
+      assert.ok(ids.has(u), `${name}: 参照している要素 #${u} が無い`);
+    }
+  }
+});
+
+test('設定を読み込む前に保存しない', () => {
+  // 自動保存があるので、初期化に失敗して画面が空のまま何かに触れると
+  // 空の値でディスク上の設定を上書きしてしまう
+  assert.match(appHtml, /if \(!settingsLoaded\) \{/);
+  assert.match(appHtml, /fill\(settings\);\s*\n\s*settingsLoaded = true;/);
+});

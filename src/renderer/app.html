@@ -610,6 +610,12 @@
             <span class="desc save-msg" id="testSumMsg" style="align-self:center"></span>
           </div>
         </div>
+
+        <div style="display:flex;align-items:center;gap:12px;padding-bottom:20px">
+          <span class="save-msg" id="saveMsg"></span>
+          <span style="flex:1"></span>
+          <button class="ghost" id="openDataBtn" type="button">データ保存先を開く</button>
+        </div>
       </div>
     </section>
   </main>
@@ -1463,6 +1469,13 @@
   $('pickSumModelBtn').onclick = pick('model', 'sumModelPath');
   $('openDataBtn').onclick = () => window.koeApp.openDataDir();
 
+  // 画面の組み立てで1か所つまずいても、設定の読み込みまで巻き添えにしない。
+  // 以前、存在しない要素への代入で初期化が止まり、設定が未読込のまま
+  // 空の画面が出た（保存されている値は無事だったが、消えたように見えた）。
+  function guard(name, fn) {
+    try { fn(); } catch (e) { console.error(`画面の初期化に失敗: ${name}`, e); }
+  }
+
   function attachHotkey(id) {
     $(id).onkeydown = (e) => {
       e.preventDefault();
@@ -1508,7 +1521,16 @@
   $('testBtn').onclick = () => runTest(() => window.koeApp.testApi(), 'testMsg');
   $('testSumBtn').onclick = () => runTest(() => window.koeApp.testSum(), 'testSumMsg');
 
+  // 設定を一度も読み込めていないうちは、絶対に保存しない。
+  // 自動保存があるので、初期化に失敗して画面が空のまま何かに触れると、
+  // その空の値でディスク上の設定を上書きしてしまう。
+  let settingsLoaded = false;
+
   async function save(silent) {
+    if (!settingsLoaded) {
+      console.error('設定を読み込めていないため保存を中止しました');
+      return false;
+    }
     const next = {
       localServerExe: $('localServerExe').value.trim(),
       localModelPath: $('localModelPath').value.trim(),
@@ -1680,6 +1702,7 @@
   (async () => {
     settings = await window.koeApp.getSettings();
     fill(settings);
+    settingsLoaded = true;   // ここを通るまで save() は書き込まない
     refreshVad();
     mtypes = await window.koeApp.meetingTypes();
     try {
