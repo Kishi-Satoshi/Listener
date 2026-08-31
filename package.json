@@ -1,6 +1,6 @@
 {
   "name": "listener",
-  "version": "0.10.4",
+  "version": "0.10.5",
   "description": "Listener — 完全オフラインの音声入力・議事録ツール（ローカルLLM要約 + 出典リンク付き）",
   "main": "src/main.js",
   "author": "Kishi-Satoshi",
@@ -9,7 +9,12 @@
     "start": "electron .",
     "test": "node --test \"test/*.test.js\"",
     "dist": "electron-builder --win portable",
-    "dist:installer": "electron-builder --win nsis"
+    "dist:installer": "electron-builder --win nsis",
+    "gate": "node tools/risk.js",
+    "gate:staged": "node tools/risk.js --staged",
+    "hedit": "node tools/hedit.js",
+    "checklist": "node tools/risk.js --checklist RELEASE-CHECK.md",
+    "hook": "node tools/install-hook.js"
   },
   "devDependencies": {
     "electron": "^31.3.0",

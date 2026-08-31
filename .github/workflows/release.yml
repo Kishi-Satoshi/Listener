@@ -86,6 +86,20 @@ jobs:
       - name: テスト
         run: npm test
 
+      # 前のタグからの差分で「新たに壊れたもの」を見る。
+      # pre-commit を --no-verify で越えても、ここで必ず捕まる。
+      - name: 変更危険度ゲート（前のタグ→HEAD）
+        run: |
+          PREV=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || git rev-list --max-parents=0 HEAD)
+          echo "基準: $PREV"
+          node tools/risk.js --base "$PREV" --head HEAD
+
+      # 変更内容から、実機で見るべき項目だけを出す
+      - name: 実機確認チェックリスト
+        run: |
+          node tools/risk.js --base-tag --checklist RELEASE-CHECK.md || true
+          if [ -f RELEASE-CHECK.md ]; then cat RELEASE-CHECK.md >> "$GITHUB_STEP_SUMMARY"; fi
+
       - name: 配布zipを作る
         run: |
           rm -rf release
