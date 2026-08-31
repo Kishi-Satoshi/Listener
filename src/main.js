@@ -84,6 +84,18 @@ let quitting = false;
 // 録音・文字起こし中は OS にアプリを眠らせない。省電力でプロセスが
 // 絞られると、録音の区切りも文字起こしも静かに止まる。
 let powerBlockId = null;
+// 録音の区切りの見張り。レンダラーの setTimeout は画面が隠れると間引かれる
+// （実機で1区間が9分になり、文字起こしが時間切れで失われた）。
+// main のタイマーは間引かれないので、ここから5秒ごとに合図を送り、
+// 録音側は期限を過ぎていたら区間を切る。
+let meetingTickId = null;
+function startMeetingTick() {
+  if (meetingTickId) return;
+  meetingTickId = setInterval(() => {
+    if (state === 'meeting') sendToOverlay('overlay:tick', {});
+    else { clearInterval(meetingTickId); meetingTickId = null; }
+  }, 5000);
+}
 function applyTheme() {
   // themeSource を切り替えると、レンダラー側の prefers-color-scheme が
   // 変わり、CSSのダーク定義がそのまま効く。画面側のJSは不要。
@@ -535,13 +547,10 @@ function createOverlay() {
     frame: false, transparent: true, resizable: false, movable: true,
     minimizable: false, maximizable: false, focusable: false,
     alwaysOnTop: true, skipTaskbar: true, show: false, hasShadow: false,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false,
-      // 録音の区切りは setTimeout で刻んでいる。画面が隠れると Chromium が
-      // タイマーを間引き、75秒の区切りが数分遅れる。実機で1区間が9分になり、
-      // 文字起こしが時間切れで丸ごと失われた。この窓では間引かせない。
-      backgroundThrottling: false,
-    },
+    // backgroundThrottling: false をここに入れてはいけない。Windows では
+    // 透過ウィンドウの透明が壊れ、ピルの角の外に不透明の矩形が出る（実機で発生）。
+    // タイマーの間引き対策は、間引かれない main 側からの overlay:tick で行う。
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false },
   });
   overlayWin.setAlwaysOnTop(true, 'screen-saver');
   overlayWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
@@ -771,6 +780,7 @@ function startMeeting() {
   } else {
     sendToOverlay('overlay:start', payload);
   }
+  startMeetingTick();
   updateTray();
   sendToMainWin('meeting:update', meetingStatus());
   return { ok: true };

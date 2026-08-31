@@ -452,17 +452,7 @@
     );
     rec.ondataavailable = (e) => {
       if (e.data && e.data.size > 0) chunks.push(e.data);
-      // 画面が隠れると setTimeout は間引かれ、75秒の区切りが数分遅れることが
-      // ある（実機で1区間が9分になり、文字起こしが時間切れで失われた）。
-      // このイベントは音声パイプラインが刻むので間引かれない。ここでも見張る。
-      if (mode === 'meeting' && segDeadline && Date.now() >= segDeadline + 2000
-          && rec === recorder && rec.state === 'recording' && !stopping && !cancelled) {
-        // 遅延中の setTimeout を必ず消してから切る。消さないと、そのタイマーが
-        // ID を失ったまま生き残り、あとから発火して「次の」区間を途中で切る。
-        // 以後ずっと前区間のタイマーが今の区間を切るずれが続いてしまう。
-        if (autoStopId) { clearTimeout(autoStopId); autoStopId = null; }
-        rec.stop();
-      }
+      cutSegmentIfOverdue(rec);
     };
     return rec;
   }
@@ -540,6 +530,19 @@
   }
 
   // --- 議事録（セグメント録り） ---
+  // 画面が隠れると setTimeout は間引かれ、75秒の区切りが数分遅れることが
+  // ある（実機で1区間が9分になり、文字起こしが時間切れで失われた）。
+  // そこで区切りは3重に見張る: 通常の setTimeout、音声パイプラインが刻む
+  // ondataavailable、そして間引かれない main からの overlay:tick。
+  function cutSegmentIfOverdue(rec) {
+    if (!(mode === 'meeting' && segDeadline && Date.now() >= segDeadline + 2000
+        && rec && rec === recorder && rec.state === 'recording' && !stopping && !cancelled)) return;
+    // 遅延中の setTimeout を必ず消してから切る。消さないと、そのタイマーが
+    // ID を失ったまま生き残り、あとから発火して「次の」区間を途中で切る。
+    if (autoStopId) { clearTimeout(autoStopId); autoStopId = null; }
+    rec.stop();
+  }
+
   function startMeetingSegment() {
     if (autoStopId) { clearTimeout(autoStopId); autoStopId = null; }   // 前区間の消し忘れ保険
     chunks = [];
@@ -683,6 +686,7 @@
     start();
   };
   window.koeOverlay.onStart((p) => window.__koeStart(p));
+  window.koeOverlay.onTick(() => cutSegmentIfOverdue(recorder));
   window.koeOverlay.onStop(() => stop());
   window.koeOverlay.onCancel(() => cancel());
   window.koeOverlay.onPhase(({ phase, message, procSec }) => {

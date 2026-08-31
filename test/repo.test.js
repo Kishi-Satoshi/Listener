@@ -129,6 +129,9 @@ const appHtml = read('src/renderer/app.html');
 const overlayHtml = read('src/renderer/overlay.html');
 
 const all = (re, s) => [...s.matchAll(re)].map((m) => m[1]);
+// ソースを正規表現で検査するテストはコメントに一致して素通りしやすい。
+// 「テストが通っているのに実装が無い」を防ぐため、コメントを落としてから見る。
+const code = (t) => String(t).replace(/^[ \t]*\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
 
 test('preload の invoke に対応する ipcMain.handle が main.js にある', () => {
   const handled = new Set(all(/ipcMain\.handle\('([^']+)'/g, main));
@@ -368,8 +371,15 @@ test('並べ替えはハンドルからだけ（本文のテキスト選択と�
 
 // ---------------------------------------------------------------- v0.9.7 の機能の結線
 test('文字起こしが切れる問題への3段の対策が入っている', () => {
-  // (1) 隠れた録音ウィンドウのタイマーを間引かせない
-  assert.match(main, /backgroundThrottling: false/);
+  // (1) 区切りの見張りは main からの tick（main のタイマーは間引かれない）。
+  //     backgroundThrottling: false は Windows で透過ウィンドウの透明を壊すので
+  //     使わない（実機でピルの角の外に不透明の矩形が出た）。コメントに語が
+  //     残るためコードだけを見る。
+  assert.ok(!/backgroundThrottling/.test(code(main)), '透明を壊す設定が残っている');
+  assert.match(main, /sendToOverlay\('overlay:tick'/);
+  assert.match(main, /function startMeetingTick/);
+  assert.ok(preload.includes("onTick: (cb) => ipcRenderer.on('overlay:tick'"));
+  assert.ok(overlayHtml.includes('window.koeOverlay.onTick(() => cutSegmentIfOverdue(recorder))'));
   // (2) 時間切れを音声の長さに比例させる（固定240秒で9分の区間が丸ごと消えた）
   assert.match(main, /Math\.max\(240000, Math\.round\(durationMs \|\| 0\) \* 5/);
   assert.match(main, /AbortSignal\.timeout\(waitMs\)/, '計算した待ち時間が使われていない');
