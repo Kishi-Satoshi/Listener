@@ -619,3 +619,38 @@ test('録音バーに外向きの影を付けない', () => {
   assert.ok(!pill.includes('backdrop-filter'), '透過ウィンドウで矩形が出る backdrop-filter が残っている');
   assert.match(main, /hasShadow: false/, 'ウィンドウの影が有効になっている');
 });
+
+// ---------------------------------------------------------------- HTMLの入れ子
+//
+// カードを並べ替えたとき、スクロール枠を閉じる </div> が最後のカードに
+// くっついて移動し、残りのカードが枠の外へ出て画面から消えた（実機で発生）。
+// 見出しの並びだけを見るテストでは通ってしまうので、入れ子も検査する。
+function divDepthMap(html) {
+  const out = [];
+  let depth = 0;
+  for (const line of html.split('\n')) {
+    depth += (line.match(/<div\b/g) || []).length - (line.match(/<\/div>/g) || []).length;
+    const h = line.match(/<h2>(.+?)<\/h2>/);
+    if (h) out.push({ title: h[1], depth });
+  }
+  return { heads: out, depth };
+}
+
+test('設定の各カードが同じ深さにある（枠の外に出ていない）', () => {
+  const a = appHtml.indexOf('<section id="tabSettings"');
+  const sec = appHtml.slice(a, appHtml.indexOf('    </section>', a));
+  const { heads, depth } = divDepthMap(sec);
+  assert.strictEqual(depth, 0, '設定セクションの div が閉じ切れていない');
+  assert.strictEqual(heads.length, 5);
+  for (const h of heads) {
+    assert.strictEqual(h.depth, heads[0].depth, `「${h.title}」だけ深さが違う（枠の外に出ている）`);
+  }
+});
+
+test('画面全体で div の開閉が合っている', () => {
+  for (const [name, html] of [['app.html', appHtml], ['overlay.html', overlayHtml]]) {
+    const o = (html.match(/<div\b/g) || []).length;
+    const c = (html.match(/<\/div>/g) || []).length;
+    assert.strictEqual(o, c, `${name} の div が ${o} 対 ${c} で合っていない`);
+  }
+});
