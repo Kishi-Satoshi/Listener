@@ -1035,6 +1035,43 @@ function makeTrayIcon(recording) {
   return fallback.isEmpty() ? fallback : fallback.resize({ width: 16, height: 16 });
 }
 
+// トレイからの更新確認。画面を経由しないので、レンダラーが壊れていても動く。
+async function checkUpdateFromTray() {
+  const target = updateTarget();
+  const r = await updater.check(app.getVersion(), app.getPath('userData'));
+  if (!r.ok) {
+    dialog.showMessageBox({ type: 'error', message: '更新を確認できませんでした', detail: r.error || '' });
+    return;
+  }
+  if (!r.update) {
+    dialog.showMessageBox({ type: 'info', message: `最新です（${app.getVersion()}）` });
+    return;
+  }
+  if (!target.ok) {
+    const pick = dialog.showMessageBoxSync({
+      type: 'info', buttons: ['配布ページを開く', '閉じる'], defaultId: 0, cancelId: 1,
+      message: `新しいバージョン ${r.version} があります`, detail: target.error || '',
+    });
+    if (pick === 0) shell.openExternal(`https://github.com/${updater.REPO}/releases/latest`);
+    return;
+  }
+  const pick = dialog.showMessageBoxSync({
+    type: 'question', buttons: ['更新して再起動', 'あとで'], defaultId: 0, cancelId: 1,
+    message: `新しいバージョン ${r.version} があります`,
+    detail: String(r.notes || '').slice(0, 800),
+  });
+  if (pick !== 0) return;
+  const res = await updater.apply(r.url, target.root, app.getPath('userData'), () => {});
+  if (!res.ok) {
+    dialog.showMessageBox({ type: 'error', message: '更新に失敗しました', detail: res.error || '' });
+    return;
+  }
+  quitting = true;
+  stopEngine(whisperEng); stopEngine(sumEng); stopPaster();
+  app.relaunch();
+  app.exit(0);
+}
+
 function updateTray() {
   updatePowerBlock();
   if (!tray) return;
@@ -1055,6 +1092,11 @@ function updateTray() {
   }
   items.push({ type: 'separator' });
   items.push({ label: 'ノートを開く', click: createMainWindow });
+  // 更新はトレイからも行えるようにする。画面側の組み立てが1か所でも
+  // つまずくと、設定タブの「更新を確認」ボタンごと動かなくなり、
+  // アプリ内更新で直すこともできなくなる（実機で起きた）。
+  // 復旧の手段が、壊れうるものに依存していてはいけない。
+  items.push({ label: '更新を確認', enabled: state === 'idle', click: checkUpdateFromTray });
   items.push({ type: 'separator' });
   items.push({ label: '終了', click: () => { quitting = true; app.quit(); } });
   tray.setContextMenu(Menu.buildFromTemplate(items));

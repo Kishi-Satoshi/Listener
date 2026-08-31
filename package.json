@@ -1,6 +1,6 @@
 {
   "name": "listener",
-  "version": "0.10.3",
+  "version": "0.10.4",
   "description": "Listener — 完全オフラインの音声入力・議事録ツール（ローカルLLM要約 + 出典リンク付き）",
   "main": "src/main.js",
   "author": "Kishi-Satoshi",

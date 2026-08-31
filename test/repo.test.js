@@ -681,3 +681,16 @@ test('設定を読み込む前に保存しない', () => {
   assert.match(appHtml, /if \(!settingsLoaded\) \{/);
   assert.match(appHtml, /fill\(settings\);\s*\n\s*settingsLoaded = true;/);
 });
+
+test('更新の導線が画面に依存しない（トレイからも確認できる）', () => {
+  // 画面の組み立てが1か所つまずくと設定タブの「更新を確認」ごと死に、
+  // アプリ内更新で直すこともできなくなった（実機で発生）。
+  // 復旧の手段が、壊れうるものに依存していてはいけない。
+  assert.match(main, /label: '更新を確認'[^}]*click: checkUpdateFromTray/);
+  assert.match(main, /async function checkUpdateFromTray\(\)/);
+  const fn = main.slice(main.indexOf('async function checkUpdateFromTray'), main.indexOf('function updateTray'));
+  assert.ok(fn.includes('updater.check('), '確認していない');
+  assert.ok(fn.includes('updater.apply('), '適用していない');
+  assert.ok(fn.includes('r.url'), 'zipのURLの受け取り方が check() の戻り値と合っていない');
+  assert.ok(fn.includes('app.relaunch()'), '再起動していない');
+});
