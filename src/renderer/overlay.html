@@ -25,15 +25,15 @@
     padding: 0 9px 0 14px;
     -webkit-app-region: drag;   /* ピル全体をドラッグで移動可能に */
     cursor: grab;
-    background: rgba(38, 38, 38, 0.96);
-    border: 1px solid rgba(255, 255, 255, 0.10);
+    background: #262626;
+    border: 1px solid rgba(255, 255, 255, 0.14);
     border-radius: 999px;
-    box-shadow:
-      0 8px 24px rgba(0, 0, 0, 0.38),
-      0 1px 4px rgba(0, 0, 0, 0.20),
-      inset 0 1px 0 rgba(255, 255, 255, 0.07);
-    backdrop-filter: blur(24px) saturate(140%);
-    -webkit-backdrop-filter: blur(24px) saturate(140%);
+    /* 外向きの影は付けない。Windows の透過ウィンドウでは影がウィンドウの
+       矩形いっぱいに落ち、ピルの外側にうっすら灰色の四角が見える（実機で発生）。
+       浮きは内側のハイライトと縁のコントラストだけで出す。 */
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    /* backdrop-filter も使わない。透過ウィンドウでは背後の合成結果が
+       矩形に出ることがある。地の色を十分濃くして代わりにする。 */
     color: #f2f2f2;
     opacity: 0; transform: translateY(10px) scale(.97);
     transition: opacity .18s ease, transform .22s cubic-bezier(.2, .9, .3, 1.2);
@@ -45,7 +45,7 @@
   .pill[data-phase="recording"] .dot { animation: pulse 1.4s ease-in-out infinite; }
   .pill[data-phase="processing"] .dot {
     background: transparent;
-    border: 2px solid rgba(27, 30, 37, 0.14); border-top-color: var(--accent);
+    border: 2px solid rgba(255, 255, 255, 0.18); border-top-color: var(--accent);   /* 暗色地に合わせる */
     animation: spin .8s linear infinite;
   }
   .pill[data-phase="done"] .dot { background: var(--green); }
@@ -314,7 +314,9 @@
     const bars = 40;
     if (ampHist.length > bars) ampHist.shift();
     const bw = w / bars;
-    ctx2d.fillStyle = 'rgba(27,30,37,0.72)';
+    // ピルは暗色なので波形も明るくする。ここを地の色のまま暗くしておくと、
+    // 暗い背景に暗い波形で何も見えない（実機で発生）。
+    ctx2d.fillStyle = paused ? 'rgba(255,255,255,0.32)' : 'rgba(255,255,255,0.86)';
     for (let i = 0; i < ampHist.length; i++) {
       const x = w - (ampHist.length - i) * bw;   // 右端が最新
       const bh = Math.max(2, ampHist[i] * (h - 2));

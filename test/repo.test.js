@@ -598,3 +598,24 @@ test('設定カードの並びは指定通り', () => {
     '要約エンジン（llama.cpp・オフライン）— 議事録の自動要約に使用',
   ]);
 });
+
+test('録音バーは暗色地に合った色で描く', () => {
+  // ピルを暗色にしたのに描画色を明るい地のままにすると、
+  // 波形もスピナーも見えなくなる（実機で波形が真っ黒になった）
+  const c = code(overlayHtml);
+  assert.match(c, /ctx2d\.fillStyle = paused \? 'rgba\(255,255,255/, '波形が暗いまま');
+  assert.ok(!/rgba\(27,\s*30,\s*37/.test(c), '明るい地向けの墨色が残っている');
+});
+
+test('録音バーに外向きの影を付けない', () => {
+  // Windows の透過ウィンドウでは影がウィンドウの矩形に落ち、
+  // ピルの外側にうっすら灰色の四角が見える（実機で発生）
+  // コメントを落としてから見る。説明文の中の語に反応しては意味がない
+  const pill = code(overlayHtml.slice(overlayHtml.indexOf('.pill {'), overlayHtml.indexOf('.pill.visible')));
+  const shadows = [...pill.matchAll(/box-shadow:([^;]*);/g)].map((m) => m[1]);
+  for (const sh of shadows) {
+    assert.ok(!/(^|,)\s*0 /.test(sh.replace(/inset[^,]*/g, '')), `外向きの影がある: ${sh.trim()}`);
+  }
+  assert.ok(!pill.includes('backdrop-filter'), '透過ウィンドウで矩形が出る backdrop-filter が残っている');
+  assert.match(main, /hasShadow: false/, 'ウィンドウの影が有効になっている');
+});
