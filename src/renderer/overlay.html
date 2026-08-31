@@ -25,22 +25,23 @@
     padding: 0 9px 0 14px;
     -webkit-app-region: drag;   /* ピル全体をドラッグで移動可能に */
     cursor: grab;
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.92) 0%, rgba(255, 255, 255, 0.74) 100%);
-    border: 1px solid rgba(255, 255, 255, 0.85);
+    background: rgba(38, 38, 38, 0.96);
+    border: 1px solid rgba(255, 255, 255, 0.10);
     border-radius: 999px;
     box-shadow:
-      0 8px 24px rgba(20, 30, 60, 0.22),
-      0 1px 4px rgba(20, 30, 60, 0.10),
-      inset 0 1px 0 rgba(255, 255, 255, 0.95);
-    backdrop-filter: blur(24px) saturate(160%);
-    -webkit-backdrop-filter: blur(24px) saturate(160%);
-    color: var(--ink);
+      0 8px 24px rgba(0, 0, 0, 0.38),
+      0 1px 4px rgba(0, 0, 0, 0.20),
+      inset 0 1px 0 rgba(255, 255, 255, 0.07);
+    backdrop-filter: blur(24px) saturate(140%);
+    -webkit-backdrop-filter: blur(24px) saturate(140%);
+    color: #f2f2f2;
     opacity: 0; transform: translateY(10px) scale(.97);
     transition: opacity .18s ease, transform .22s cubic-bezier(.2, .9, .3, 1.2);
   }
   .pill.visible { opacity: 1; transform: none; }
 
   .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); flex: none; }
+  .pill.paused .dot { animation: none !important; background: rgba(255,255,255,.35); }
   .pill[data-phase="recording"] .dot { animation: pulse 1.4s ease-in-out infinite; }
   .pill[data-phase="processing"] .dot {
     background: transparent;
@@ -61,7 +62,7 @@
   .center { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
   canvas#wave { width: 100%; height: 18px; display: block; }
   .status {
-    font-size: 11px; color: var(--muted);
+    font-size: 11px; color: rgba(255, 255, 255, 0.62);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .pill[data-phase="done"] .status { color: var(--green); }
@@ -69,7 +70,7 @@
 
   .timer {
     flex: none; font-size: 12px; font-variant-numeric: tabular-nums;
-    color: var(--ink); letter-spacing: .03em; min-width: 36px; text-align: right;
+    color: #f2f2f2; letter-spacing: .03em; min-width: 36px; text-align: right;
   }
   .pill[data-phase="done"] .timer { color: var(--green); font-size: 12px; }
 
@@ -83,19 +84,29 @@
     transition: transform .08s ease, background .12s ease, filter .12s ease;
   }
   .pbtn:active { transform: scale(.92); }
-  .pbtn.ok {
-    background: linear-gradient(180deg, #7b8bef 0%, #5261dd 100%);
-    color: #fff;
-    box-shadow: 0 4px 12px rgba(82, 97, 221, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.4);
-  }
-  .pbtn.ok:hover { filter: brightness(1.06); }
-  .pbtn.ng {
-    background: rgba(255, 255, 255, 0.6);
-    color: var(--muted);
-    border: 1px solid rgba(27, 30, 37, 0.12);
-  }
-  .pbtn.ng:hover { color: var(--ink); background: rgba(255, 255, 255, 0.92); }
-  .pill.meeting .pbtn.ng { display: none; } /* 議事録は誤操作防止のため✕なし */
+  /* 一時停止: 落ち着いたグレーの丸。押しても記録は失われないので目立たせない */
+  .pbtn.pause { background: rgba(255, 255, 255, 0.13); color: #f2f2f2; }
+  .pbtn.pause:hover { background: rgba(255, 255, 255, 0.22); }
+  /* 停止: 赤い四角。ここで記録が締まるので、唯一の強い色にする */
+  .pbtn.stop { background: rgba(255, 255, 255, 0.13); }
+  .pbtn.stop:hover { background: rgba(255, 255, 255, 0.22); }
+  .pbtn .sq { width: 11px; height: 11px; border-radius: 2.5px; background: var(--rec); display: block; }
+  .pbtn .bar { width: 3.5px; height: 12px; border-radius: 1.5px; background: currentColor; display: block; }
+  .pbtn .tri { width: 0; height: 0; display: block;
+    border-left: 10px solid currentColor; border-top: 6px solid transparent;
+    border-bottom: 6px solid transparent; margin-left: 2px; }
+  .pause-ico { display: flex; gap: 3px; }
+  .pill.paused .pause-ico { display: none; }
+  .resume-ico { display: none; }
+  .pill.paused .resume-ico { display: block; }
+  /* 音声入力（1本録り）は一時停止しない。短い発話が前提で、
+     区間の概念も無いため、止める＝確定でよい */
+  .pill:not(.meeting) .pbtn.pause { display: none; }
+  /* 破棄は音声入力だけ。議事録は誤操作で会議が消えるので画面には出さない
+     （破棄はメイン画面の「破棄」ボタンから、確認つきで行う） */
+  .pbtn.ng { background: rgba(255, 255, 255, 0.13); color: rgba(255,255,255,.72); font-size: 11px; }
+  .pbtn.ng:hover { background: rgba(255, 255, 255, 0.22); color: #fff; }
+  .pill.meeting .pbtn.ng { display: none; }
 </style>
 </head>
 <body>
@@ -107,7 +118,11 @@
     </div>
     <div class="timer" id="timer">0:00</div>
     <div class="btns">
-      <button class="pbtn ok" id="okBtn" title="確定（ホットキーでも可）">✓</button>
+      <button class="pbtn pause" id="pauseBtn" title="一時停止 / 再開">
+        <span class="pause-ico"><span class="bar"></span><span class="bar"></span></span>
+        <span class="tri resume-ico"></span>
+      </button>
+      <button class="pbtn stop" id="stopBtn" title="停止して議事録を作成"><span class="sq"></span></button>
       <button class="pbtn ng" id="ngBtn" title="キャンセル（Esc）">✕</button>
     </div>
   </div>
@@ -125,6 +140,9 @@
   let mode = 'dictation'; // 'dictation' | 'meeting'
   let segmentMs = 75000;
   let segDeadline = 0;   // この時刻を過ぎたら区間を切る（setTimeout の保険）
+  let paused = false;     // 一時停止中（録音は止まるが、記録は捨てない）
+  let pausedAt = 0;       // 一時停止した時刻
+  let pausedMs = 0;       // 一時停止していた合計。経過時間の表示から差し引く
   const FIRST_SEG_MS = 20000; // 最初のセグメントは短くして早く結果を見せる
   let firstSegDone = false;
   // mediaStream は MediaRecorder に渡すもの。相手の声を混ぜているときは
@@ -234,6 +252,7 @@
   // 無音警告から戻るときも同じ関数を使うので、警告が一度出ただけで
   // 「相手の声も」の表示が消えることがない。
   function recordingLabel() {
+    if (paused) return '一時停止中';
     if (mode !== 'meeting') return '聞き取り中…';
     if (!sysWanted) return '議事録を記録中';
     return sysOn ? '記録中（相手の声も）' : '記録中（マイクのみ）';
@@ -467,6 +486,8 @@
     ampHist = [];
     silentSince = 0;
     micSilentSince = 0;
+    paused = false; pausedAt = 0; pausedMs = 0;
+    pill.classList.remove('paused');
     shownLabel = '';
     firstSegDone = false;
     showRecording(recordingLabel());   // 取り込みの成否が決まったら openStream が貼り直す
@@ -496,7 +517,11 @@
     muteSystemForBeep();
     beep(SND.start);
     startedAt = Date.now();
-    timerId = setInterval(() => { timerEl.textContent = fmt(Date.now() - startedAt); }, 250);
+    // 一時停止していた時間は会議の長さに含めない
+    timerId = setInterval(() => {
+      const pause = pausedMs + (paused ? Date.now() - pausedAt : 0);
+      timerEl.textContent = fmt(Date.now() - startedAt - pause);
+    }, 250);
 
     if (mode === 'meeting') startMeetingSegment();
     else startDictation();
@@ -535,6 +560,7 @@
   // そこで区切りは3重に見張る: 通常の setTimeout、音声パイプラインが刻む
   // ondataavailable、そして間引かれない main からの overlay:tick。
   function cutSegmentIfOverdue(rec) {
+    if (paused) return;
     if (!(mode === 'meeting' && segDeadline && Date.now() >= segDeadline + 2000
         && rec && rec === recorder && rec.state === 'recording' && !stopping && !cancelled)) return;
     // 遅延中の setTimeout を必ず消してから切る。消さないと、そのタイマーが
@@ -566,6 +592,7 @@
       const isFinal = stopping;
       if (wav) window.koeOverlay.sendSegment(wav, durationMs, isFinal);
       else if (isFinal) window.koeOverlay.sendSegment(new Uint8Array(0), durationMs, true);
+      if (paused) return;      // 一時停止で締めた区間。再開まで次は始めない
       if (!isFinal) {
         startMeetingSegment(); // 次のセグメントへ
       } else {
@@ -579,7 +606,55 @@
     recorder.start(250);
   }
 
+  // 一時停止。録音そのものを止め、それまでの区間はきちんと締めて送る。
+  // 中途半端に持ったまま止めると、再開までの分が同じ区間に混ざり、
+  // 一時停止した意味が無くなる。
+  function pauseRec() {
+    if (paused || mode !== 'meeting' || stopping || cancelled) return;
+    paused = true;
+    pausedAt = Date.now();
+    pill.classList.add('paused');
+    if (autoStopId) { clearTimeout(autoStopId); autoStopId = null; }
+    segDeadline = 0;
+    stopMeters();                 // 波形とマイクの見張りを止める
+    if (recorder && recorder.state === 'recording') recorder.stop();  // 区間を締めて送る
+    releaseStream();              // マイクを解放する。停止中に録っていないことを機器の表示でも示す
+    setPhase('recording', recordingLabel());
+    window.koeOverlay.reportPause(true);
+  }
+
+  async function resumeRec() {
+    if (!paused || stopping || cancelled) return;
+    pausedMs += Date.now() - pausedAt;
+    paused = false;
+    pill.classList.remove('paused');
+    try {
+      await openStream();         // マイクを開き直す
+    } catch (e) {
+      paused = true; pausedAt = Date.now(); pill.classList.add('paused');
+      setPhase('recording', 'マイクを開けませんでした。もう一度お試しください');
+      return;
+    }
+    if (stopping || cancelled) { cleanup(); return; }
+    firstSegDone = true;          // 再開後は通常の区間長で刻む
+    startMeetingSegment();
+    setPhase('recording', recordingLabel());
+    window.koeOverlay.reportPause(false);
+  }
+
   function stop() {
+    // 一時停止中は録音が止まっているので、そのまま締める
+    if (paused) {
+      paused = false;
+      pausedMs += Date.now() - pausedAt;
+      pill.classList.remove('paused');
+      stopping = true;
+      setPhase('processing', mode === 'meeting' ? '議事録を作成中…' : '文字起こし中…');
+      beep(SND.stop);
+      window.koeOverlay.sendSegment(new Uint8Array(0), 0, true);
+      cleanup();
+      return;
+    }
     stopping = true;
     if (autoStopId) clearTimeout(autoStopId);
     setPhase('processing', mode === 'meeting' ? '議事録を作成中…' : '文字起こし中…');
@@ -606,7 +681,7 @@
   // 誰も見なくなる。一方、マイクだけが死んでいる状態は相手の声に隠れるので、
   // そちらは別に数える（自分の発言が会議まるごと欠ける）。
   function checkSilence(micLevel, sysLevel) {
-    if (stopping || cancelled || pill.dataset.phase !== 'recording') return;
+    if (stopping || cancelled || paused || pill.dataset.phase !== 'recording') return;
     const now = Date.now();
     const level = Math.max(micLevel, sysLevel || 0);
 
@@ -665,7 +740,11 @@
     chunks = [];
   }
 
-  document.getElementById('okBtn').addEventListener('click', () => window.koeOverlay.confirmStop());
+  document.getElementById('pauseBtn').addEventListener('click', () => {
+    if (mode !== 'meeting') return;
+    if (paused) resumeRec(); else pauseRec();
+  });
+  document.getElementById('stopBtn').addEventListener('click', () => window.koeOverlay.confirmStop());
   document.getElementById('ngBtn').addEventListener('click', () => window.koeOverlay.requestCancel());
 
   // main からは IPC と executeJavaScript の2経路で来る。両方ここへ合流させる。

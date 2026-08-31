@@ -190,15 +190,30 @@ test('画面が呼ぶ API がすべて preload に公開されている', () => 
   assert.deepStrictEqual(missingOverlay, [], 'overlay.html が使うのに preload に無い koeOverlay の API');
 });
 
-test('外部URLを開くのは REPO 定数から組み立てたものだけ', () => {
+test('外部URLを開くのはコード内で組み立てたものだけ', () => {
   // 画面から渡された文字列を openExternal に流すと、表示中の内容次第で
-  // 任意のページを開けてしまう
+  // 任意のページを開けてしまう。許すのは次の2つだけ。
+  //   - REPO 定数から組み立てたリリースページ
+  //   - Windows のサウンド設定（固定のURI）
+  const ALLOWED = [
+    /^`https:\/\/github\.com\/\$\{updater\.REPO\}/,
+    /^'ms-settings:[a-z]+'$/,
+  ];
   const calls = [...main.matchAll(/shell\.openExternal\(([^)]*)\)/g)].map((m) => m[1].trim());
   assert.ok(calls.length > 0, 'openExternal の呼び出しが見つからない');
   for (const c of calls) {
-    assert.match(c, /^`https:\/\/github\.com\/\$\{updater\.REPO\}/,
+    assert.ok(ALLOWED.some((re) => re.test(c)),
       `画面から受け取ったURLを開いていないか: ${c}`);
   }
+});
+
+test('録音されるスピーカーは表示だけで、選ばせない', () => {
+  // ループバックの取得元は Windows の既定の再生デバイス固定で、
+  // アプリから指定する手段が無い。選べる風のUIを出す方が誤解を生む。
+  assert.ok(appHtml.includes('id="spkNow"'), 'スピーカーの表示が無い');
+  assert.match(appHtml, /id="spkNow"[^>]*readonly/, '編集できてしまう');
+  assert.ok(!/<select id="spkSelect"/.test(appHtml), '選択式になっている');
+  assert.ok(appHtml.includes('openSoundSettings()'), 'Windows設定への導線が無い');
 });
 
 test('更新の告知が設定タブの外にも出る', () => {
@@ -535,4 +550,51 @@ test('「すべて」の検索が要約の本文とメモに当たる', () => {
   assert.ok(fn.includes('snippet'), '当たった箇所を見せていない');
   // 古い索引の作り直し（これが無いと既存の議事録は検索に出てこないまま）
   assert.match(st, /typeof index\.pages\[i\]\.searchText === 'string'/);
+});
+
+// ---------------------------------------------------------------- 録音バーと設定の並び
+test('録音バーは一時停止と停止のボタンを持つ', () => {
+  assert.ok(overlayHtml.includes('id="pauseBtn"'), '一時停止ボタンが無い');
+  assert.ok(overlayHtml.includes('id="stopBtn"'), '停止ボタンが無い');
+  // 停止は赤い四角、一時停止は二本線
+  assert.match(overlayHtml, /\.pbtn \.sq \{[\s\S]{0,160}?background: var\(--rec\)/);
+  assert.match(overlayHtml, /class="pause-ico"><span class="bar"><\/span><span class="bar">/);
+});
+
+test('一時停止は区間を締めてマイクを解放する', () => {
+  // 持ったまま止めると再開までの分が同じ区間に混ざり、止めた意味が無くなる。
+  // マイクを掴んだままだと、止めたのに録っているように見える。
+  const fn = code(overlayHtml).slice(code(overlayHtml).indexOf('function pauseRec'));
+  const body = fn.slice(0, fn.indexOf('async function resumeRec'));
+  assert.ok(body.includes('recorder.stop()'), '区間を締めていない');
+  assert.ok(body.includes('releaseStream()'), 'マイクを解放していない');
+  assert.ok(body.includes('reportPause(true)'), 'main へ知らせていない');
+});
+
+test('一時停止した時間は会議の長さに含めない', () => {
+  assert.match(main, /const pausedTotal = m\.pausedMs/);
+  assert.match(main, /m\.startedAt - pausedTotal/);
+  assert.ok(appHtml.includes('- mtPausedMs'), '画面の時計が一時停止を引いていない');
+});
+
+test('一時停止中は無音警告も区間の切り出しも動かない', () => {
+  const c = code(overlayHtml);
+  assert.match(c, /function checkSilence\([^)]*\) \{\s*if \(stopping \|\| cancelled \|\| paused/);
+  assert.match(c, /function cutSegmentIfOverdue\([^)]*\) \{\s*if \(paused\) return;/);
+  assert.match(main, /state === 'meeting' && meeting && !meeting\.paused/);
+});
+
+test('議事録の破棄ボタンは録音バーに出さない（誤操作で会議が消える）', () => {
+  assert.match(overlayHtml, /\.pill\.meeting \.pbtn\.ng \{ display: none; \}/);
+});
+
+test('設定カードの並びは指定通り', () => {
+  const heads = [...appHtml.matchAll(/<h2>(.+?)<\/h2>/g)].map((m) => m[1]);
+  assert.deepStrictEqual(heads, [
+    'アップデート',
+    '動作',
+    'ユーザー辞書（認識ヒント）',
+    '文字起こしエンジン（whisper.cpp・オフライン）',
+    '要約エンジン（llama.cpp・オフライン）— 議事録の自動要約に使用',
+  ]);
 });

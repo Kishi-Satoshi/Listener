@@ -424,6 +424,125 @@
     <section id="tabSettings" class="tab">
       <div class="scroll">
         <div class="card">
+          <h2>アップデート</h2>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <span id="verNow" style="font-size:13px"></span>
+            <button class="ghost" id="chkUpdBtn" type="button">更新を確認</button>
+            <button class="action" id="applyUpdBtn" type="button" style="display:none">更新して再起動</button>
+            <span class="save-msg" id="updMsg"></span>
+          </div>
+          <div id="updNotes" style="display:none;margin-top:12px;font-size:12px;line-height:1.7;
+            white-space:pre-wrap;background:rgba(var(--srf),.5);border-radius:10px;padding:12px;max-height:200px;overflow-y:auto"></div>
+          <div class="desc" style="margin-top:10px">
+            更新はアプリ本体（数百KB）のみを取得します。エンジンやモデル、保存済みの議事録はそのままです。<br />
+            更新前のバージョンは <code>src.backup-*</code> として1世代だけ残ります。
+          </div>
+        </div>
+
+        <div style="display:flex;align-items:center;gap:12px;padding-bottom:20px">
+          <span class="save-msg" id="saveMsg"></span>
+          <span style="flex:1"></span>
+          <button class="ghost" id="openDataBtn" type="button">データ保存先を開く</button>
+        </div>
+      </div>
+        <div class="card">
+          <h2>動作</h2>
+          <div class="field">
+            <label for="themeSel">画面の配色</label>
+            <select id="themeSel">
+              <option value="system">Windowsの設定に合わせる</option>
+              <option value="light">ライト</option>
+              <option value="dark">ダーク</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="hotkey">音声入力ホットキー（クリックしてキーを押す）</label>
+            <input type="text" id="hotkey" readonly />
+          </div>
+          <div class="field">
+            <label for="meetingHotkey">議事録ホットキー（開始／終了をトグル）</label>
+            <input type="text" id="meetingHotkey" readonly />
+            <div class="desc">※ 左右のAltは区別されません（どちらでも動作）。</div>
+          </div>
+          <div class="field">
+            <label for="segmentSec">議事録の文字起こし間隔（秒）</label>
+            <input type="text" id="segmentSec" />
+            <div class="desc">短いほど早く画面に出ますが、文の切れ目が増えます（既定75秒。最初の1回は20秒）。</div>
+          </div>
+          <div class="field">
+            <label for="pillPos">録音バーの表示位置（表示中はドラッグでも移動できます）</label>
+            <select id="pillPos">
+              <option value="bottom">下・中央（既定）</option>
+              <option value="top">上・中央</option>
+              <option value="left">左・中央</option>
+              <option value="right">右・中央</option>
+              <option value="top-left">左上</option>
+              <option value="top-right">右上</option>
+              <option value="bottom-left">左下</option>
+              <option value="bottom-right">右下</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="micSelect">使用するマイク</label>
+            <div class="row">
+              <select id="micSelect"></select>
+              <button class="ghost" id="micReloadBtn" type="button">更新</button>
+            </div>
+          </div>
+          <label class="check"><input type="checkbox" id="useSystemAudio" />
+            <span>議事録で相手の声も録る（パソコンから出ている音）<br />
+              <span class="d">マイクに加えて、スピーカーやイヤホンへ流れている音も一緒に記録します。
+                Web会議の相手の発言を議事録に残せます。Windows でのみ動作します。<br />
+                パソコンで鳴っている音はすべて入ります（通知音や動画の音も）。
+                二重に入るのを避けるため、イヤホンの使用をおすすめします。
+                音声入力（ホットキー）ではこれまで通りマイクだけを使います。<br />
+                ※ 録音していることは、会議の参加者へ伝えてください。</span></span></label>
+          <div class="field" id="spkField">
+            <label>録音されるスピーカー</label>
+            <div class="row">
+              <input type="text" id="spkNow" readonly />
+              <button class="ghost" id="spkReloadBtn" type="button">更新</button>
+              <button class="ghost" id="spkSettingsBtn" type="button">Windowsの設定</button>
+            </div>
+            <div class="desc">Windows の「既定の再生デバイス」に出ている音が録音されます。
+              アプリ側から選ぶことはできない仕組みのため、変えたいときは
+              Windows のサウンド設定で既定のデバイスを切り替えてください。
+              録音の開始時点のデバイスに固定されます（録音中に切り替えても追従しません）。</div>
+          </div>
+          <div class="field">
+            <label for="language">認識言語</label>
+            <select id="language">
+              <option value="ja">日本語</option><option value="en">英語</option><option value="auto">自動判定</option>
+            </select>
+          </div>
+          <label class="check"><input type="checkbox" id="autoPaste" />
+            <span>文字起こし後、カーソル位置へ自動貼り付け</span></label>
+          <label class="check"><input type="checkbox" id="removeFillers" />
+            <span>フィラー除去（えー、あのー 等）</span></label>
+          <label class="check"><input type="checkbox" id="soundFeedback" />
+            <span>効果音</span></label>
+          <label class="check"><input type="checkbox" id="autoLaunch" />
+            <span>Windowsサインイン時に自動起動<br />
+              <span class="d">インストーラー版でのみ動作します。</span></span></label>
+          <label class="check"><input type="checkbox" id="stayInTray" />
+            <span>ウィンドウを閉じてもタスクトレイに残す<br />
+              <span class="d">オフのときは、閉じるとアプリも終了します。
+                終了中はホットキーの音声入力も使えません。</span></span></label>
+        </div>
+
+        <div class="card">
+          <h2>ユーザー辞書（認識ヒント）</h2>
+          <div class="field">
+            <textarea id="dictionary" rows="5" placeholder="1行に1語ずつ&#10;自社名&#10;製品名&#10;部署名"></textarea>
+            <div class="desc">固有名詞・社内用語をエンジンへ渡し、認識精度を上げます。</div>
+          </div>
+          <label class="check"><input type="checkbox" id="useBuiltinTerms" />
+            <span>業務でよく使う言葉のヒントも渡す<br />
+              <span class="d">「不具合」「改修」「結合テスト」「今週」などをあらかじめ渡します。
+                上の辞書が優先で、余った分だけ使われます。</span></span></label>
+        </div>
+
+        <div class="card">
           <h2>文字起こしエンジン（whisper.cpp・オフライン）</h2>
           <div class="field">
             <label for="localServerExe">whisper-server.exe のパス</label>
@@ -502,113 +621,6 @@
           </div>
         </div>
 
-        <div class="card">
-          <h2>動作</h2>
-          <div class="field">
-            <label for="themeSel">画面の配色</label>
-            <select id="themeSel">
-              <option value="system">Windowsの設定に合わせる</option>
-              <option value="light">ライト</option>
-              <option value="dark">ダーク</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="hotkey">音声入力ホットキー（クリックしてキーを押す）</label>
-            <input type="text" id="hotkey" readonly />
-          </div>
-          <div class="field">
-            <label for="meetingHotkey">議事録ホットキー（開始／終了をトグル）</label>
-            <input type="text" id="meetingHotkey" readonly />
-            <div class="desc">※ 左右のAltは区別されません（どちらでも動作）。</div>
-          </div>
-          <div class="field">
-            <label for="segmentSec">議事録の文字起こし間隔（秒）</label>
-            <input type="text" id="segmentSec" />
-            <div class="desc">短いほど早く画面に出ますが、文の切れ目が増えます（既定75秒。最初の1回は20秒）。</div>
-          </div>
-          <div class="field">
-            <label for="pillPos">録音バーの表示位置（表示中はドラッグでも移動できます）</label>
-            <select id="pillPos">
-              <option value="bottom">下・中央（既定）</option>
-              <option value="top">上・中央</option>
-              <option value="left">左・中央</option>
-              <option value="right">右・中央</option>
-              <option value="top-left">左上</option>
-              <option value="top-right">右上</option>
-              <option value="bottom-left">左下</option>
-              <option value="bottom-right">右下</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="micSelect">使用するマイク</label>
-            <div class="row">
-              <select id="micSelect"></select>
-              <button class="ghost" id="micReloadBtn" type="button">更新</button>
-            </div>
-          </div>
-          <label class="check"><input type="checkbox" id="useSystemAudio" />
-            <span>議事録で相手の声も録る（パソコンから出ている音）<br />
-              <span class="d">マイクに加えて、スピーカーやイヤホンへ流れている音も一緒に記録します。
-                Web会議の相手の発言を議事録に残せます。Windows でのみ動作します。<br />
-                パソコンで鳴っている音はすべて入ります（通知音や動画の音も）。
-                二重に入るのを避けるため、イヤホンの使用をおすすめします。
-                音声入力（ホットキー）ではこれまで通りマイクだけを使います。<br />
-                ※ 録音していることは、会議の参加者へ伝えてください。</span></span></label>
-          <div class="field">
-            <label for="language">認識言語</label>
-            <select id="language">
-              <option value="ja">日本語</option><option value="en">英語</option><option value="auto">自動判定</option>
-            </select>
-          </div>
-          <label class="check"><input type="checkbox" id="autoPaste" />
-            <span>文字起こし後、カーソル位置へ自動貼り付け</span></label>
-          <label class="check"><input type="checkbox" id="removeFillers" />
-            <span>フィラー除去（えー、あのー 等）</span></label>
-          <label class="check"><input type="checkbox" id="soundFeedback" />
-            <span>効果音</span></label>
-          <label class="check"><input type="checkbox" id="autoLaunch" />
-            <span>Windowsサインイン時に自動起動<br />
-              <span class="d">インストーラー版でのみ動作します。</span></span></label>
-          <label class="check"><input type="checkbox" id="stayInTray" />
-            <span>ウィンドウを閉じてもタスクトレイに残す<br />
-              <span class="d">オフのときは、閉じるとアプリも終了します。
-                終了中はホットキーの音声入力も使えません。</span></span></label>
-        </div>
-
-        <div class="card">
-          <h2>ユーザー辞書（認識ヒント）</h2>
-          <div class="field">
-            <textarea id="dictionary" rows="5" placeholder="1行に1語ずつ&#10;自社名&#10;製品名&#10;部署名"></textarea>
-            <div class="desc">固有名詞・社内用語をエンジンへ渡し、認識精度を上げます。</div>
-          </div>
-          <label class="check"><input type="checkbox" id="useBuiltinTerms" />
-            <span>業務でよく使う言葉のヒントも渡す<br />
-              <span class="d">「不具合」「改修」「結合テスト」「今週」などをあらかじめ渡します。
-                上の辞書が優先で、余った分だけ使われます。</span></span></label>
-        </div>
-
-        <div class="card">
-          <h2>アップデート</h2>
-          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-            <span id="verNow" style="font-size:13px"></span>
-            <button class="ghost" id="chkUpdBtn" type="button">更新を確認</button>
-            <button class="action" id="applyUpdBtn" type="button" style="display:none">更新して再起動</button>
-            <span class="save-msg" id="updMsg"></span>
-          </div>
-          <div id="updNotes" style="display:none;margin-top:12px;font-size:12px;line-height:1.7;
-            white-space:pre-wrap;background:rgba(var(--srf),.5);border-radius:10px;padding:12px;max-height:200px;overflow-y:auto"></div>
-          <div class="desc" style="margin-top:10px">
-            更新はアプリ本体（数百KB）のみを取得します。エンジンやモデル、保存済みの議事録はそのままです。<br />
-            更新前のバージョンは <code>src.backup-*</code> として1世代だけ残ります。
-          </div>
-        </div>
-
-        <div style="display:flex;align-items:center;gap:12px;padding-bottom:20px">
-          <span class="save-msg" id="saveMsg"></span>
-          <span style="flex:1"></span>
-          <button class="ghost" id="openDataBtn" type="button">データ保存先を開く</button>
-        </div>
-      </div>
     </section>
   </main>
 
@@ -631,6 +643,7 @@
   let mtTimer = null;
   let mtStartedAt = null;
   let mtStoppedAt = null;
+  let mtPausedMs = 0;
   let mtWasActive = false;
   let dragBlockId = null;   // 並べ替え中のブロック
 
@@ -1216,13 +1229,15 @@
   // ---------------- 録音セッション ----------------
   function mtClock() {
     if (!mtStartedAt) return '0:00';
+    // 一時停止していた時間は会議の長さに含めない
     // 停止後は止まった時計を出す。作成中も進み続けると、
     // 会議が実際より長かったように見える。
-    return fmtClock((mtStoppedAt || Date.now()) - mtStartedAt);
+    return fmtClock(Math.max(0, (mtStoppedAt || Date.now()) - mtStartedAt - mtPausedMs));
   }
   function setMeetingUi(st) {
     mtStartedAt = st.startedAt;
     mtStoppedAt = st.stoppedAt || null;
+    mtPausedMs = st.pausedMs || 0;
     // 記録を新しく始めた瞬間は、開いていた議事録を閉じて白紙から始める。
     // 前の議事録が開いたままだと、その画面に記録中バーだけが刺さり、
     // 新しい記録が始まったように見えない。
@@ -1247,6 +1262,7 @@
       // 記録中のバーに出す。
       const recLabel = st.systemAudio ? '議事録を記録中（相手の声も）' : '議事録を記録中';
       $('liveTitle').textContent = st.finalizing ? '議事録を作成しています…'
+        : st.paused ? '一時停止中（録音していません）'
         : st.pending > 0 ? `${recLabel}（${st.pending}区間を文字起こし中）` : recLabel;
       if (!mtTimer) mtTimer = setInterval(() => { const e = $('liveTm'); if (e) e.textContent = mtClock(); }, 500);
       // 記録中はライブ文字起こしを表示
@@ -1393,6 +1409,29 @@
   }
   $('micReloadBtn').onclick = () => loadMics($('micSelect').value);
 
+  // 録音されるスピーカー（Windows の既定の再生デバイス）を表示する。
+  // 選ばせないのは意地悪ではなく、ループバックの取得元を指定する手段が
+  // 無いため。選べる風のUIを出す方が誤解を生む。
+  async function loadSpeaker() {
+    const el = $('spkNow');
+    if (!el) return;
+    try {
+      let devs = await navigator.mediaDevices.enumerateDevices();
+      if (!devs.some((d) => d.kind === 'audiooutput' && d.label)) {
+        const st = await navigator.mediaDevices.getUserMedia({ audio: true });
+        st.getTracks().forEach((t) => t.stop());
+        devs = await navigator.mediaDevices.enumerateDevices();
+      }
+      const outs = devs.filter((d) => d.kind === 'audiooutput');
+      const def = outs.find((d) => d.deviceId === 'default') || outs[0];
+      el.value = def && def.label ? def.label.replace(/^既定\s*-\s*/, '') : '（取得できませんでした）';
+    } catch (_) {
+      el.value = '（取得できませんでした）';
+    }
+  }
+  $('spkReloadBtn').onclick = () => loadSpeaker();
+  $('spkSettingsBtn').onclick = () => window.koeApp.openSoundSettings();
+
   function fill(s) {
     $('localServerExe').value = s.localServerExe || '';
     $('localModelPath').value = s.localModelPath || '';
@@ -1419,6 +1458,7 @@
     $('stayInTray').checked = Boolean(s.stayInTray);              // 既定 false
     $('themeSel').value = ['light', 'dark'].includes(s.theme) ? s.theme : 'system';
     $('useSystemAudio').checked = Boolean(s.useSystemAudio);      // 既定 false
+    loadSpeaker();
     loadMics(s.micId || '');
   }
 

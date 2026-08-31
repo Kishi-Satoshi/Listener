@@ -92,7 +92,7 @@ let meetingTickId = null;
 function startMeetingTick() {
   if (meetingTickId) return;
   meetingTickId = setInterval(() => {
-    if (state === 'meeting') sendToOverlay('overlay:tick', {});
+    if (state === 'meeting' && meeting && !meeting.paused) sendToOverlay('overlay:tick', {});
     else { clearInterval(meetingTickId); meetingTickId = null; }
   }, 5000);
 }
@@ -719,6 +719,8 @@ function meetingStatus() {
     segments: meeting ? meeting.segments : [],
     pending: pendingSegs,
     stoppedAt: meeting && meeting.stoppedAt ? meeting.stoppedAt : null,
+    paused: Boolean(meeting && meeting.paused),
+    pausedMs: meeting ? meeting.pausedMs + (meeting.paused ? Date.now() - meeting.pausedAt : 0) : 0,
     systemAudio: Boolean(meeting && meeting.systemAudio),
   };
 }
@@ -754,7 +756,8 @@ function recoverDraftIfAny() {
 function startMeeting() {
   if (state !== 'idle') return { ok: false, error: '他の処理を実行中です' };
   if (!engineValid(whisperEng)) return { ok: false, error: '文字起こしエンジンが未設定です。設定タブでパスを指定してください。' };
-  meeting = { startedAt: Date.now(), memo: '', segments: [], offsetMs: 0, stopping: false, seq: 0, systemAudio: false };
+  meeting = { startedAt: Date.now(), memo: '', segments: [], offsetMs: 0, stopping: false, seq: 0,
+    systemAudio: false, paused: false, pausedMs: 0, pausedAt: 0 };
   segChain = Promise.resolve(); pendingSegs = 0;
   state = 'meeting';
   writeDraft();
@@ -869,7 +872,9 @@ async function maybeFinalizeMeeting() {
   const m = meeting;
   meeting = null;
 
-  const durationSec = Math.round(((m.stoppedAt || Date.now()) - m.startedAt) / 1000);
+  // 一時停止していた時間は会議の長さに含めない
+  const pausedTotal = m.pausedMs + (m.paused ? Date.now() - m.pausedAt : 0);
+  const durationSec = Math.round(((m.stoppedAt || Date.now()) - m.startedAt - pausedTotal) / 1000);
   const dt = new Date(m.startedAt);
   const fallbackTitle = `${dt.getFullYear()}/${dt.getMonth() + 1}/${dt.getDate()} ${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')} の議事録`;
 
@@ -1211,6 +1216,13 @@ function setupIpc() {
     return { path: p, auto: Boolean(p) && p !== settings.vadModelPath };
   });
   ipcMain.handle('app:open-data-dir', () => { shell.openPath(app.getPath('userData')); return true; });
+  // Windows のサウンド設定を開く。録音されるスピーカーは「既定の再生デバイス」
+  // で決まり、アプリ側から選ぶ手段は無いので、変える場所へ案内する。
+  ipcMain.handle('app:open-sound-settings', () => {
+    // URL は固定。画面から受け取った文字列を開くと、任意のURIを開けてしまう。
+    shell.openExternal('ms-settings:sound').catch(() => {});
+    return true;
+  });
   ipcMain.handle('app:open-releases', () => {
     // URL は REPO 定数から組み立てる。画面から受け取ったURLを開くと、
     // 表示中の文字列次第で任意のページを開けてしまう。
@@ -1254,6 +1266,17 @@ function setupIpc() {
   // 録音側が実際に何を録れているかを受け取る。設定がオンでも、再生デバイスが
   // 無い・他のアプリが排他で掴んでいる等で失敗しうる。黙ってマイクだけで進むと、
   // 会議が終わってから片側しか残っていないことに気づく——それが一番まずい。
+  // 一時停止の状態を受け取る。記録中バーにも出す（オーバーレイを
+  // 隠したまま席を外すと、止めたつもりが録れている／その逆が起きる）。
+  ipcMain.on('overlay:pause', (_e, { paused }) => {
+    if (!meeting) return;
+    if (paused && !meeting.paused) { meeting.paused = true; meeting.pausedAt = Date.now(); }
+    else if (!paused && meeting.paused) {
+      meeting.paused = false;
+      meeting.pausedMs += Date.now() - meeting.pausedAt;
+    }
+    sendToMainWin('meeting:update', meetingStatus());
+  });
   ipcMain.on('overlay:source', (_e, { systemAudio, wanted }) => {
     if (!meeting) return;
     meeting.systemAudio = Boolean(systemAudio);
