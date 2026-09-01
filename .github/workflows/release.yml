@@ -144,17 +144,21 @@ jobs:
           # get-installer.ps1 も添付する。インストーラー本体は大きく、
           # 回線によっては途中で切れるので、続きから取り直せる手段を
           # リリースページ上に置いておく。
+          # setup-*.ps1 も添付する。インストーラーだけでは文字起こしも要約も
+          # 動かない（エンジンが要る）。渡した相手がリポジトリを触らずに
+          # 揃えられるよう、リリースページから直接落とせるようにしておく。
+          SETUP="get-installer.ps1 setup-local-engine.ps1 setup-summarizer.ps1"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "既存のリリースを更新します: $TAG"
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
               --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --latest
-            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$ZIP" get-installer.ps1
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$ZIP" $SETUP
           else
             # タグが無ければ gh がこのコミットに作る。
             # --latest を外すとアプリ側の releases/latest から外れるので必ず付ける。
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" --title "$TAG" \
-              --notes-file "$RUNNER_TEMP/notes.md" --latest "$ZIP" get-installer.ps1
+              --notes-file "$RUNNER_TEMP/notes.md" --latest "$ZIP" $SETUP
           fi
 
       - name: 一時ブランチを片付ける

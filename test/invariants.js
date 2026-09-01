@@ -441,6 +441,21 @@ const INVARIANTS = [
       return v;
     } },
 
+  { id: 'DIST-03', 分類: '配布物',
+    表明: 'リポジトリ内の .ps1 は、括弧と引用符の対応が取れている',
+    由来: '手渡した .ps1 が MissingEndCurlyBrace で動かなかった。文字を切り貼りして .ps1 を直す限り、閉じ忘れは必ずまた起きる。実機に渡る前に機械で止める',
+    check(w) {
+      const fs = require('fs'); const path = require('path');
+      const { scanPs1 } = require('../tools/lib/ps1.js');
+      const v = [];
+      const ps1 = w.trackedFiles().filter((f) => f.endsWith('.ps1'));
+      if (!ps1.length) return ['.ps1 が1つも無い（検査が空振りしている）'];
+      for (const f of ps1) {
+        for (const m of scanPs1(fs.readFileSync(path.join(w.ROOT, f), 'utf8'))) v.push(`${f}: ${m}`);
+      }
+      return v;
+    } },
+
   // ---- 結線 --------------------------------------------------------------
   { id: 'IPC-01', 分類: '結線',
     表明: 'preload が公開する API は、すべて main.js に受け口がある',

@@ -137,8 +137,19 @@ data/
 
 ### インストーラー（配布するならこれ）
 
-リリースページに `Listener-<版>-setup.exe` が添付されています。配布先はこれを
-落として実行するだけです。手元でビルドする必要はありません。
+**渡す相手にはこの1枚を読んでもらえば足ります → [INSTALL.md](INSTALL.md)**
+
+リリースページに次の3つを添付しています。配布先はこれを落とすだけで、
+リポジトリを触る必要も、手元でビルドする必要もありません。
+
+| ファイル | 用途 |
+| --- | --- |
+| `Listener-<版>-setup.exe` | アプリ本体（約75MB） |
+| `setup-local-engine.ps1` | 文字起こしエンジン（約0.6GB）を取ってくる |
+| `setup-summarizer.ps1` | 要約エンジン（約2GB）を取ってくる |
+
+インストーラーだけではエンジンが無いので文字起こしも要約も動かない。
+setup-*.ps1 の2本まで込みで「配布物」だと考えること。
 
 https://github.com/Kishi-Satoshi/Listener/releases/latest
 
@@ -149,6 +160,9 @@ https://github.com/Kishi-Satoshi/Listener/releases/latest
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\get-installer.ps1
 ```
+
+このスクリプトは setup-*.ps1 も同じフォルダに揃えるので、上の3ファイルを
+個別に落とす必要はありません。
 
 この大きなファイルを落とすのは初回だけです。以降の更新は数百KBの差分のみを取得します。
 
@@ -235,7 +249,7 @@ powershell -ExecutionPolicy Bypass -File .\make-release.ps1 -Version 0.8.1
 
 | 層 | 何をするか |
 |---|---|
-| **不変条件**（`test/invariants.js`） | 「この製品では常にこうでなければならない」を32件、表として持つ。HTMLの木・色の対比・透過ウィンドウの禁止事項・復旧の導線・配布物の形式をまとめて検査する |
+| **不変条件**（`test/invariants.js`） | 「この製品では常にこうでなければならない」を33件、表として持つ。HTMLの木・色の対比・透過ウィンドウの禁止事項・復旧の導線・配布物の形式をまとめて検査する |
 | **起動ハーネス**（`test/helpers/`） | 画面のスクリプトを素のNodeで実際に実行し、初期化が例外なく完走することを確かめる。存在しない要素への代入は、ここで落ちる |
 | **変更危険度ゲート**（`tools/risk.js`） | 前の版と比べ「新たに壊れたもの」だけを報告する。既存の例外に対して誤検知が出ない |
 
