@@ -115,3 +115,154 @@ test('設定タブのカードは全部スクロール枠の中にある', () =>
   assert.deepStrictEqual(cards.filter((c) => !c.closest('.scroll')).map((c) => `${c._line}行`), [],
     'スクロール枠の外に出たカードがある（画面に出ない／スクロールで届かない）');
 });
+
+// ================= 文字起こしの編集 =================
+// 行の本文をその場で直せる。保存は blur、Enter で確定、Escape で取り消し。
+// 日本語入力の変換確定 Enter では抜けない。保存に失敗したら元に戻して知らせる。
+const { PAGE } = require('./helpers/replies.js');
+const { STANDUP_SEGMENTS } = require('./fixtures.js');
+const clone = (x) => JSON.parse(JSON.stringify(x));
+
+async function 開いた(extra = {}) {
+  const segs = clone(STANDUP_SEGMENTS);
+  const returns = Object.assign({
+    pageGet: (id) => ({ page: Object.assign(clone(PAGE), { id, title: id === 'p2' ? '二つ目の議事録' : PAGE.title }), segments: segs }),
+    segmentUpdate: (pageId, segId, patch) => ({
+      page: Object.assign(clone(PAGE), { id: pageId }),
+      segments: segs.map((s) => (s.id === segId ? Object.assign({}, s, { text: patch.text }) : s)),
+    }),
+  }, extra);
+  const l = await load(APP, { returns });
+  l.fire('onPageOpen', 'p1');
+  await l.drain();
+  return l;
+}
+const 行 = (l) => l.byId.get('pScript').querySelectorAll('.seg');
+const 本文 = (row) => row.querySelector('.txt');
+const spyBlur = (el) => { let n = 0; el.blur = () => { n++; }; return () => n; };
+
+test('文字起こしの各行が編集できる形で描かれ、出典が飛び先に使う id は据え置き', async () => {
+  const l = await 開いた();
+  const rows = 行(l);
+  assert.strictEqual(rows.length, STANDUP_SEGMENTS.length, '行数が合わない');
+  for (const [i, r] of rows.entries()) {
+    assert.strictEqual(r.id, `seg-${STANDUP_SEGMENTS[i].id}`, '出典チップが飛ぶ id が変わった');
+    const t = 本文(r);
+    assert.ok(t, '本文の要素が無い');
+    assert.strictEqual(t.contentEditable, 'true', `${r.id} が編集できない`);
+    assert.strictEqual(t.textContent, STANDUP_SEGMENTS[i].text);
+  }
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('文を変えて blur すると、その区間だけ保存され、要約側（出典チップ）が描き直される', async () => {
+  const l = await 開いた();
+  const noteBefore = l.byId.get('pNote').childNodes[0];
+  const t = 本文(行(l)[2]);
+  t.textContent = '在庫連携のバッチ処理ですが、性能が出ていません。';
+  t.dispatchEvent({ type: 'blur' });
+  await l.drain();
+  const calls = l.called('segmentUpdate');
+  assert.strictEqual(calls.length, 1, '保存が1回でない');
+  assert.deepStrictEqual(calls[0].args, ['p1', 's3', { text: '在庫連携のバッチ処理ですが、性能が出ていません。' }]);
+  assert.notStrictEqual(l.byId.get('pNote').childNodes[0], noteBefore, '要約タブが描き直されていない（出典チップが古いまま）');
+  // 文字起こし面は描き直さない（次の行の編集を壊さない）
+  assert.strictEqual(本文(行(l)[2]), t, '文字起こし面が描き直された');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('変えずに blur しても保存しない', async () => {
+  const l = await 開いた();
+  本文(行(l)[0]).dispatchEvent({ type: 'blur' });
+  await l.drain();
+  assert.deepStrictEqual(l.called('segmentUpdate'), []);
+});
+
+test('Enter で確定（blur）し、Escape は元の文に戻して抜ける', async () => {
+  const l = await 開いた();
+  const t = 本文(行(l)[1]);
+  const blurs = spyBlur(t);
+  t.dispatchEvent({ type: 'keydown', key: 'Enter' });
+  assert.strictEqual(blurs(), 1, 'Enter で確定しない');
+  t.textContent = '途中まで書いた';
+  t.dispatchEvent({ type: 'keydown', key: 'Escape' });
+  assert.strictEqual(t.textContent, STANDUP_SEGMENTS[1].text, 'Escape で元に戻らない');
+  assert.strictEqual(blurs(), 2, 'Escape で抜けない');
+});
+
+test('日本語入力の変換確定 Enter では抜けない（isComposing / keyCode 229）', async () => {
+  const l = await 開いた();
+  const t = 本文(行(l)[1]);
+  const blurs = spyBlur(t);
+  t.dispatchEvent({ type: 'keydown', key: 'Enter', isComposing: true });
+  t.dispatchEvent({ type: 'keydown', key: 'Enter', keyCode: 229 });
+  assert.strictEqual(blurs(), 0, '変換確定の Enter で編集が終わってしまう');
+});
+
+test('保存に失敗したら知らせて、画面の文を元に戻す', async () => {
+  const l = await 開いた({ segmentUpdate: () => null });
+  const t = 本文(行(l)[4]);
+  t.textContent = '保存できない文';
+  t.dispatchEvent({ type: 'blur' });
+  await l.drain();
+  assert.ok(/保存できませんでした/.test(l.byId.get('toast').textContent), 'toast が出ない');
+  assert.strictEqual(t.textContent, STANDUP_SEGMENTS[4].text, '失敗したのに画面の文が新しいまま（保存されたように見える）');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('編集中に page:updated が来ても、文字起こし面を描き直さない', async () => {
+  const l = await 開いた();
+  const row = 行(l)[3];
+  const t = 本文(row);
+  t.dispatchEvent({ type: 'focus' });
+  assert.ok(row.classList.contains('editing'), '編集中の印が付かない');
+  l.fire('onPageUpdated', { page: clone(PAGE), segments: clone(STANDUP_SEGMENTS) });
+  await l.drain();
+  assert.strictEqual(行(l)[3], row, '編集中の行が作り直された（入力中の文が消える）');
+  t.dispatchEvent({ type: 'blur' });
+  assert.ok(!row.classList.contains('editing'), '編集を抜けたのに印が残る');
+});
+
+test('保存中に別のページへ移ったら、遅れて戻ってきた古いページの結果で画面を上書きしない', async () => {
+  const segs = clone(STANDUP_SEGMENTS);
+  const l = await 開いた({
+    pageGet: (id) => ({
+      page: Object.assign(clone(PAGE), { id, title: id === 'p2' ? '二つ目の議事録' : PAGE.title, blocks: id === 'p2' ? [{ id: 'q1', type: 'bullet', text: '二つ目の要点', cites: [] }] : PAGE.blocks }),
+      segments: segs,
+    }),
+    // 保存の応答が、ページ切替より後に届く
+    segmentUpdate: () => new Promise((res) => setTimeout(() => res({
+      page: Object.assign(clone(PAGE), { blocks: [{ id: 'o1', type: 'bullet', text: '古いページの保存結果', cites: [] }] }),
+      segments: segs,
+    }), 10)),
+  });
+  const t = 本文(行(l)[0]);
+  t.textContent = '別の文';
+  t.dispatchEvent({ type: 'blur' });         // 保存が走り始める（応答は 10ms 後）
+  l.fire('onPageOpen', 'p2');                // その直後にページ切替
+  await l.drain();
+  const texts = () => l.byId.get('pNote').querySelectorAll('.txt').map((e) => e.textContent);
+  assert.deepStrictEqual(texts(), ['二つ目の要点'], '切替が反映されていない（前提）');
+  await new Promise((r) => setTimeout(r, 30));   // 古い保存の応答が届く
+  await l.drain();
+  assert.deepStrictEqual(texts(), ['二つ目の要点'], '古いページの保存結果で要約タブが上書きされた');
+  assert.strictEqual(l.byId.get('pTitle').textContent, '二つ目の議事録');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('空にした行はコピーに含めない', async () => {
+  const l = await 開いた();
+  const t = 本文(行(l)[0]);
+  t.textContent = '';
+  t.dispatchEvent({ type: 'blur' });
+  await l.drain();
+  l.byId.get('paneBtnScript').dispatchEvent({ type: 'click' });
+  const copyBtn = l.byId.get('pActs').querySelectorAll('button').find((b) => b.textContent === 'コピー');
+  assert.ok(copyBtn, 'コピーのボタンが無い');
+  copyBtn.dispatchEvent({ type: 'click' });
+  await l.drain();
+  const c = l.called('copy');
+  assert.strictEqual(c.length, 1);
+  assert.ok(!/\[0:00\] *\n/.test(c[0].args[0] + '\n'), '空の行が [0:00] だけで写っている');
+  assert.ok(c[0].args[0].includes(STANDUP_SEGMENTS[1].text), '残りの行が写っていない');
+});

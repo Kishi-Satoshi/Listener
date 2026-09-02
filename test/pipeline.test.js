@@ -167,3 +167,28 @@ test('文字起こしが空でも出典付与が落ちない', () => {
   assert.strictEqual(r.citeStat.linked, 0);
   assert.ok(r.blocks.length > 0);
 });
+
+// ---------------------------------------------------------------- 文字起こしの編集
+// 認識ミスで崩れた区間を人が直したら、その区間を根拠にすべき要点に出典が付き直る。
+// 他の要点の出典は動かない（人が書き直した要点の出典が消える事故を防ぐ）。
+test('崩れていた区間を直すと、その要点の出典が正しい発言へ移る。他の要点は動かない', () => {
+  const { refreshCitations } = require('../src/cite');
+  const broken = STANDUP_SEGMENTS.map((s) =>
+    (s.id === 's6' ? { ...s, text: 'ご視聴ありがとうございました。' } : s));   // 無音区間で whisper が出す定番の幻聴
+  const { blocks } = runPipeline(STANDUP_SUMMARY_MD, broken, BASE);
+  const find = (needle) => blocks.find((b) => (b.type === 'bullet' || b.type === 'todo') && b.text.includes(needle));
+  const hiring = find('応募は8名');
+  assert.ok(hiring, '対象の要点が見つからない');
+  assert.ok(!hiring.cites.includes('s6'), `前提が崩れた（崩れた文に一致してしまう）: ${JSON.stringify(hiring.cites)}`);
+  const before = new Map(blocks.map((b) => [b.id, JSON.stringify(b.cites || [])]));
+
+  const stat = refreshCitations(blocks, STANDUP_SEGMENTS, 's6');
+  assert.ok(hiring.cites.includes('s6'), `直したのに s6 を指さない: ${JSON.stringify(hiring.cites)}`);
+  for (const b of blocks) {
+    if (b === hiring) continue;
+    assert.strictEqual(JSON.stringify(b.cites || []), before.get(b.id), `編集と無関係な要点「${b.text}」の出典が動いた`);
+  }
+  const ids = new Set(STANDUP_SEGMENTS.map((s) => s.id));
+  for (const b of blocks) for (const c of b.cites || []) assert.ok(ids.has(c), `存在しない id ${c}`);
+  assert.ok(stat.total > 0 && stat.linked <= stat.total);
+});

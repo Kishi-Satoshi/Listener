@@ -230,6 +230,12 @@
     flex: none; padding-top: 3px; min-width: 44px; }
   .seg.hit { background: rgba(91,110,225,.16); box-shadow: 0 0 0 2px rgba(91,110,225,.3); }
   .seg.failed { color: var(--danger); }
+  /* 行の本文はクリックで編集できる。地色は .blk .txt と同じトークン（ダークで実機確認済み） */
+  .seg .txt { flex: 1; min-width: 0; outline: none; border-radius: 6px; padding: 0 4px; word-break: break-word; cursor: text; }
+  .seg .txt:hover { background: rgba(var(--srf),.5); }
+  .seg.editing { background: rgba(var(--srf),.92); box-shadow: 0 0 0 2px rgba(91,110,225,.3); }
+  .seg .txt:empty { min-width: 6em; }
+  .seg .txt:empty::before { content: '（削除済み）'; color: var(--faint); }
 
   /* ---------- 進行中バー ---------- */
   .live { display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
@@ -826,6 +832,7 @@
 
   // ================= 議事録: ページ =================
   async function openPage(id) {
+    flushSegEdit();
     const r = await window.koeApp.pageGet(id);
     if (!r) { toast('ページが見つかりません'); return; }
     curId = id; curPage = r.page; curSegs = r.segments;
@@ -898,15 +905,7 @@
       refreshList();
     };
 
-    const props = $('pProps'); props.textContent = '';
-    const add = (t, color) => { const s = document.createElement('span'); s.textContent = t; if (color) s.style.color = color; props.appendChild(s); };
-    add(`📅 ${new Date(curPage.createdAt).toLocaleString('ja-JP')}`);
-    add(`⏱ ${fmtDur(curPage.durationSec || 0)}`);
-    add(`💬 ${curSegs.length} 区間`);
-    const st = curPage.citeStat;
-    if (st && st.total) add(`🔗 出典 ${st.linked}/${st.total}`, st.linked === st.total ? 'var(--green)' : '');
-    const ast = curPage.actionStat;
-    if (ast && ast.total) add(`✅ アクション ${ast.total}（担当${ast.withAssignee} / 期限${ast.withDue}）`);
+    renderProps();
 
     const acts = $('pActs'); acts.textContent = '';
     const mk = (label, fn, primary) => {
@@ -926,7 +925,8 @@
     mk('コピー', async () => {
       let text = ''; let what = '';
       if (pane === 'script') {
-        text = curSegs.map((sg) => `[${fmtClock(sg.atMs)}] ${sg.text}`).join('\n');
+        // 空にした行（実質の削除）は写さない
+        text = curSegs.filter((sg) => sg.text).map((sg) => `[${fmtClock(sg.atMs)}] ${sg.text}`).join('\n');
         what = '文字起こし';
       } else if (pane === 'memo') {
         // 保存は500ms遅れで走るので、書いた直後に押すと保存前の古い値を
@@ -1167,8 +1167,36 @@
     }
   }
 
+  // 日付・所要時間・区間数・出典・アクションの行。文字起こしを直したあと
+  // 「🔗 出典 x/y」だけ描き直したいので、renderPage から切り出してある。
+  function renderProps() {
+    const props = $('pProps'); props.textContent = '';
+    const add = (t, color) => { const s = document.createElement('span'); s.textContent = t; if (color) s.style.color = color; props.appendChild(s); };
+    add(`📅 ${new Date(curPage.createdAt).toLocaleString('ja-JP')}`);
+    add(`⏱ ${fmtDur(curPage.durationSec || 0)}`);
+    add(`💬 ${curSegs.length} 区間`);
+    const st = curPage.citeStat;
+    if (st && st.total) add(`🔗 出典 ${st.linked}/${st.total}`, st.linked === st.total ? 'var(--green)' : '');
+    const ast = curPage.actionStat;
+    if (ast && ast.total) add(`✅ アクション ${ast.total}（担当${ast.withAssignee} / 期限${ast.withDue}）`);
+  }
+
+  // 編集中の行があれば確定させる。Chromium はフォーカス中の要素を DOM から外しても
+  // blur を発火しないので、#pScript を空にする前（ページ切替・記録開始）にここを通す。
+  function flushSegEdit() {
+    const ed = $('pScript').querySelector('.seg.editing');
+    if (!ed) return;
+    ed.classList.remove('editing');
+    const t = ed.querySelector('.txt');
+    if (t) t.blur();
+  }
+
   function renderScript() {
-    const box = $('pScript'); box.textContent = '';
+    const box = $('pScript');
+    // 編集中は描き直さない。要約完了などで page:updated が来ても、入力中の行を失わない。
+    // main は createPage のあと文字起こしを書き換えないので、いま画面にある文で正しい。
+    if (box.querySelector('.seg.editing')) return;
+    box.textContent = '';
     if (!curSegs.length) {
       const d = document.createElement('div'); d.className = 'empty'; d.textContent = '文字起こしがありません';
       box.appendChild(d); return;
@@ -1178,7 +1206,39 @@
       el.className = 'seg' + (s.failed ? ' failed' : '');
       el.id = `seg-${s.id}`;
       const at = document.createElement('span'); at.className = 'at'; at.textContent = fmtClock(s.atMs);
-      const tx = document.createElement('span'); tx.textContent = s.text;
+      const tx = document.createElement('span');
+      tx.className = 'txt'; tx.contentEditable = 'true'; tx.spellcheck = false; tx.title = 'クリックで編集';
+      tx.textContent = s.text;
+      tx.onfocus = () => el.classList.add('editing');
+      tx.onkeydown = (ev) => {
+        // 日本語入力の変換確定 Enter を「保存して抜ける」にしない
+        if (ev.isComposing || ev.keyCode === 229) return;
+        if (ev.key === 'Enter') { ev.preventDefault(); tx.blur(); }
+        else if (ev.key === 'Escape') { ev.preventDefault(); tx.textContent = s.text; tx.blur(); }
+      };
+      tx.onblur = async () => {
+        el.classList.remove('editing');
+        const pid = curId;
+        const prev = String(s.text || '');
+        const v = tx.textContent.trim();
+        if (v === prev.trim()) return;
+        try {
+          const r = await window.koeApp.segmentUpdate(pid, s.id, { text: v });
+          if (!r) throw new Error('segment not found');
+          if (pid !== curId) return;                     // 保存中に別のページへ移った
+          s.text = v; delete s.failed; el.classList.remove('failed');
+          if (!v) tx.textContent = '';                   // 残った <br> を消して「（削除済み）」を出す
+          // onPageUpdated は curSegs を丸ごと差し替えるので、閉包の s ではなく id で当て直す
+          const cur = curSegs.find((x) => x.id === s.id);
+          if (cur && cur !== s) { cur.text = v; delete cur.failed; }
+          curPage = r.page;
+          renderBlocks(); renderProps();                 // 出典チップと「🔗 出典」だけ。文字起こし面は触らない
+          if (filter === 'full') refreshList();          // 文字起こし検索の一覧は本文の抜粋を出している
+        } catch (e) {
+          toast('変更を保存できませんでした');
+          if (pid === curId) tx.textContent = prev;
+        }
+      };
       el.append(at, tx);
       box.appendChild(el);
     }
@@ -1237,6 +1297,7 @@
     // 新しい記録が始まったように見えない。
     // （記録中に一覧から過去の議事録を開き直すのは今までどおりできる）
     if (st.active && !mtWasActive && curId) {
+      flushSegEdit();
       curId = null; curPage = null; curSegs = [];
       renderList(); renderPage();
     }

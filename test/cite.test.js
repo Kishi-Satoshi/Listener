@@ -8,7 +8,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { attachCitations, buildIndex, matchOne, bigrams, normalize } = require('../src/cite');
+const { attachCitations, refreshCitations, buildIndex, matchOne, bigrams, normalize } = require('../src/cite');
 
 const SEGS = [
   { id: 's1', atMs: 0, text: '在庫連携のバッチ処理ですが、1万件の取り込みに4分かかっています。' },
@@ -147,4 +147,86 @@ test('装飾が付いていても同じ発言に当たる', () => {
   assert.deepStrictEqual(decorated.map((h) => h.id), plain.map((h) => h.id),
     '装飾の有無で出典が変わってはいけない');
   assert.ok(plain.length > 0, '素の文でも出典が付いていない（前提が崩れている）');
+});
+
+// ---------------------------------------------------------------- 文字起こしの編集後の付け直し
+// 文字起こしを直したあと、全要点を引き直してはいけない。人が自分の言葉に書き直した
+// 要点（updateBlock は出典を触らない）が再照合で「根拠なし」に落ちるため。
+// 触ってよいのは「その区間を根拠にしていた要点」と「根拠なしの要点」だけ。
+
+function mkBlocks() {
+  return [
+    { id: 'h1', type: 'heading', text: '進捗', cites: [] },
+    { id: 'b1', type: 'bullet', text: '在庫連携のバッチは1万件の取り込みに4分かかっている', cites: [] },
+    { id: 'b2', type: 'bullet', text: '採用の応募は今月8名、一次面接に進んだのは3名', cites: [] },
+    { id: 'b3', type: 'bullet', text: 'リリース日は11月15日で確定', cites: [] },
+  ];
+}
+
+test('refreshCitations: 編集した区間を根拠にしていない要点の出典は、1文字も動かない', () => {
+  const blocks = mkBlocks();
+  attachCitations(blocks, SEGS);
+  // b1 を人が自分の言葉に書き直した想定。再照合すると根拠なしに落ちる文にする
+  const b1 = blocks.find((b) => b.id === 'b1');
+  assert.deepStrictEqual(b1.cites, ['s1']);
+  b1.text = '性能問題は継続調査';
+  const before = JSON.parse(JSON.stringify(blocks.map((b) => b.cites)));
+  // s2（採用）を編集した → s1 を根拠にしていた b1 は触らない
+  refreshCitations(blocks, SEGS, 's2');
+  assert.deepStrictEqual(b1.cites, ['s1'], '編集していない区間の出典が動いた');
+  assert.deepStrictEqual(blocks.find((b) => b.id === 'b3').cites, before[3]);
+});
+
+test('refreshCitations: 編集した区間を根拠にしていた要点は再照合される（根拠が消えれば外れる）', () => {
+  const blocks = mkBlocks();
+  attachCitations(blocks, SEGS);
+  const b2 = blocks.find((b) => b.id === 'b2');
+  assert.deepStrictEqual(b2.cites, ['s2']);
+  // s2 の本文を空にした（実質の削除）
+  const segs = SEGS.map((s) => (s.id === 's2' ? { ...s, text: '' } : s));
+  const r = refreshCitations(blocks, segs, 's2');
+  assert.deepStrictEqual(b2.cites, [], '根拠が消えたのにリンクが残っている');
+  assert.strictEqual(r.total, 3);
+  assert.strictEqual(r.linked, 2);
+});
+
+test('refreshCitations: 根拠なしだった要点は、区間を直したあとに出典が付く', () => {
+  // 認識ミスで s2 が崩れている状態から始める
+  const broken = SEGS.map((s) => (s.id === 's2' ? { ...s, text: '再曜の往復は今月八名でした。位置面接まで済んだのが参名です。' } : s));
+  const blocks = mkBlocks();
+  attachCitations(blocks, broken);
+  const b2 = blocks.find((b) => b.id === 'b2');
+  assert.deepStrictEqual(b2.cites, [], '前提が崩れた（崩れた文に一致してしまう）');
+  // 人が s2 を直した
+  const r = refreshCitations(blocks, SEGS, 's2');
+  assert.deepStrictEqual(b2.cites, ['s2'], '直したのに出典が付かない');
+  assert.strictEqual(r.linked, 3);
+});
+
+test('refreshCitations: 全ての出典が実在する区間を指す', () => {
+  const blocks = mkBlocks();
+  attachCitations(blocks, SEGS);
+  refreshCitations(blocks, SEGS, 's3');
+  const ids = new Set(SEGS.map((s) => s.id));
+  for (const b of blocks) for (const c of b.cites || []) assert.ok(ids.has(c), `存在しない id ${c}`);
+});
+
+test('refreshCitations: 二度掛けても結果が変わらない（冪等）', () => {
+  const blocks = mkBlocks();
+  attachCitations(blocks, SEGS);
+  blocks.find((b) => b.id === 'b1').text = '性能問題は継続調査';
+  const r1 = refreshCitations(blocks, SEGS, 's2');
+  const snap = JSON.stringify(blocks.map((b) => b.cites));
+  const r2 = refreshCitations(blocks, SEGS, 's2');
+  assert.strictEqual(JSON.stringify(blocks.map((b) => b.cites)), snap);
+  assert.deepStrictEqual(r1, r2);
+});
+
+test('refreshCitations: 区間が空なら {0,0} を返し、出典に触らない', () => {
+  const blocks = mkBlocks();
+  attachCitations(blocks, SEGS);
+  const snap = JSON.stringify(blocks.map((b) => b.cites));
+  const r = refreshCitations(blocks, [], 's1');
+  assert.deepStrictEqual(r, { linked: 0, total: 0 });
+  assert.strictEqual(JSON.stringify(blocks.map((b) => b.cites)), snap);
 });

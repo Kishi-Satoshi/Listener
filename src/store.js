@@ -177,6 +177,20 @@ function updateBlock(pageId, blockId, patch) {
   return savePage(page);
 }
 
+// 文字起こし1区間の本文を直す。id と atMs は変えない（出典チップと時刻表示が id で引くため）。
+// ページ本体（page.json）と出典は触らない。出典の引き直しとページ保存は main 側が1回だけ行う。
+function updateSegment(pageId, segId, patch) {
+  const segments = getTranscript(pageId);
+  const s = segments.find((x) => x.id === segId);
+  if (!s) return null;
+  if (typeof patch.text === 'string') {
+    s.text = patch.text;
+    delete s.failed;   // 「認識に失敗」の行を人が書き直したら、要約の材料に戻す
+  }
+  saveTranscript(pageId, segments);
+  return segments;
+}
+
 function insertBlock(pageId, afterBlockId, type) {
   const page = getPage(pageId);
   if (!page) return null;
@@ -305,7 +319,7 @@ module.exports = {
   init, newId,
   listPages, getPage, getTranscript, savePage, saveTranscript,
   createPage, deletePage,
-  updateBlock, insertBlock, removeBlock, moveBlock, setTitle,
+  updateBlock, updateSegment, insertBlock, removeBlock, moveBlock, setTitle,
   searchIndex, searchFullText, openActions, assigneeList,
   readDraft, writeDraft, clearDraft,
 };

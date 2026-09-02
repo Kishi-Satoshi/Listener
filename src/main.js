@@ -18,7 +18,7 @@ const os = require('os');
 const { execFile, spawn } = require('child_process');
 
 const store = require('./store');
-const { attachCitations } = require('./cite');
+const { attachCitations, refreshCitations } = require('./cite');
 const mtype = require('./meetingType');
 const { enrichActionBlocks } = require('./actions');
 const updater = require('./updater');
@@ -917,7 +917,7 @@ async function runSummary(pageId) {
   };
   const page = store.getPage(pageId);
   if (!page) { clearUi(); return { ok: false, error: 'ページが見つかりません' }; }
-  const segments = store.getTranscript(pageId);
+  let segments = store.getTranscript(pageId);   // 出典付与の直前に読み直して差し替える（下記）
   const usable = segments.filter((s) => !s.failed);
   const plain = usable.map((s) => s.text).join('\n');
 
@@ -972,10 +972,15 @@ async function runSummary(pageId) {
     // 「（担当: ○○ / 期限: ○○）」を落とした本文に対して行いたい。
     // 書式が残ったままだと、その語がクエリに混ざって一致がぶれる。
     const actStat = enrichActionBlocks(blocks, new Date(page.createdAt));
-    const stat = attachCitations(blocks, usable);
+    // 要約は数分かかる。その間に文字起こしが編集されているかもしれないので、
+    // 出典は読み込み時の配列ではなく、いまディスクにある文字起こしに対して付ける。
+    // 画面へ返す segments も同じもの（古い配列を返すと、編集した行が画面上で戻る）。
+    const fresh = store.getTranscript(pageId);
+    const stat = attachCitations(blocks, fresh.filter((s) => !s.failed));
+    segments = fresh;
 
-    // 要約は数分かかる。その間にタイトルやメモが編集されているかもしれないので、
-    // 読み込み時のページを丸ごと書き戻さず、生成物だけを最新のページに載せる。
+    // 同じ理由で、タイトルやメモも読み込み時のページを丸ごと書き戻さず、
+    // 生成物だけを最新のページに載せる。
     const saved = store.getPage(pageId) || page;
     saved.blocks = blocks;
     saved.meetingType = page.meetingType;
@@ -1209,6 +1214,18 @@ function setupIpc() {
   ipcMain.handle('block:insert', (_e, { pageId, afterBlockId, type }) => store.insertBlock(pageId, afterBlockId, type));
   ipcMain.handle('block:remove', (_e, { pageId, blockId }) => store.removeBlock(pageId, blockId));
   ipcMain.handle('block:move', (_e, { pageId, blockId, toIndex }) => store.moveBlock(pageId, blockId, toIndex));
+  // 文字起こしの1区間を直す。その区間を根拠にしていた要点と根拠なしの要点だけ出典を引き直す。
+  // page:updated は送らない。送ると画面が文字起こし面を全部描き直し、次の行の編集を壊す。
+  // 戻り値（page:get と同じ形）で画面側が要約タブの出典チップだけを描き直す。
+  ipcMain.handle('segment:update', (_e, { pageId, segId, patch }) => {
+    const segments = store.updateSegment(pageId, segId, patch || {});
+    if (!segments) return null;
+    const page = store.getPage(pageId);
+    if (!page) return null;
+    if (page.blocks.length) page.citeStat = refreshCitations(page.blocks, segments.filter((s) => !s.failed), segId);
+    store.savePage(page);
+    return { page, segments };
+  });
   ipcMain.handle('block:setAction', (_e, { pageId, blockId, assignee, dueRaw }) => {
     const p = store.getPage(pageId); if (!p) return null;
     const b = p.blocks.find((x) => x.id === blockId); if (!b) return null;

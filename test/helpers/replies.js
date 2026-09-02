@@ -43,6 +43,7 @@ module.exports = {
   pageSummarize: { ok: true, page: PAGE },
   pageSetType: PAGE, pageSetTitle: PAGE, pageSetMemo: PAGE, pageDelete: { ok: true },
   blockUpdate: PAGE, blockInsert: PAGE, blockRemove: PAGE, blockMove: PAGE,
+  segmentUpdate: { page: PAGE, segments: F.STANDUP_SEGMENTS },
   blockSetAction: { ok: true },
   copy: { ok: true }, toggleRecording: { ok: true }, meetingToggle: { ok: true }, meetingDiscard: { ok: true },
   openDataDir: { ok: true }, openSoundSettings: { ok: true }, openReleases: { ok: true }, restart: { ok: true },

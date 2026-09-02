@@ -119,4 +119,39 @@ function attachCitations(blocks, segments, opts) {
   return { linked, total };
 }
 
-module.exports = { attachCitations, buildIndex, matchOne, bigrams, normalize };
+/**
+ * 1区間の本文が編集された後の、出典の付け直し。
+ *
+ * 全要点を引き直さない。理由は2つ。
+ *  - 人が自分の言葉に書き直した要点（updateBlock は出典を触らない）を再照合すると
+ *    閾値に届かず「根拠なし」に落ちる。編集していない行の出典が消えるのは事故。
+ *  - IDF は全区間で決まるので、1区間の変更で無関係な行が閾値の境目で反転しうる。
+ *
+ * 触るのは「その区間を根拠にしていた要点」と「根拠なしの要点」だけ。
+ * それ以外の要点の cites はそのまま戻す。決定的で、二度掛けても結果は変わらない。
+ * @returns {{linked:number, total:number}}
+ */
+function refreshCitations(blocks, segments, segId) {
+  const keep = new Map();
+  for (const b of blocks) {
+    if (Array.isArray(b.cites) && b.cites.length && !b.cites.includes(segId)) keep.set(b.id, b.cites.slice());
+  }
+  const r = attachCitations(blocks, segments, undefined);
+  for (const b of blocks) {
+    if (!keep.has(b.id)) continue;
+    // 直した区間が新たに根拠になった要点は、新しい結果を採る。
+    // 崩れた区間のせいで隣の発言を指していた要点が、直した後に正しい発言へ移る経路。
+    if (Array.isArray(b.cites) && b.cites.includes(segId)) continue;
+    b.cites = keep.get(b.id);
+  }
+  if (r.total === 0) return { linked: 0, total: 0 };
+  let linked = 0;
+  for (const b of blocks) {
+    if (b.type !== 'bullet' && b.type !== 'todo') continue;
+    if (!b.text || normalize(b.text).length < 6) continue;
+    if (Array.isArray(b.cites) && b.cites.length) linked++;
+  }
+  return { linked, total: r.total };
+}
+
+module.exports = { attachCitations, refreshCitations, buildIndex, matchOne, bigrams, normalize };
