@@ -62,6 +62,7 @@ contextBridge.exposeInMainWorld('koeApp', {
   blockInsert: (pageId, afterBlockId, type) => ipcRenderer.invoke('block:insert', { pageId, afterBlockId, type }),
   blockRemove: (pageId, blockId) => ipcRenderer.invoke('block:remove', { pageId, blockId }),
   blockMove: (pageId, blockId, toIndex) => ipcRenderer.invoke('block:move', { pageId, blockId, toIndex }),
+  hotkeyState: () => ipcRenderer.invoke('hotkey:state'),
   segmentUpdate: (pageId, segId, patch) => ipcRenderer.invoke('segment:update', { pageId, segId, patch }),
 
   // 議事録セッション

@@ -23,7 +23,16 @@ const mtype = require('./meetingType');
 const { enrichActionBlocks } = require('./actions');
 const updater = require('./updater');
 const { chooseDisplayMedia } = require('./loopback');
-const { markdownToBlocks, dropRedundantEmpty } = require('./minutes');
+const minutes = require('./minutes');
+const { markdownToBlocks, dropRedundantEmpty } = minutes;
+// テンプレートの写し（見出しだけ・雛形そのまま）を落とす。minutes.js 側に
+// まだ無い版でも動くよう、無ければ素通しにする。
+const dropTemplateEcho = minutes.dropTemplateEcho || ((b) => b);
+const { normalizeSettings } = require('./settings');
+const {
+  saveIfExists, meetingDurationSec, promptTail,
+  registerHotkeys, hotkeyFailureMessage, resolveStartupHotkeys,
+} = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
 const CPU_DEFAULT_THREADS = Math.max(4, os.cpus().length - 2);
@@ -92,8 +101,11 @@ let meetingTickId = null;
 function startMeetingTick() {
   if (meetingTickId) return;
   meetingTickId = setInterval(() => {
-    if (state === 'meeting' && meeting && !meeting.paused) sendToOverlay('overlay:tick', {});
-    else { clearInterval(meetingTickId); meetingTickId = null; }
+    // 見張りを消すのは議事録が無くなったときだけ。一時停止は送信を飛ばすだけにする。
+    // 一時停止で消すと、再開しても誰も起こし直さず、以後の区切りが画面の
+    // 間引かれるタイマー任せに戻る（1区間が9分になる元の不具合が再発する）。
+    if (state !== 'meeting' || !meeting) { clearInterval(meetingTickId); meetingTickId = null; return; }
+    if (!meeting.paused) sendToOverlay('overlay:tick', {});
   }, 5000);
 }
 function applyTheme() {
@@ -159,7 +171,9 @@ const persistSettings = () => saveJson(settingsPath(), settings);
 const persistHistory = () => saveJson(historyPath(), history);
 
 function loadStores() {
-  settings = { ...DEFAULT_SETTINGS, ...loadJson(settingsPath(), {}) };
+  // 保存時と同じ正規化を通す。手で編集された settings.json のポートが文字列や
+  // 範囲外だと、起動直後だけ正規化をすり抜けてエンジンの起動待ちが静かに失敗する。
+  settings = normalizeSettings({ ...DEFAULT_SETTINGS, ...loadJson(settingsPath(), {}) }, DEFAULT_SETTINGS);
   if (CPU_DEFAULT_THREADS > CPU_OLD_DEFAULT_THREADS) {
     if (settings.localThreads === CPU_OLD_DEFAULT_THREADS) settings.localThreads = CPU_DEFAULT_THREADS;
     if (settings.sumThreads === CPU_OLD_DEFAULT_THREADS) settings.sumThreads = CPU_DEFAULT_THREADS;
@@ -343,7 +357,17 @@ function ensureEngineReady(eng) {
       try {
         const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
         if (res.ok || res.status === 404) { eng.ready = true; return true; }
-      } catch (_) { /* 起動中 */ }
+      } catch (e) {
+        // 接続先の URL 自体が組み立てられない（ポートが不正）なら、90秒待っても
+        // 直らない。「起動中」と区別して設定の問題だと分かる文で返す。
+        // 接続拒否も TypeError（fetch failed）で来るので、URL の解析失敗だけを見る。
+        if (e instanceof TypeError && /URL/i.test(e.message)) {
+          eng.lastError = `${eng.name}の接続先（ポート設定）が不正です`;
+          engineLog(`${eng.lastError}: ${url}`);
+          return false;
+        }
+        /* 起動中 */
+      }
       await new Promise((r) => setTimeout(r, 400));
     }
     if (!eng.lastError) {
@@ -436,22 +460,29 @@ async function llmChat(messages, maxTokens, onWait) {
   return { text, truncated };
 }
 
+// 節ごとに「なければ特になし」と書くと、小型モデルが条件を守り切れず
+// 実項目と「特になし」を両方並べてくる。ルールは全体で1回だけ言う。
+// （それでも混ざるので minutes.js の dropRedundantEmpty で後始末する）
+// 装飾を禁じるのは見た目のためではない。「**」が残ると出典の一致が
+// 薄まり、短い要点でリンクが消えるため。
+const OUTPUT_RULE = '書き方のきまり:\n'
+  + '- 該当する内容が本当に一つも無い見出しにだけ「特になし」と書く。'
+  + '一つでも書くことがあれば「特になし」は書かない。\n'
+  + '- 太字（**）や斜体などの装飾は使わない。素の文章で書く。\n'
+  + '- 文体は報告文書として使える常体で書く。「です」「ます」は使わない。\n'
+  // 3Bクラスは指示より例をまねる。会話体の文字起こしに引きずられて
+  // 「です・ます」で書いてくるので、良い例と悪い例を1組だけ見せる。
+  + '  良い例: 「結合テストは今週で完了。不具合22件のうち20件は修正済み。残り2件は来週対応。」\n'
+  + '  悪い例: 「完了しました」「修正されました」「お願いします」「持ち越します」';
+
+// プロンプトに入れる議事録の書式（見出しの雛形 + 書き方のきまり）。
+// 要約後にテンプレートの写しを落とす（dropTemplateEcho）ときも同じ文字列を
+// 渡す。別々に組み立てると、片方を直したときにずれて落とし損ねる。
+function minutesTemplate(type) {
+  return `${mtype.getFormat(type)}\n\n${OUTPUT_RULE}`;
+}
+
 async function generateMinutes(plain, memo, onProgress, type) {
-  const MINUTES_FORMAT = mtype.getFormat(type);
-  // 節ごとに「なければ特になし」と書くと、小型モデルが条件を守り切れず
-  // 実項目と「特になし」を両方並べてくる。ルールは全体で1回だけ言う。
-  // （それでも混ざるので minutes.js の dropRedundantEmpty で後始末する）
-  // 装飾を禁じるのは見た目のためではない。「**」が残ると出典の一致が
-  // 薄まり、短い要点でリンクが消えるため。
-  const OUTPUT_RULE = '書き方のきまり:\n'
-    + '- 該当する内容が本当に一つも無い見出しにだけ「特になし」と書く。'
-    + '一つでも書くことがあれば「特になし」は書かない。\n'
-    + '- 太字（**）や斜体などの装飾は使わない。素の文章で書く。\n'
-    + '- 文体は報告文書として使える常体で書く。「です」「ます」は使わない。\n'
-    // 3Bクラスは指示より例をまねる。会話体の文字起こしに引きずられて
-    // 「です・ます」で書いてくるので、良い例と悪い例を1組だけ見せる。
-    + '  良い例: 「結合テストは今週で完了。不具合22件のうち20件は修正済み。残り2件は来週対応。」\n'
-    + '  悪い例: 「完了しました」「修正されました」「お願いします」「持ち越します」';
   const ok = await ensureEngineReady(sumEng);
   if (!ok) throw new Error(sumEng.lastError || '要約エンジンが起動していません');
   const llmChatP = (messages, maxTokens) => llmChat(messages, maxTokens, onProgress);
@@ -468,7 +499,7 @@ async function generateMinutes(plain, memo, onProgress, type) {
   if (plain.length + memoBlock.length <= CHUNK + 1500) {
     const one = await llmChatP([
       { role: 'system', content: sys },
-      { role: 'user', content: `${memoBlock}【会議の文字起こし】\n${plain}\n\n上記から、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${MINUTES_FORMAT}\n\n${OUTPUT_RULE}` },
+      { role: 'user', content: `${memoBlock}【会議の文字起こし】\n${plain}\n\n上記から、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${minutesTemplate(type)}` },
     ], SUM_MAX_TOKENS);
     return { md: one.text, truncated: one.truncated };
   }
@@ -493,7 +524,7 @@ async function generateMinutes(plain, memo, onProgress, type) {
   if (onProgress) onProgress('議事録をまとめています…');
   const final = await llmChatP([
     { role: 'system', content: sys },
-    { role: 'user', content: `${memoBlock}【会議の要点メモ（時系列）】\n${notes.join('\n\n')}\n\n上記の要点メモを統合し、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${MINUTES_FORMAT}\n\n${OUTPUT_RULE}` },
+    { role: 'user', content: `${memoBlock}【会議の要点メモ（時系列）】\n${notes.join('\n\n')}\n\n上記の要点メモを統合し、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${minutesTemplate(type)}` },
   ], SUM_MAX_TOKENS);
   return { md: final.text, truncated: truncated || final.truncated };
 }
@@ -796,6 +827,14 @@ function stopMeeting() {
   // 会議の長さはここまで。以降の文字起こし待ちを所要時間に混ぜると、
   // 実際の会議時間が分からなくなる（4分の会議が12分と記録されていた）。
   meeting.stoppedAt = Date.now();
+  // 一時停止したまま停止したら、停止時刻で一時停止を締める。開けたままだと
+  // 所要時間の計算が「今」まで一時停止として引き、文字起こし待ちの分だけ
+  // 短くなる（待ちが長いと負になる）。
+  if (meeting.paused) {
+    meeting.pausedMs += meeting.stoppedAt - meeting.pausedAt;
+    meeting.paused = false;
+    meeting.pausedAt = 0;
+  }
   sendToOverlay('overlay:stop', {});
   sendToOverlay('overlay:phase', { phase: 'processing', message: '議事録を作成中…' });
   sendToMainWin('meeting:progress', { message: '録音を終了し、残りの文字起こしを処理しています…' });
@@ -838,7 +877,9 @@ function onMeetingSegment(buffer, durationMs, isFinal) {
   segChain = segChain.then(async () => {
     if (meeting !== m) return;
     if (buffer.byteLength < 4000) return;
-    const tail = m.segments.length ? m.segments[m.segments.length - 1].text.slice(-100) : '';
+    // 直近の「成功した」区間の末尾。失敗区間のエラー文を渡すと、次の区間が
+    // それを文例として真似る（mainlib.promptTail）。
+    const tail = promptTail(m.segments);
     let text = '';
     try {
       text = await transcribeLocal(buffer, tail, durationMs);
@@ -872,9 +913,10 @@ async function maybeFinalizeMeeting() {
   const m = meeting;
   meeting = null;
 
-  // 一時停止していた時間は会議の長さに含めない
-  const pausedTotal = m.pausedMs + (m.paused ? Date.now() - m.pausedAt : 0);
-  const durationSec = Math.round(((m.stoppedAt || Date.now()) - m.startedAt - pausedTotal) / 1000);
+  // 一時停止していた時間は会議の長さに含めない。基準は停止時刻であって
+  // 「今」ではない（今で計ると文字起こし待ちが混ざる。mainlib.meetingDurationSec）。
+  const endAt = m.stoppedAt || Date.now();
+  const durationSec = meetingDurationSec(m, endAt);
   const dt = new Date(m.startedAt);
   const fallbackTitle = `${dt.getFullYear()}/${dt.getMonth() + 1}/${dt.getDate()} ${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')} の議事録`;
 
@@ -908,12 +950,30 @@ async function maybeFinalizeMeeting() {
   await runSummary(page.id);
 }
 
+// 同じページの要約は同時に一つだけ。走行中に「要約を生成」を連打されると、
+// 同じ文字起こしに対して要約が二重に走り、後から終わった方が前の結果
+// （とその間の編集）を上書きしていた。走行中なら同じ Promise を返す。
+const summarizing = new Map();
+function runSummary(pageId) {
+  if (summarizing.has(pageId)) return summarizing.get(pageId);
+  const p = doRunSummary(pageId).finally(() => summarizing.delete(pageId));
+  summarizing.set(pageId, p);
+  return p;
+}
+
 // 要約の生成 → ブロック化 → 出典付与 → 保存
-async function runSummary(pageId) {
+async function doRunSummary(pageId) {
   // どの経路で抜けても進捗表示と録音状態を必ず解除する
   const clearUi = () => {
     sendToMainWin('meeting:progress', { message: '' });
     sendToMainWin('meeting:update', meetingStatus());
+  };
+  // 保存は必ず「いまディスクにあるページ」に対して行う。入口で読んだ page を
+  // 書き戻すと、要約中に削除された議事録が復活する（mainlib.saveIfExists）。
+  const gone = () => {
+    engineLog('要約完了時にページが無い（削除済み）ため破棄');
+    clearUi();
+    return { ok: false, error: 'ページが削除されました' };
   };
   const page = store.getPage(pageId);
   if (!page) { clearUi(); return { ok: false, error: 'ページが見つかりません' }; }
@@ -922,20 +982,22 @@ async function runSummary(pageId) {
   const plain = usable.map((s) => s.text).join('\n');
 
   if (!plain.trim()) {
-    page.summaryError = '文字起こしが空のため要約できません';
-    store.savePage(page);
+    const err = '文字起こしが空のため要約できません';
+    const saved = saveIfExists(store, pageId, (p) => { p.summaryError = err; });
+    if (!saved) return gone();
     clearUi();
-    sendToMainWin('page:updated', { page, segments });
-    return { ok: false, error: page.summaryError };
+    sendToMainWin('page:updated', { page: saved, segments });
+    return { ok: false, error: err };
   }
   if (!engineValid(sumEng)) {
-    page.summaryError = '要約エンジンが未設定のため、文字起こしのみ保存しました。'
+    const err = '要約エンジンが未設定のため、文字起こしのみ保存しました。'
       + 'setup-summarizer.ps1 を実行し、設定タブでパスを指定すると「要約を生成」で作成できます。';
-    store.savePage(page);
+    const saved = saveIfExists(store, pageId, (p) => { p.summaryError = err; });
+    if (!saved) return gone();
     clearUi();
-    sendToMainWin('page:updated', { page, segments });
-    sendToMainWin('app:notice', page.summaryError);
-    return { ok: false, error: page.summaryError };
+    sendToMainWin('page:updated', { page: saved, segments });
+    sendToMainWin('app:notice', err);
+    return { ok: false, error: err };
   }
 
   // 会議タイプ: 手動指定があればそれを尊重し、無ければタイトルと冒頭から推定。
@@ -967,7 +1029,8 @@ async function runSummary(pageId) {
     );
     // 「特になし」の混入を先に落とす。ここで落とさないと
     // 「- [ ] 特になし」がアクション1件として数えられてしまう。
-    const blocks = dropRedundantEmpty(markdownToBlocks(md));
+    // 続けて、テンプレートの見出し・雛形をそのまま写した行も落とす。
+    const blocks = dropTemplateEcho(dropRedundantEmpty(markdownToBlocks(md)), minutesTemplate(page.meetingType));
     // 担当・期限を先に抜く。出典の突き合わせは
     // 「（担当: ○○ / 期限: ○○）」を落とした本文に対して行いたい。
     // 書式が残ったままだと、その語がクエリに混ざって一致がぶれる。
@@ -980,39 +1043,47 @@ async function runSummary(pageId) {
     segments = fresh;
 
     // 同じ理由で、タイトルやメモも読み込み時のページを丸ごと書き戻さず、
-    // 生成物だけを最新のページに載せる。
-    const saved = store.getPage(pageId) || page;
-    saved.blocks = blocks;
-    saved.meetingType = page.meetingType;
-    saved.typeAuto = page.typeAuto;
-    saved.autoType = page.autoType;
-    saved.citeStat = stat;
-    saved.actionStat = actStat;
-    saved.summaryError = truncated
-      ? '要約が長さの上限で打ち切られた可能性があります。末尾の議題が欠けていないか確認してください。'
-      : '';
-    store.savePage(saved);
+    // 生成物だけを最新のページに載せる。ページが消えていれば生成物は捨てる。
+    const latest = saveIfExists(store, pageId, (saved) => {
+      saved.blocks = blocks;
+      saved.meetingType = page.meetingType;
+      saved.typeAuto = page.typeAuto;
+      saved.autoType = page.autoType;
+      saved.citeStat = stat;
+      saved.actionStat = actStat;
+      saved.summaryError = truncated
+        ? '要約が長さの上限で打ち切られた可能性があります。末尾の議題が欠けていないか確認してください。'
+        : '';
+    });
+    if (!latest) return gone();
     clearUi();
     sendToMainWin('pages:updated', store.listPages());
-    sendToMainWin('page:updated', { page: saved, segments });
-    return { ok: true, page: saved, stat };
+    sendToMainWin('page:updated', { page: latest, segments });
+    return { ok: true, page: latest, stat };
   } catch (e) {
-    const saved = store.getPage(pageId) || page;
-    saved.summaryError = e.message;
-    store.savePage(saved);
+    const latest = saveIfExists(store, pageId, (saved) => { saved.summaryError = e.message; });
+    if (!latest) return gone();
     clearUi();
-    sendToMainWin('page:updated', { page: saved, segments });
+    sendToMainWin('page:updated', { page: latest, segments });
     return { ok: false, error: e.message };
   }
 }
 
 // ---------------------------------------------------------------- ホットキー / トレイ
+// 登録できていないホットキーの状態。画面（hotkey:state）とトレイに出す。
+// 以前は片方が他アプリと衝突すると両方を黙って既定に戻し、ディスクにも
+// 書いていたので、利用者は「設定したキーが勝手に変わる」としか見えなかった。
+let hotkeyState = { ok: true, failed: [], message: '' };
+let hotkeyNote = '';   // トレイに添える「（Alt+M は登録できず）」
+
+// 片方ずつ独立に登録する。片方が失敗しても成功した側は解除しない
+// （mainlib.registerHotkeys）。戻り値 { ok, failed: ['音声入力'|'議事録'…] }
 function applyHotkeys(hk, mhk) {
   globalShortcut.unregisterAll();
-  const okA = globalShortcut.register(hk, toggleRecording);
-  const okB = mhk ? globalShortcut.register(mhk, toggleMeetingByHotkey) : true;
-  if (!okA || !okB) { globalShortcut.unregisterAll(); return { ok: false, which: !okA ? '音声入力' : '議事録' }; }
-  return { ok: true };
+  return registerHotkeys([
+    { label: '音声入力', accel: hk, handler: toggleRecording },
+    { label: '議事録', accel: mhk, handler: toggleMeetingByHotkey },
+  ], (accel, handler) => globalShortcut.register(accel, handler));
 }
 
 /*
@@ -1104,12 +1175,14 @@ function updateTray() {
   items.push({ label: '更新を確認', enabled: state === 'idle', click: checkUpdateFromTray });
   items.push({ type: 'separator' });
   items.push({ label: '終了', click: () => { quitting = true; app.quit(); } });
+  // 登録できていないキーがあれば、その旨を添える（画面を開かなくても気づけるように）
+  if (hotkeyNote) items.push({ label: `ホットキー ${hotkeyNote}`, enabled: false });
   tray.setContextMenu(Menu.buildFromTemplate(items));
   tray.setToolTip(
     state === 'meeting' ? 'Listener — 議事録を記録中'
       : state === 'recording' ? 'Listener — 録音中'
         : state === 'processing' || state === 'meeting-finalizing' ? 'Listener — 処理中'
-          : `Listener — ${settings.hotkey}: 音声入力 / ${settings.meetingHotkey || '未設定'}: 議事録`,
+          : `Listener — ${settings.hotkey}: 音声入力 / ${settings.meetingHotkey || '未設定'}: 議事録${hotkeyNote}`,
   );
 }
 
@@ -1163,19 +1236,24 @@ function setupIpc() {
     const prevMeetingHotkey = settings.meetingHotkey;
     const prevAutoLaunch = settings.autoLaunch;
     const prevPillPos = settings.pillPos;
-    const merged = { ...settings, ...next };
-    merged.dictionary = Array.isArray(merged.dictionary) ? merged.dictionary.map((w) => String(w).trim()).filter(Boolean) : [];
-    merged.localPort = Math.max(1024, Math.min(65535, parseInt(merged.localPort, 10) || 8990));
-    merged.sumPort = Math.max(1024, Math.min(65535, parseInt(merged.sumPort, 10) || 8991));
-    merged.localThreads = Math.max(1, Math.min(64, parseInt(merged.localThreads, 10) || CPU_DEFAULT_THREADS));
-    merged.sumThreads = Math.max(1, Math.min(64, parseInt(merged.sumThreads, 10) || CPU_DEFAULT_THREADS));
-    merged.segmentSec = Math.max(20, Math.min(300, parseInt(merged.segmentSec, 10) || 75));
+    const merged = normalizeSettings({ ...settings, ...next }, DEFAULT_SETTINGS);
 
+    // ホットキーは失敗した側だけ前の値に戻し、他の設定は保存する。
+    // 以前は片方の衝突で保存全体を失敗にしていたので、同時に変えた
+    // 他の項目まで黙って捨てられていた。失敗は warning で画面に返す。
+    let warning = '';
     if (merged.hotkey !== prevHotkey || merged.meetingHotkey !== prevMeetingHotkey) {
       const r = applyHotkeys(merged.hotkey, merged.meetingHotkey);
       if (!r.ok) {
-        applyHotkeys(prevHotkey, prevMeetingHotkey);
-        return { ok: false, error: `${r.which}のホットキーを登録できませんでした（他アプリと競合の可能性）` };
+        warning = hotkeyFailureMessage(r.failed, { 音声入力: merged.hotkey, 議事録: merged.meetingHotkey });
+        hotkeyNote = `（${r.failed.map((l) => (l === '音声入力' ? merged.hotkey : merged.meetingHotkey)).join('・')} は登録できず）`;
+        if (r.failed.includes('音声入力')) merged.hotkey = prevHotkey;
+        if (r.failed.includes('議事録')) merged.meetingHotkey = prevMeetingHotkey;
+        applyHotkeys(merged.hotkey, merged.meetingHotkey);
+        hotkeyState = { ok: false, failed: r.failed, message: warning };
+      } else {
+        hotkeyState = { ok: true, failed: [], message: '' };
+        hotkeyNote = '';
       }
     }
     if (merged.pillPos !== prevPillPos) merged.pillCustom = null;
@@ -1187,8 +1265,9 @@ function setupIpc() {
       try { app.setLoginItemSettings({ openAtLogin: settings.autoLaunch }); } catch (_) { /* noop */ }
     }
     updateTray();
-    return { ok: true };
+    return warning ? { ok: true, warning } : { ok: true };
   });
+  ipcMain.handle('hotkey:state', () => hotkeyState);
 
   ipcMain.handle('history:get', () => history);
   ipcMain.handle('history:delete', (_e, id) => { history = history.filter((h) => h.id !== id); persistHistory(); return history; });
@@ -1382,10 +1461,17 @@ if (!gotLock) {
     });
     createOverlay();
     createTray();
-    if (!applyHotkeys(settings.hotkey, settings.meetingHotkey).ok) {
-      settings.hotkey = DEFAULT_SETTINGS.hotkey;
-      settings.meetingHotkey = DEFAULT_SETTINGS.meetingHotkey;
-      applyHotkeys(settings.hotkey, settings.meetingHotkey);
+    // 登録できなかった側だけ既定に落として再試行する（成功した側はそのまま）。
+    // 結果はメモリ上だけで、ディスクには書かない。利用者が選んだキーを
+    // 黙って既定に書き換えると、衝突が解けた後も元に戻らない。
+    {
+      const r = resolveStartupHotkeys(settings, DEFAULT_SETTINGS, applyHotkeys);
+      settings.hotkey = r.hotkey;
+      settings.meetingHotkey = r.meetingHotkey;
+      hotkeyState = r.state;
+      hotkeyNote = r.note;
+      if (!r.state.ok) engineLog(`ホットキー: ${r.state.message}`);
+      updateTray();
     }
     if (engineValid(whisperEng)) startEngine(whisperEng);
     ensurePaster();
