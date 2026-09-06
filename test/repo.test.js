@@ -572,8 +572,13 @@ test('一時停止は区間を締めてマイクを解放する', () => {
 });
 
 test('一時停止した時間は会議の長さに含めない', () => {
-  assert.match(main, /const pausedTotal = m\.pausedMs/);
-  assert.match(main, /m\.startedAt - pausedTotal/);
+  // 計算そのものは src/mainlib.js の meetingDurationSec（main.test.js で実行して検査）。
+  // ここでは main.js が停止時刻を渡してそれを呼んでいることを見る。
+  const lib = read('src/mainlib.js');
+  assert.match(lib, /const pausedTotal = .*pausedMs/);
+  assert.match(lib, /m\.startedAt - pausedTotal/);
+  assert.match(main, /const endAt = m\.stoppedAt \|\| Date\.now\(\);/);
+  assert.match(main, /meetingDurationSec\(m, endAt\)/, '所要時間を純関数で計算していない');
   assert.ok(appHtml.includes('- mtPausedMs'), '画面の時計が一時停止を引いていない');
 });
 
@@ -581,7 +586,7 @@ test('一時停止中は無音警告も区間の切り出しも動かない', ()
   const c = code(overlayHtml);
   assert.match(c, /function checkSilence\([^)]*\) \{\s*if \(stopping \|\| cancelled \|\| paused/);
   assert.match(c, /function cutSegmentIfOverdue\([^)]*\) \{\s*if \(paused\) return;/);
-  assert.match(main, /state === 'meeting' && meeting && !meeting\.paused/);
+  assert.match(main, /if \(!meeting\.paused\) sendToOverlay\('overlay:tick'/);
 });
 
 test('議事録の破棄ボタンは録音バーに出さない（誤操作で会議が消える）', () => {
@@ -693,4 +698,99 @@ test('更新の導線が画面に依存しない（トレイからも確認で�
   assert.ok(fn.includes('updater.apply('), '適用していない');
   assert.ok(fn.includes('r.url'), 'zipのURLの受け取り方が check() の戻り値と合っていない');
   assert.ok(fn.includes('app.relaunch()'), '再起動していない');
+});
+
+// ---------------------------------------------------------------- 監査指摘の修正（main 側）
+const fnBody = (src, from, to) => {
+  const i = src.indexOf(from);
+  assert.ok(i >= 0, `${from} が無い`);
+  const j = src.indexOf(to, i + from.length);
+  return src.slice(i, j > 0 ? j : src.length);
+};
+
+test('#46 要約完了時に手元の古い page で書き戻さない（削除した議事録が復活する）', () => {
+  // 「store.getPage(pageId) || page」は、要約中に削除されたページを
+  // 古いコピーから復活させる。無ければ破棄する（判断は mainlib.saveIfExists）。
+  const fn = fnBody(code(main), 'async function doRunSummary', '\nlet hotkeyState');
+  assert.ok(!/getPage\(pageId\)\s*\|\|\s*page\b/.test(fn), '「getPage(pageId) || page」のフォールバックが残っている');
+  assert.ok(!/store\.savePage\(/.test(fn), '存在確認を挟まずに savePage している');
+  assert.ok((fn.match(/saveIfExists\(store, pageId/g) || []).length >= 4,
+    '空・未設定・成功・失敗の全経路が saveIfExists を通っていない');
+  assert.ok(fn.includes('ページが削除されました'), '削除済みのときの戻り値が無い');
+  // 保存できなかった（= 削除済み）ことを全経路が見ている
+  assert.ok((fn.match(/if \(!(saved|latest)\) return gone\(\);/g) || []).length >= 4, '削除済みを見ずに進む経路がある');
+});
+
+test('#10 同じページの要約は同時に一つだけ走る', () => {
+  assert.match(main, /const summarizing = new Map\(\)/);
+  const fn = fnBody(code(main), 'function runSummary(pageId)', '\n}');
+  assert.ok(fn.includes('summarizing.has(pageId)') && fn.includes('summarizing.get(pageId)'), '走行中なら同じ Promise を返していない');
+  assert.ok(fn.includes('summarizing.delete(pageId)'), '完了時に外していない');
+  assert.match(main, /ipcMain\.handle\('page:summarize', \(_e, id\) => runSummary\(id\)\)/);
+  assert.match(main, /await runSummary\(page\.id\)/, '議事録終了後の要約が排他を通っていない');
+});
+
+test('#12 一時停止しても overlay:tick の見張りを消さない', () => {
+  // interval を消すのは議事録が無くなったときだけ。一時停止は送信を飛ばすだけ。
+  const fn = fnBody(code(main), 'function startMeetingTick', '\nfunction applyTheme');
+  const clearing = fn.split('\n').filter((l) => l.includes('clearInterval'));
+  assert.ok(clearing.length > 0);
+  for (const l of clearing) assert.ok(!l.includes('paused'), `一時停止で見張りを消している: ${l.trim()}`);
+  assert.ok(!/paused\)\s*\{?\s*clearInterval/.test(fn.replace(/\n/g, ' ')), '一時停止で見張りを消している');
+});
+
+test('#14 一時停止したまま停止したら、停止時刻で一時停止を締める', () => {
+  const fn = fnBody(code(main), 'function stopMeeting()', '\nfunction discardMeeting');
+  assert.ok(fn.indexOf('meeting.stoppedAt = Date.now()') < fn.indexOf('meeting.pausedMs += meeting.stoppedAt - meeting.pausedAt'));
+  assert.ok(fn.includes('meeting.paused = false'));
+});
+
+test('#15 次の区間の初期プロンプトは直近の成功区間から取る', () => {
+  assert.match(main, /const tail = promptTail\(m\.segments\);/);
+  assert.match(main, /transcribeLocal\(buffer, tail, durationMs\)/);
+});
+
+test('#26 設定の正規化は起動時と保存時の両方で通す', () => {
+  assert.match(main, /require\('\.\/settings'\)/);
+  const load = fnBody(code(main), 'function loadStores()', '\n}');
+  assert.match(load, /settings = normalizeSettings\(\{ \.\.\.DEFAULT_SETTINGS, \.\.\.loadJson\(settingsPath\(\), \{\}\) \}, DEFAULT_SETTINGS\)/);
+  const save = fnBody(code(main), "ipcMain.handle('settings:save'", '\n  });');
+  assert.match(save, /const merged = normalizeSettings\(\{ \.\.\.settings, \.\.\.next \}, DEFAULT_SETTINGS\)/);
+  assert.ok(!/Math\.max\(1024, Math\.min\(65535/.test(save), '保存時だけの手書きのクランプが残っている');
+  // 正規化をすり抜けた不正なポートは、エンジンの起動待ちで TypeError になる。
+  // 90秒のタイムアウトまで黙って待たず、設定の問題だと分かる文で返す。
+  const ready = fnBody(code(main), 'function ensureEngineReady', '\nfunction restartEnginesIfNeeded');
+  assert.ok(ready.includes('e instanceof TypeError'), 'TypeError を起動中と区別していない');
+  assert.ok(ready.includes('接続先（ポート設定）が不正です'));
+});
+
+test('#35/#49 ホットキーは片方ずつ登録し、失敗を画面とトレイに伝える', () => {
+  // 登録は独立（全か無かにしない）
+  const apply = fnBody(code(main), 'function applyHotkeys', '\n}');
+  assert.ok(apply.includes('registerHotkeys('), '独立登録の純関数を通っていない');
+  assert.ok(!apply.includes('unregisterAll(); return { ok: false'), '片方の失敗で両方を解除している');
+  // 保存時: 失敗した側だけ前の値に戻し、他の設定は保存する。戻り値は warning 付きの ok
+  const save = fnBody(code(main), "ipcMain.handle('settings:save'", '\n  });');
+  assert.ok(!save.includes("return { ok: false, error: `${r.which}"), '全体を失敗として返している');
+  assert.match(save, /warning/);
+  assert.ok(save.includes('merged.hotkey = prevHotkey') && save.includes('merged.meetingHotkey = prevMeetingHotkey'));
+  // 起動時: 失敗した側だけ既定に落とし、ディスクには書かない
+  assert.match(main, /let hotkeyState = \{ ok: true, failed: \[\], message: '' \}/);
+  const boot = fnBody(code(main), 'resolveStartupHotkeys(', '\n    if (engineValid(whisperEng))');
+  assert.ok(!boot.includes('persistSettings'), '起動時のホットキーの失敗で設定をディスクに書いている');
+  assert.ok(boot.includes('hotkeyState = '), '起動時の結果を hotkeyState に残していない');
+  // 画面から状態を引ける
+  assert.match(main, /ipcMain\.handle\('hotkey:state', \(\) => hotkeyState\)/);
+  assert.ok(preload.includes("  hotkeyState: () => ipcRenderer.invoke('hotkey:state'),"));
+  // トレイに「（… は登録できず）」を添える
+  const tray = fnBody(code(main), 'function updateTray()', '\nfunction createTray');
+  assert.ok(tray.includes('hotkeyNote'), 'トレイに登録できなかったキーの注記が無い');
+});
+
+test('#18 テンプレートの写しを落とす結線（minutes.dropTemplateEcho が無ければ素通し）', () => {
+  assert.match(main, /const dropTemplateEcho = minutes\.dropTemplateEcho \|\| \(\(b\) => b\)/);
+  assert.match(main, /dropTemplateEcho\(dropRedundantEmpty\(markdownToBlocks\(md\)\), minutesTemplate\(page\.meetingType\)\)/);
+  // プロンプトに入れている書式と同じ文字列を渡す（別々に組み立てるとずれる）
+  const gen = fnBody(code(main), 'async function generateMinutes', '\nfunction ensurePaster');
+  assert.strictEqual((gen.match(/\$\{minutesTemplate\(type\)\}/g) || []).length, 2, 'プロンプト側がテンプレート関数を使っていない');
 });
