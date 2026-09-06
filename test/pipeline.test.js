@@ -192,3 +192,19 @@ test('崩れていた区間を直すと、その要点の出典が正しい発�
   for (const b of blocks) for (const c of b.cites || []) assert.ok(ids.has(c), `存在しない id ${c}`);
   assert.ok(stat.total > 0 && stat.linked <= stat.total);
 });
+
+// ---------------------------------------------------------------- 表で書かれた報告
+// 数値の多い会議でモデルが表を書いてくる。paragraph に落ちると出典が付かず、
+// 「数値は必ず残す」と指示した肝心の行が根拠なしで並ぶ。
+test('表で出た数値行に出典が付く', () => {
+  const md = '## 報告事項\n| 項目 | 状況 |\n|---|---|\n'
+    + '| 在庫連携のバッチ処理 | 1万件の取り込みに4分、目標は90秒 |\n'
+    + '| 採用の応募 | 今月8名、一次面接まで進んだのが3名 |';
+  const { blocks, citeStat } = runPipeline(md, STANDUP_SEGMENTS, BASE);
+  const rows = blocks.filter((b) => b.type === 'bullet');
+  assert.strictEqual(rows.length, 2, JSON.stringify(blocks.map((b) => `${b.type}:${b.text}`)));
+  assert.ok(rows[0].cites.includes('s3'), `バッチの行: ${JSON.stringify(rows[0].cites)}`);
+  assert.ok(rows[1].cites.includes('s6'), `採用の行: ${JSON.stringify(rows[1].cites)}`);
+  assert.strictEqual(citeStat.total, 2);
+  assert.strictEqual(citeStat.linked, 2);
+});

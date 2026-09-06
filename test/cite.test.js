@@ -8,7 +8,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { attachCitations, refreshCitations, buildIndex, matchOne, bigrams, normalize } = require('../src/cite');
+const { attachCitations, refreshCitations, buildIndex, matchOne, bigrams, normalize,
+  isCitable, citeText, MIN_CITE_CHARS } = require('../src/cite');
 
 const SEGS = [
   { id: 's1', atMs: 0, text: '在庫連携のバッチ処理ですが、1万件の取り込みに4分かかっています。' },
@@ -113,7 +114,7 @@ test('文字起こしが無い・空でも落ちない', () => {
   for (const segs of [[], null, undefined]) {
     const blocks = mk();
     const stat = attachCitations(blocks, segs);
-    assert.deepStrictEqual(stat, { linked: 0, total: 0 });
+    assert.deepStrictEqual(stat, { linked: 0, total: 0, skipped: 0 });
     assert.deepStrictEqual(blocks[0].cites, []);
   }
 });
@@ -227,6 +228,97 @@ test('refreshCitations: 区間が空なら {0,0} を返し、出典に触らな�
   attachCitations(blocks, SEGS);
   const snap = JSON.stringify(blocks.map((b) => b.cites));
   const r = refreshCitations(blocks, [], 's1');
-  assert.deepStrictEqual(r, { linked: 0, total: 0 });
+  assert.deepStrictEqual(r, { linked: 0, total: 0, skipped: 0 });
   assert.strictEqual(JSON.stringify(blocks.map((b) => b.cites)), snap);
+});
+
+// ---------------------------------------------------------------- 照合対象外の印
+// 短い要点は偶然一致を避けるため照合しない。その閾値は1か所（MIN_CITE_CHARS）に置き、
+// 対象外になった行には citeSkip を付けて「根拠なし」と見分けられるようにする。
+// 「根拠を探したが無かった」と「そもそも探していない」は画面で区別したい。
+test('isCitable: 正規化後の文字数で判定する（生の文字数ではない）', () => {
+  assert.strictEqual(MIN_CITE_CHARS, 6);
+  // 生6文字・正規化5文字（「。」が落ちる）
+  assert.strictEqual(isCitable('A社と合意。'), false);
+  assert.strictEqual(isCitable('A社との合意。'), true);
+  assert.strictEqual(isCitable(''), false);
+  assert.strictEqual(isCitable(null), false);
+});
+
+test('attachCitations: 短い行に citeSkip が付き、total に入らない', () => {
+  const blocks = [
+    { id: 'b1', type: 'bullet', text: 'A社と合意。', cites: [] },
+    { id: 'b2', type: 'todo', text: '完了', cites: [] },
+    { id: 'b3', type: 'bullet', text: '採用の応募は今月8名だった', cites: [] },
+    { id: 'h1', type: 'heading', text: '短い' },
+  ];
+  const stat = attachCitations(blocks, SEGS);
+  assert.strictEqual(blocks[0].citeSkip, true);
+  assert.strictEqual(blocks[1].citeSkip, true);
+  assert.strictEqual(blocks[2].citeSkip, undefined);
+  assert.strictEqual(blocks[3].citeSkip, undefined, '見出しには印を付けない');
+  assert.strictEqual(stat.total, 1);
+  assert.strictEqual(stat.skipped, 2);
+  assert.strictEqual(stat.linked, 1);
+});
+
+test('attachCitations: 行を長く直したら citeSkip が消える', () => {
+  const blocks = [{ id: 'b1', type: 'bullet', text: 'A社と合意。', cites: [] }];
+  attachCitations(blocks, SEGS);
+  assert.strictEqual(blocks[0].citeSkip, true);
+  blocks[0].text = '採用の応募は今月8名だった';
+  const stat = attachCitations(blocks, SEGS);
+  assert.strictEqual(blocks[0].citeSkip, undefined);
+  assert.strictEqual(stat.skipped, 0);
+  assert.strictEqual(stat.total, 1);
+});
+
+test('refreshCitations: citeSkip の付け外しと skipped は attachCitations と同じ', () => {
+  const blocks = mkBlocks();
+  blocks.push({ id: 'b4', type: 'bullet', text: 'A社と合意。', cites: [] });
+  attachCitations(blocks, SEGS);
+  blocks[4].text = '採用の応募は今月8名だった';
+  blocks[1].text = '合意。';
+  const r = refreshCitations(blocks, SEGS, 's2');
+  assert.strictEqual(blocks[4].citeSkip, undefined);
+  assert.strictEqual(blocks[1].citeSkip, true);
+  assert.strictEqual(r.skipped, 1);
+  assert.strictEqual(r.total, 3);
+});
+
+// ---------------------------------------------------------------- 担当名を含めた照合
+// 担当・期限は本文から抜いてから照合する（書式が混ざると一致がぶれる）。
+// その結果、同じ作業を別の人に振った todo が本文だけでは区別できず、
+// 互いの発言を指してしまう。担当名だけをクエリに戻して照合する。
+const ASSIGN_SEGS = [
+  { id: 's1', atMs: 0, text: '田中さんは来期の予算案の資料を作成してください。' },
+  { id: 's2', atMs: 1000, text: '在庫連携のバッチ処理は今週中に見直します。' },
+  { id: 's3', atMs: 2000, text: '佐藤さんは来期の予算案の資料を作成してください。' },
+];
+
+test('citeText: 担当付きの todo だけ担当名をクエリに足す（表示本文は変えない）', () => {
+  assert.strictEqual(citeText({ type: 'todo', text: '資料を作成する', assignee: '田中' }), '資料を作成する 田中');
+  assert.strictEqual(citeText({ type: 'todo', text: '資料を作成する', assignee: '' }), '資料を作成する');
+  assert.strictEqual(citeText({ type: 'todo', text: '資料を作成する' }), '資料を作成する');
+  assert.strictEqual(citeText({ type: 'bullet', text: '資料を作成する', assignee: '田中' }), '資料を作成する');
+});
+
+test('同じ作業を別人に割り当てた todo が、それぞれの担当への発言を指す', () => {
+  const blocks = [
+    { id: 'b1', type: 'todo', text: '来期の予算案の資料を作成する', assignee: '田中', cites: [] },
+    { id: 'b2', type: 'todo', text: '来期の予算案の資料を作成する', assignee: '佐藤', cites: [] },
+  ];
+  attachCitations(blocks, ASSIGN_SEGS);
+  assert.strictEqual(blocks[0].cites[0], 's1', `田中の todo: ${JSON.stringify(blocks[0].cites)}`);
+  assert.strictEqual(blocks[1].cites[0], 's3', `佐藤の todo: ${JSON.stringify(blocks[1].cites)}`);
+  assert.strictEqual(blocks[0].text, '来期の予算案の資料を作成する', '表示本文が変わった');
+});
+
+test('refreshCitations でも担当名を含めて照合する', () => {
+  const blocks = [
+    { id: 'b1', type: 'todo', text: '来期の予算案の資料を作成する', assignee: '佐藤', cites: [] },
+  ];
+  attachCitations(blocks, ASSIGN_SEGS);
+  refreshCitations(blocks, ASSIGN_SEGS, 's3');
+  assert.strictEqual(blocks[0].cites[0], 's3');
 });

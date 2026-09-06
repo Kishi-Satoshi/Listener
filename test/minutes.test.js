@@ -9,7 +9,8 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const { markdownToBlocks, blocksToMarkdown, fmtClock,
-  stripInlineMarkdown, dropRedundantEmpty } = require('../src/minutes');
+  stripInlineMarkdown, dropRedundantEmpty, dropTemplateEcho } = require('../src/minutes');
+const mtype = require('../src/meetingType');
 
 const types = (md) => markdownToBlocks(md).map((b) => b.type);
 
@@ -272,4 +273,174 @@ test('角括弧の引用・番号はチェックボックスにしない', () =>
   assert.strictEqual(markdownToBlocks('- [1] を参照')[0].type, 'bullet');
   assert.strictEqual(markdownToBlocks('- 出典[2]の件')[0].type, 'bullet');
   assert.strictEqual(markdownToBlocks('[3] 脚注ふう')[0].type, 'paragraph');
+});
+
+// ---------------------------------------------------------------- 行頭記号の一覧
+//
+// 実機のモデルは「•」「＊」「１．」のような全角・記号違いの行頭を混ぜてくる。
+// paragraph に落ちると出典リンクと担当・期限の抽出の対象外になり、機能が静かに欠ける。
+// 一方で「-5%」「＊強調＊」のような普通の文を箇条書きにしてもいけない（数字が消える）。
+// どの記号がどう扱われるかを一覧で固定する。
+test('行頭記号の一覧: bullet / todo / paragraph の振り分け', () => {
+  const table = [
+    // [入力, 期待する type, 期待する本文]
+    ['- ハイフン', 'bullet', 'ハイフン'],
+    ['* アスタリスク', 'bullet', 'アスタリスク'],
+    ['＊ 全角アスタリスク', 'bullet', '全角アスタリスク'],
+    ['－ 全角ハイフン', 'bullet', '全角ハイフン'],
+    ['– エンダッシュ', 'bullet', 'エンダッシュ'],
+    ['— エムダッシュ', 'bullet', 'エムダッシュ'],
+    ['• ビュレット', 'bullet', 'ビュレット'],
+    ['◦ 白丸ビュレット', 'bullet', '白丸ビュレット'],
+    ['▪ 四角ビュレット', 'bullet', '四角ビュレット'],
+    ['・ 中黒', 'bullet', '中黒'],
+    ['・中黒の直後に空白なし', 'bullet', '中黒の直後に空白なし'],
+    ['1. 番号', 'bullet', '番号'],
+    ['1) 番号と丸括弧', 'bullet', '番号と丸括弧'],
+    ['１．全角番号', 'bullet', '全角番号'],
+    ['１）全角番号と括弧', 'bullet', '全角番号と括弧'],
+    ['1、読点の番号', 'bullet', '読点の番号'],
+    ['2.空白なしの番号', 'bullet', '空白なしの番号'],
+    ['- [ ] 通常のチェック', 'todo', '通常のチェック'],
+    ['* [x] 済みのチェック', 'todo', '済みのチェック'],
+    ['＊[ ] 全角アスタリスクのチェック', 'todo', '全角アスタリスクのチェック'],
+    ['－ [ ] 全角ハイフンのチェック', 'todo', '全角ハイフンのチェック'],
+    ['• ［　］ ビュレットと全角括弧', 'todo', 'ビュレットと全角括弧'],
+    ['—[×] エムダッシュと×', 'todo', 'エムダッシュと×'],
+    ['・[ ] 中黒のチェック', 'todo', '中黒のチェック'],
+    ['1. [ ] 番号のチェック', 'todo', '番号のチェック'],
+    // 以下は箇条書きにしない
+    ['ー長音で始まる語', 'paragraph', 'ー長音で始まる語'],
+    ['※ 注記は地の文', 'paragraph', '※ 注記は地の文'],
+    ['-5%の減少', 'paragraph', '-5%の減少'],
+    ['－5%の減少（全角）', 'paragraph', '－5%の減少（全角）'],
+    ['＊強調＊の文', 'paragraph', '＊強調＊の文'],
+    ['•空白なしのビュレット', 'paragraph', '•空白なしのビュレット'],
+    ['12.5%の増加', 'paragraph', '12.5%の増加'],
+    ['1、2、3の順で進める', 'paragraph', '1、2、3の順で進める'],
+  ];
+  for (const [md, type, text] of table) {
+    const b = markdownToBlocks(md);
+    assert.strictEqual(b.length, 1, md);
+    assert.strictEqual(b[0].type, type, `${md} → ${b[0].type}`);
+    assert.strictEqual(b[0].text, text, md);
+  }
+});
+
+test('全角記号のチェック状態を拾う', () => {
+  const b = markdownToBlocks('＊［ｘ］ 済み\n－ [ ] 未了\n• [X] 済み2');
+  assert.deepStrictEqual(b.map((x) => x.checked), [true, false, true]);
+});
+
+// ---------------------------------------------------------------- 表とコードフェンス
+//
+// 数値の多い会議で、モデルは表で書いてくることがある。
+// そのまま paragraph にすると「| 応募 | 8名 |」が画面に出るうえ出典も付かない。
+// 表の各行を「列1: 列2」の箇条書きに畳めば、出典の突き合わせも担当抽出も通常どおり効く。
+test('表のデータ行は「a: b」の箇条書きになり、ヘッダと区切り行は捨てる', () => {
+  const md = '## 報告事項\n| 項目 | 今月 |\n|---|---|\n| 応募数 | 8名 |\n| 一次面接 | 3名 |';
+  const b = markdownToBlocks(md).map((x) => `${x.type}:${x.text}`);
+  assert.deepStrictEqual(b, ['heading:報告事項', 'bullet:応募数: 8名', 'bullet:一次面接: 3名']);
+});
+
+test('3列以上の表は「a: b / c」にする', () => {
+  const md = '| 案件 | 状況 | 期限 |\n| :-- | :-: | --: |\n| 受注管理 | 結合テスト完了 | 来週 |';
+  const b = markdownToBlocks(md);
+  assert.strictEqual(b.length, 1);
+  assert.strictEqual(b[0].type, 'bullet');
+  assert.strictEqual(b[0].text, '受注管理: 結合テスト完了 / 来週');
+});
+
+test('区切り行の書式の揺れ（先頭の | の有無・揃え記号）', () => {
+  for (const sep of ['|---|---|', '---|---', '| --- | --- |', '|:--|--:|', '|:---:|:---:|']) {
+    const b = markdownToBlocks(`| A | B |\n${sep}\n| a | b |`);
+    assert.deepStrictEqual(b.map((x) => `${x.type}:${x.text}`), ['bullet:a: b'], sep);
+  }
+});
+
+test('区切り行の無い表もデータ行は箇条書きにする（ヘッダは残る）', () => {
+  const b = markdownToBlocks('| 応募数 | 8名 |');
+  assert.deepStrictEqual(b.map((x) => `${x.type}:${x.text}`), ['bullet:応募数: 8名']);
+});
+
+test('表のセルの太字を落とす・空セルは詰める', () => {
+  const b = markdownToBlocks('| **応募数** | | 8名 |');
+  assert.strictEqual(b[0].text, '応募数: 8名');
+});
+
+test('区切り行の直前が表の行でなければ消さない', () => {
+  // 区切り行だけ独立して出た場合に、前の要点を巻き添えにしない
+  const b = markdownToBlocks('- 本物の要点\n|---|---|');
+  assert.deepStrictEqual(b.map((x) => `${x.type}:${x.text}`), ['bullet:本物の要点']);
+});
+
+test('コードフェンスの行は捨て、中身は捨てない', () => {
+  const md = '```markdown\n## 決定事項\n- 価格は据え置き\n```';
+  const b = markdownToBlocks(md).map((x) => `${x.type}:${x.text}`);
+  assert.deepStrictEqual(b, ['heading:決定事項', 'bullet:価格は据え置き']);
+  assert.deepStrictEqual(markdownToBlocks('```\n本文\n````').map((x) => x.text), ['本文']);
+});
+
+test('行頭記号を広げても行数は変わらない（表とフェンス以外は落とさない）', () => {
+  const md = '• A\n◦ B\n１．C\n＊[ ] D\n地の文';
+  assert.strictEqual(markdownToBlocks(md).length, 5);
+});
+
+// ---------------------------------------------------------------- 記入例の丸写し
+//
+// プロンプトの記入例「- [ ] 内容（担当: ○○ / 期限: ○○）」「（箇条書き）」を
+// 小型モデルがそのまま書いてくる。アクション件数が水増しされ、担当「○○」が
+// 横断一覧に並ぶ。記入例と完全一致する行だけ落とす（部分一致で本物を消さない）。
+const fmtAll = () => mtype.ORDER.map((k) => mtype.getFormat(k) + '\n' + mtype.ACTION_RULE);
+const T = (md, tpl) => dropTemplateEcho(dropRedundantEmpty(markdownToBlocks(md)), tpl).map((b) => `${b.type}:${b.text}`);
+
+test('記入例を丸写しした todo が消え、本物のアクションは残る（全テンプレート）', () => {
+  for (const tpl of fmtAll()) {
+    const md = '## アクションアイテム\n- [ ] 内容（担当: ○○ / 期限: ○○）\n- [ ] 内容（担当: ○○）\n'
+      + '- [ ] 内容（期限: ○○）\n- [ ] 内容\n- [ ] 求人票の改訂案を作成する（担当: 佐藤 / 期限: 今月末）';
+    assert.deepStrictEqual(T(md, tpl), [
+      'heading:アクションアイテム', 'todo:求人票の改訂案を作成する（担当: 佐藤 / 期限: 今月末）'], tpl.slice(0, 20));
+  }
+});
+
+test('「（箇条書き）」の丸写しは、その記入例を持つテンプレートでだけ消える', () => {
+  const md = '## 決定事項\n- （箇条書き）\n- 箇条書き\n- 価格は据え置き';
+  for (const k of mtype.ORDER) {
+    const tpl = mtype.getFormat(k) + '\n' + mtype.ACTION_RULE;
+    const has = tpl.includes('（箇条書き）');
+    assert.deepStrictEqual(T(md, tpl), has
+      ? ['heading:決定事項', 'bullet:価格は据え置き']
+      : ['heading:決定事項', 'bullet:（箇条書き）', 'bullet:箇条書き', 'bullet:価格は据え置き'], k);
+  }
+  assert.ok(mtype.ORDER.some((k) => mtype.getFormat(k).includes('（箇条書き）')), '前提: 記入例を持つ型がある');
+});
+
+test('テンプレートの全文を丸写しした Markdown から、見出し以外が消える', () => {
+  for (const k of mtype.ORDER) {
+    const fmt = mtype.getFormat(k);
+    const out = dropTemplateEcho(markdownToBlocks(fmt), fmt + '\n' + mtype.ACTION_RULE);
+    assert.deepStrictEqual(out.map((b) => b.type), out.map(() => 'heading'), k);
+    assert.ok(out.length >= 4, k);
+  }
+});
+
+test('部分一致では消さない（「内容」を含む本物の要点）', () => {
+  const tpl = mtype.getFormat('standup') + '\n' + mtype.ACTION_RULE;
+  const md = '- [ ] 契約内容を確認する（担当: 山田）\n- 会議全体を3〜5行で要約した資料を配る\n- 数値は必ず残すこと';
+  assert.deepStrictEqual(T(md, tpl), [
+    'todo:契約内容を確認する（担当: 山田）', 'bullet:会議全体を3〜5行で要約した資料を配る', 'bullet:数値は必ず残すこと']);
+});
+
+test('見出しは記入例と同じ文言でも落とさない', () => {
+  const tpl = mtype.getFormat('general') + '\n' + mtype.ACTION_RULE;
+  const md = '## 決定事項\n## 箇条書き\n- 本物';
+  assert.deepStrictEqual(T(md, tpl), ['heading:決定事項', 'heading:箇条書き', 'bullet:本物']);
+});
+
+test('templateText が空なら何もしない', () => {
+  const blocks = markdownToBlocks('- [ ] 内容（担当: ○○ / 期限: ○○）\n- （箇条書き）');
+  for (const tpl of ['', null, undefined]) {
+    assert.strictEqual(dropTemplateEcho(blocks, tpl).length, 2, String(tpl));
+  }
+  assert.deepStrictEqual(dropTemplateEcho([], mtype.getFormat('general')), []);
 });
