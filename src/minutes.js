@@ -45,23 +45,74 @@ function stripInlineMarkdown(s) {
 // 「[1] を参照」のような角括弧は中身が空白/x でないので誤爆しない。
 const CHECKBOX_HEAD = /^[\[［]([ xXｘＸ×　]?)[\]］]\s*/;
 
+// 行頭の箇条書き記号。実機のモデルは「•」「＊」「－」「１．」のような
+// 全角・記号違いの行頭を混ぜてくる。paragraph に落ちると出典リンクも
+// 担当・期限の抽出も対象外になり、機能が静かに欠ける。
+//
+// 入れない記号:
+//   「ー」（長音）… 「ーん」のような語頭に出るので誤爆する
+//   「※」… 注記の印であり、要点ではなく地の文として残したい
+// 「・」以外は直後の空白を必須にする。半角の「-」「*」で守っている
+// 「-5%」「*強調*」を箇条書きにしない意図を、全角の「－5%」「＊強調＊」にも揃える。
+// チェックボックスは記号と「[」の間の空白が無くても拾う（「-[ ]」は普通の文にならない）。
+const TODO_HEAD = /^\s*[-*＊－–—•◦▪]\s*[\[［]([ xXｘＸ×　]?)[\]］]\s*(.*)$/;
+const BULLET_HEAD = /^\s*(?:[-*＊－–—•◦▪]\s+|・\s*)(.*)$/;
+// 番号は全角と「、」も見る（「１．背景」「1、目的」は空白なしが普通）。
+// ただし直後が数字なら番号ではない（「12.5%の増加」「1、2、3の順」を切り刻まない）。
+const NUMBER_HEAD = /^\s*[0-9０-９]+[.．)）、](?![0-9０-９])\s*(.*)$/;
+
+// 表とコードフェンス。数値の多い会議でモデルが表で書いてくることがあり、
+// 「| 応募 | 8名 |」がそのまま画面に出るうえ出典も付かない。
+// 表の各行は「列1: 列2」の箇条書きに畳む。ヘッダ行と区切り行は要点ではないので捨てる。
+// フェンス（```）は行だけ捨て、中身は普通の行として読む（要約全体を ```markdown で
+// 包んでくるモデルがいる。中身を捨てると要約が丸ごと消える）。
+const FENCE_LINE = /^\s*`{3,}\s*[\w-]*\s*$/;
+// 揃え記号付きの「:-:」は横棒が1本なので、本数は問わない
+const TABLE_SEP = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/;
+const TABLE_ROW = /^\s*\|(.+)\|\s*$/;
+
+// 表の1行を箇条書きの本文にする。空セルは詰める（「a:  / b」を避ける）。
+// 2列なら「a: b」、3列以上は「a: b / c」。
+function tableRowText(inner) {
+  const cells = inner.split('|').map((c) => stripInlineMarkdown(c)).filter(Boolean);
+  if (cells.length === 0) return '';
+  if (cells.length === 1) return cells[0];
+  return `${cells[0]}: ${cells.slice(1).join(' / ')}`;
+}
+
 // Markdown → ブロック配列（Notion のブロックモデル相当）
 function markdownToBlocks(md) {
   const blocks = [];
+  let lastRow = null;   // 直前に表の行から作ったブロック（区切り行が来たらヘッダとして捨てる）
   for (const raw of String(md || '').split('\n')) {
     const line = raw.trimEnd();
     if (!line.trim()) continue;
+    if (FENCE_LINE.test(line)) continue;
+    if (TABLE_SEP.test(line)) {
+      // 区切り行の直前の行がヘッダ。表の行以外（本物の要点）は巻き添えにしない
+      if (lastRow && blocks[blocks.length - 1] === lastRow) blocks.pop();
+      lastRow = null;
+      continue;
+    }
     let m;
+    if ((m = line.match(TABLE_ROW))) {
+      const text = tableRowText(m[1]);
+      lastRow = null;
+      if (!text) continue;
+      lastRow = { id: store.newId('b'), type: 'bullet', text, cites: [] };
+      blocks.push(lastRow);
+      continue;
+    }
+    lastRow = null;
     if ((m = line.match(/^#{1,4}\s+(.*)$/))) {
       blocks.push({ id: store.newId('b'), type: 'heading', text: stripInlineMarkdown(m[1]), cites: [] });
     // 「]」「・」の直後に空白が無い書き方をモデルがよくする。
     // ここで拾い損ねるとその行は paragraph になり、出典リンクも
     // 担当・期限の抽出も対象外になって、静かに機能が欠ける。
     // 「-」「*」は空白必須のまま（"*強調*" や "-5%" を誤って箇条書きにしないため）。
-    } else if ((m = line.match(/^\s*[-*]\s*\[([ xX])\]\s*(.*)$/))) {
-      blocks.push({ id: store.newId('b'), type: 'todo', text: stripInlineMarkdown(m[2]), checked: m[1].toLowerCase() === 'x', cites: [] });
-    } else if ((m = line.match(/^\s*(?:[-*]\s+|・\s*)(.*)$/))
-        || (m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+    } else if ((m = line.match(TODO_HEAD))) {
+      blocks.push({ id: store.newId('b'), type: 'todo', text: stripInlineMarkdown(m[2]), checked: /[xXｘＸ×]/.test(m[1] || ''), cites: [] });
+    } else if ((m = line.match(BULLET_HEAD)) || (m = line.match(NUMBER_HEAD))) {
       const c = m[1].match(CHECKBOX_HEAD);
       if (c) {
         blocks.push({ id: store.newId('b'), type: 'todo',
@@ -125,6 +176,61 @@ function dropRedundantEmpty(blocks) {
   return out;
 }
 
+// プロンプトの記入例の丸写しを落とす。
+//
+// テンプレートは各節に「（箇条書き）」「- [ ] 内容（担当: ○○ / 期限: ○○）」と
+// 書き方の例を添えているが、小型モデルはこれをそのまま書いてくる。
+// 「内容」が todo として数えられ、担当「○○」が横断アクション一覧に並ぶ。
+//
+// 消すのは、記入例の行と正規化後に完全一致するブロックだけ。
+// 部分一致は使わない。「契約内容を確認する」「会議全体を3〜5行で要約した資料」のような
+// 本物の要点が記入例の語を含むことは普通にあり、そこを消すと要約が静かに欠ける。
+// 見出しは対象にしない（節の名前が記入例の語と重なっても構造は壊さない）。
+//
+// キーの作り方（templateText の見出し以外の各行から）:
+//   - 行全体
+//   - 「」で括られた例（ACTION_RULE は「- [ ] 内容（担当: ○○ / 期限: ○○）」を
+//     説明文の中に埋めているので、括りの中だけを取り出す）
+//   - 例の末尾の「（担当: ○○ / 期限: ○○）」を、丸ごと外したもの・片方だけ残したもの
+//     （ルールに「無ければその項目は書かず」とあるので、モデルは「内容」
+//      「内容（担当: ○○）」の形でも写してくる）
+const TEMPLATE_KEY_STRIP = /[\s（）()「」『』【】［］\[\]、。,.:：;；/／・\-—–…!?！？*_]/g;
+function templateKey(text) {
+  return String(text || '').replace(TEMPLATE_KEY_STRIP, '').toLowerCase();
+}
+const LIST_MARK = /^\s*(?:[-*＊－–—•◦▪・]\s*(?:[\[［][ xXｘＸ×　]?[\]］]\s*)?|[0-9０-９]+[.．)）、]\s*)/;
+
+function templateKeys(templateText) {
+  const keys = new Set();
+  const addVariants = (frag) => {
+    const body = frag.replace(LIST_MARK, '').trim();
+    if (!body) return;
+    keys.add(templateKey(body));
+    // 「内容（担当: ○○ / 期限: ○○）」→ 「内容」「内容（担当: ○○）」「内容（期限: ○○）」
+    const paren = body.match(/^(.*?)[（(]([^（()）]*)[）)]\s*$/);
+    if (!paren) return;
+    const head = paren[1].trim();
+    if (head) keys.add(templateKey(head));
+    const parts = paren[2].split(/[/／]/).map((p) => p.trim()).filter(Boolean);
+    if (parts.length > 1) for (const p of parts) keys.add(templateKey(`${head}（${p}）`));
+  };
+  for (const raw of String(templateText || '').split('\n')) {
+    const line = raw.trim();
+    if (!line || /^#{1,4}\s/.test(line)) continue;
+    addVariants(line);
+    for (const q of line.matchAll(/「([^「」]+)」/g)) addVariants(q[1]);
+  }
+  keys.delete('');
+  return keys;
+}
+
+function dropTemplateEcho(blocks, templateText) {
+  if (!templateText || !String(templateText).trim()) return blocks;
+  const keys = templateKeys(templateText);
+  if (keys.size === 0) return blocks;
+  return blocks.filter((b) => b.type === 'heading' || !keys.has(templateKey(b.text)));
+}
+
 function blocksToMarkdown(page, segments) {
   let md = `# ${page.title || '議事録'}\n\n`;
   md += `- 日時: ${new Date(page.createdAt).toLocaleString('ja-JP')}\n`;
@@ -141,4 +247,4 @@ function blocksToMarkdown(page, segments) {
   return md;
 }
 
-module.exports = { fmtClock, markdownToBlocks, blocksToMarkdown, stripInlineMarkdown, dropRedundantEmpty };
+module.exports = { fmtClock, markdownToBlocks, blocksToMarkdown, stripInlineMarkdown, dropRedundantEmpty, dropTemplateEcho };
