@@ -28,13 +28,30 @@ function dirs() {
   };
 }
 
+// 「ファイルが無い」と「読めたが壊れている」を分ける。壊れていたら退避してから
+// fallback を返す（main.js の loadJson と同じ扱い）。退避しないと、次の保存で
+// 壊れたファイルが既定値で上書きされ、人手でも復旧できなくなる。
+// 時刻はファイル名に使えるよう ':' '.' を落とす（Windows は ':' を許さない）。
 function readJson(file, fallback) {
+  let raw;
   try {
-    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!fs.existsSync(file)) return fallback;
+    raw = fs.readFileSync(file, 'utf8');
   } catch (e) {
     console.error('store: read failed', file, e.message);
+    return fallback;
   }
-  return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error('store: broken json', file, e.message);
+    try {
+      const broken = `${file}.broken-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+      fs.renameSync(file, broken);
+      console.error('store: 壊れたファイルを退避しました:', broken);
+    } catch (e2) { console.error('store: 退避に失敗', file, e2.message); }
+    return fallback;
+  }
 }
 
 // 書き込み中の電源断でファイルが壊れないよう、一時ファイル経由で置換する
@@ -56,16 +73,51 @@ function init(userDataPath) {
   fs.mkdirSync(d.transcripts, { recursive: true });
   index = readJson(d.indexFile, { version: 2, pages: [] });
   if (!index || !Array.isArray(index.pages)) index = { version: 2, pages: [] };
-  // 古い世代の索引には searchText が無く、検索が本文に当たらない。
-  // 起動時に1回だけ、無い項目を作り直す。
-  let migrated = false;
-  for (let i = 0; i < index.pages.length; i++) {
-    if (typeof index.pages[i].searchText === 'string') continue;
-    const page = getPage(index.pages[i].id);
-    if (page) { index.pages[i] = summarize(page); migrated = true; }
-  }
-  if (migrated) writeJson(d.indexFile, index);
+  if (reconcile()) writeJson(d.indexFile, index);
   return ROOT;
+}
+
+// 索引と pages/ の食い違いを直す。真実は常に pages/ 側（索引は一覧用の写しに過ぎない）。
+//   (a) 索引に無い page.json → summarize して復帰。索引が壊れて空になった場合の
+//       「全議事録が消えたまま」もこれで直る（全ページが (a) になる＝再構築）。
+//   (b) 索引にあって page.json が無い行 → 幽霊行なので除く。
+//   (c) 古い世代の索引には searchText が無く、検索が本文に当たらない → 作り直す。
+// 起動のたびに全ページを読むのは避けたいので、(a)(c) に該当する行だけ読む。
+// 変更があったときだけ true を返し、呼び出し側が索引を書く。
+function reconcile() {
+  let onDisk;
+  try {
+    onDisk = new Set(fs.readdirSync(dirs().pages)
+      .filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -'.json'.length)));
+  } catch (e) {
+    console.error('store: pages/ を読めない', e.message);
+    return false;
+  }
+  let changed = false;
+  const seen = new Set();
+  const kept = [];
+  for (let i = 0; i < index.pages.length; i++) {
+    const entry = index.pages[i];
+    if (!entry || typeof entry.id !== 'string' || !onDisk.has(entry.id) || seen.has(entry.id)) {
+      changed = true;
+      continue;
+    }
+    seen.add(entry.id);
+    if (typeof index.pages[i].searchText === 'string') { kept.push(entry); continue; }
+    const page = getPage(entry.id);
+    if (page) { kept.push(summarize(page)); changed = true; } else kept.push(entry);
+  }
+  for (const id of onDisk) {
+    if (seen.has(id)) continue;
+    const page = getPage(id);
+    if (!page || page.id !== id) continue;   // 壊れた page.json は getPage が退避済み
+    kept.push(summarize(page));
+    changed = true;
+  }
+  if (!changed) return false;
+  index.pages = kept;
+  index.pages.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  return true;
 }
 
 // ---------------------------------------------------------------- インデックス
@@ -124,8 +176,27 @@ function getTranscript(id) {
   return t && Array.isArray(t.segments) ? t.segments : [];
 }
 
+// 出典の被覆率「🔗 出典 x/y」。要約直後の値を持ち越すと、人が行を足したり書き換えたり
+// したあとに数が合わなくなるので、保存のたびにブロックから数え直す。
+//   分母: bullet/todo のうち、短すぎて対象外（citeSkip: cite.js が付ける）でも
+//         人が足した行（manual）でもないもの
+//   分子: そのうち出典があり、人が書き換えていない（stale ではない）もの
+// citeStat に他のキーがあっても消さない（表示側が知らないキーを持ち越せるように）。
+function citeStatOf(blocks) {
+  let total = 0;
+  let linked = 0;
+  for (const b of blocks) {
+    if (b.type !== 'bullet' && b.type !== 'todo') continue;
+    if (b.citeSkip || b.citeState === 'manual') continue;
+    total++;
+    if (Array.isArray(b.cites) && b.cites.length && b.citeState !== 'stale') linked++;
+  }
+  return { linked, total };
+}
+
 function savePage(page) {
   page.updatedAt = new Date().toISOString();
+  page.citeStat = { ...(page.citeStat || {}), ...citeStatOf(page.blocks || []) };
   writeJson(pageFile(page.id), page);
   reindexPage(page);
   return page;
@@ -156,12 +227,15 @@ function createPage({ title, date, durationSec, memo, blocks, segments, createdA
   return page;
 }
 
+// 索引から外して書く → transcript → page の順。途中で落ちても、索引に「本体の無い行」
+// （開くと空になる幽霊行）は残らない。逆に page.json が残れば次回起動の reconcile が
+// 索引へ戻す（真実はファイル側）ので、消し損ねが黙って失われることもない。
 function deletePage(id) {
-  for (const f of [pageFile(id), transcriptFile(id)]) {
-    try { fs.unlinkSync(f); } catch (_) { /* noop */ }
-  }
   index.pages = index.pages.filter((p) => p.id !== id);
   writeJson(dirs().indexFile, index);
+  for (const f of [transcriptFile(id), pageFile(id)]) {
+    try { fs.unlinkSync(f); } catch (_) { /* noop */ }
+  }
   return index.pages;
 }
 
@@ -171,7 +245,13 @@ function updateBlock(pageId, blockId, patch) {
   if (!page) return null;
   const b = page.blocks.find((x) => x.id === blockId);
   if (!b) return null;
-  if (typeof patch.text === 'string') b.text = patch.text;
+  if (typeof patch.text === 'string' && patch.text !== b.text) {
+    // 人が書き換えた要点は、出典がまだ元の文に対応しているか分からない。
+    // cites は残す（根拠を辿れる方が有用）が、被覆率の分子からは外す（stale）。
+    // 人が足した行（manual）はもともと出典の対象外なので、そのまま。
+    if (b.citeState !== 'manual') b.citeState = 'stale';
+    b.text = patch.text;
+  }
   if (typeof patch.checked === 'boolean') b.checked = patch.checked;
   if (typeof patch.type === 'string') b.type = patch.type;
   return savePage(page);
@@ -194,7 +274,8 @@ function updateSegment(pageId, segId, patch) {
 function insertBlock(pageId, afterBlockId, type) {
   const page = getPage(pageId);
   if (!page) return null;
-  const block = { id: newId('b'), type: type || 'bullet', text: '', cites: [] };
+  // 人が足した行。LLM の要約ではないので出典の対象外（被覆率の分母に入れない）
+  const block = { id: newId('b'), type: type || 'bullet', text: '', cites: [], citeState: 'manual' };
   const i = page.blocks.findIndex((x) => x.id === afterBlockId);
   if (i >= 0) page.blocks.splice(i + 1, 0, block);
   else page.blocks.push(block);
