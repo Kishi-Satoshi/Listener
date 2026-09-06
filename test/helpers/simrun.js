@@ -161,6 +161,14 @@ async function load(htmlPath, opt = {}) {
     createMediaStreamDestination() { return { stream: fakeStream(), connect: noop }; }
     resume() { return Promise.resolve(); }
     close() { return Promise.resolve(); }
+    // WAV変換（blobToWav16k）を最後まで通す。ここが無いと変換が常に失敗し、
+    // 「区間が送られたか」を見る検査が変換失敗と区別できない。
+    decodeAudioData() { return Promise.resolve({ duration: 0.01, sampleRate: 48000, numberOfChannels: 1, length: 480 }); }
+  }
+  class FakeOfflineAudioContext {
+    constructor(ch, len, rate) { this.length = len; this.sampleRate = rate; this.destination = {}; }
+    createBufferSource() { return { buffer: null, connect: noop, start: noop }; }
+    startRendering() { const n = this.length; return Promise.resolve({ getChannelData: () => new Float32Array(n) }); }
   }
   class FakeMediaRecorder {
     constructor(stream, o) { this.stream = stream; this.mimeType = (o && o.mimeType) || 'audio/webm'; this.state = 'inactive'; this.ondataavailable = null; this.onstop = null; this.onerror = null; }
@@ -180,7 +188,7 @@ async function load(htmlPath, opt = {}) {
     requestAnimationFrame: (fn) => { if (rafLeft > 0) { rafLeft--; rafQ.push(fn); } return ++rafId; },
     cancelAnimationFrame: () => { rafQ.length = 0; },
     addEventListener: noop, removeEventListener: noop,
-    AudioContext: FakeAudioContext, webkitAudioContext: FakeAudioContext,
+    AudioContext: FakeAudioContext, webkitAudioContext: FakeAudioContext, OfflineAudioContext: FakeOfflineAudioContext,
     MediaRecorder: FakeMediaRecorder,
     Blob: class { constructor(p, o) { this.parts = p || []; this.type = (o && o.type) || ''; this.size = 1; } arrayBuffer() { return Promise.resolve(new ArrayBuffer(0)); } },
     navigator: {

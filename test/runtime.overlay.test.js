@@ -70,3 +70,63 @@ test('実際に描いた色は、ピルの地の上で見える', () => {
     assert.ok(r >= 2.0, `描画色 ${p} がピルの地 rgb(${bg.slice(0, 3).join(',')}) に埋もれる（コントラスト比 ${r.toFixed(2)}）`);
   }
 });
+
+/*
+ * 一時停止まわり。実機の MediaRecorder.stop() は onstop を非同期に呼ぶ
+ * （sim の FakeMediaRecorder は同期）。一時停止で recorder を先に捨てると、
+ * あとから走る onstop が捨てた recorder を読んで落ち、最大75秒の発言が消える。
+ */
+async function 議事録を一時停止まで(opt = {}) {
+  const log = await load(OVL);
+  const MR = log.window.MediaRecorder;
+  MR.prototype.stop = function () {
+    this.state = 'inactive';
+    setImmediate(() => { if (this.onstop) this.onstop(); });   // 実機と同じく後で発火
+  };
+  log.fire('onStart', { mode: 'meeting', segmentSec: 75, sound: false, systemAudio: false });
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '録音開始で例外');
+  log.byId.get('pauseBtn').click();
+  if (!opt.noDrain) await log.drain();
+  return log;
+}
+
+test('一時停止で締めた区間は、onstop が非同期でも届く', async () => {
+  const log = await 議事録を一時停止まで();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '一時停止で例外');
+  assert.strictEqual(log.called('sendSegment').length, 1, '一時停止で締めた区間がメインに渡らない');
+  assert.strictEqual(log.called('sendSegment')[0].args[2], false, '一時停止の区間が最後の区間として送られている');
+  assert.deepStrictEqual(log.called('reportPause').map((c) => c.args[0]), [true], 'main へ一時停止が伝わっていない');
+});
+
+test('一時停止中に終了すると、締めた区間の後に空の最後の区間が届く', async () => {
+  const log = await 議事録を一時停止まで();
+  log.fire('onStop');
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '終了で例外');
+  const segs = log.called('sendSegment').map((c) => c.args[2]);
+  assert.deepStrictEqual(segs, [false, true], '区間の並びが違う（締めた区間 → 最後の区間 の順で1回ずつ）');
+});
+
+test('区間を締めている最中に終了しても、最後の区間は1回だけ届く', async () => {
+  const log = await 議事録を一時停止まで({ noDrain: true });   // onstop がまだ走っていない
+  log.fire('onStop');
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '終了で例外');
+  const segs = log.called('sendSegment').map((c) => c.args[2]);
+  assert.deepStrictEqual(segs, [true], '最後の区間が二重に届く／届かない');
+  assert.ok(log.called('sendSegment')[0].args[0].length > 0, '締めた区間の音声が捨てられている');
+});
+
+test('再開すると次の区間が始まり、終了で最後の区間が届く', async () => {
+  const log = await 議事録を一時停止まで();
+  log.byId.get('pauseBtn').click();   // 再開
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '再開で例外');
+  assert.deepStrictEqual(log.called('reportPause').map((c) => c.args[0]), [true, false]);
+  log.fire('onStop');
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '終了で例外');
+  const segs = log.called('sendSegment').map((c) => c.args[2]);
+  assert.deepStrictEqual(segs, [false, true], '再開後の区間が最後の区間として届かない');
+});
