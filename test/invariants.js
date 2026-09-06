@@ -341,6 +341,21 @@ const INVARIANTS = [
       return v;
     } },
 
+  { id: 'COLOR-05', 分類: '色',
+    表明: 'セレクタの規則の中に別の規則がネストされていない（CSS ネストを使わない。@media / @keyframes の中に規則を置くのは可）',
+    由来: 'ダーク専用の固定色を @media の外の html, body { } の中にネストしてしまい、複合セレクタになって詳細度が上がり、基底規則に勝ってライトでもダークの色が当たった（button.ghost の文字が薄灰色に）。@media は詳細度を変えないので、ネストは @media の意図を壊す',
+    check(w) {
+      const v = [];
+      for (const s of Object.values(w.screens)) {
+        if (!s.css.length) { v.push(`${s.rel}: CSS の規則が1つも取れない（検査が空振りしている）`); continue; }
+        for (const r of s.css) {
+          if (r.at.startsWith('@keyframes') || r.at.startsWith('@-webkit-keyframes')) continue;
+          if (r.body.includes('{')) v.push(`${s.rel}:${r.line}行 ${r.selectors.join(', ')} { … } の中に別の規則がネストされている`);
+        }
+      }
+      return v;
+    } },
+
   // ---- Electron の地雷 ---------------------------------------------------
   { id: 'WIN-01', 分類: 'Electron',
     表明: '透過ウィンドウは表1の地雷を1つも踏んでいない',

@@ -20,6 +20,26 @@ function parse(css, at = '') {
       const inner = parse(body, head);
       if (inner.length) out.push(...inner);
       else out.push({ at: at ? `${at} ${head}` : head, sel: head, decls: decls(body) });
+    } else if (body.includes('{')) {
+      // 規則の中に規則がネストされている（CSS ネスト）。ブラウザは内側を
+      // 「親 子」の複合セレクタとして効かせるので、読み飛ばさずに独立した
+      // 規則として返す（nested に親を記す）。@media の外にネストされた
+      // ダーク専用色がライトにも当たった事故を、対比計算で捕まえるため。
+      let k = 0, own = '';
+      const at0 = out.length;   // 親の規則は内側より前（出現順）に置く
+      while (k < body.length) {
+        const o = body.indexOf('{', k);
+        if (o < 0) { own += body.slice(k); break; }
+        const pre = body.slice(k, o);
+        const semi = pre.lastIndexOf(';');
+        own += pre.slice(0, semi + 1);
+        const inner = pre.slice(semi + 1).trim();
+        let d2 = 1, j2 = o + 1;
+        while (j2 < body.length && d2 > 0) { if (body[j2] === '{') d2++; else if (body[j2] === '}') d2--; j2++; }
+        out.push({ at, sel: inner, nested: head, decls: decls(body.slice(o + 1, j2 - 1)) });
+        k = j2;
+      }
+      out.splice(at0, 0, { at, sel: head, decls: decls(own) });
     } else {
       out.push({ at, sel: head, decls: decls(body) });
     }

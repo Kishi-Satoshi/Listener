@@ -93,6 +93,7 @@
   .field .row { display: flex; gap: 8px; align-items: center; }
   .field .row > input, .field .row > select { flex: 1; min-width: 0; }
   .field .desc { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .field .desc.ng { color: var(--danger); }
   .check { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 11px; cursor: pointer; }
   /* 設定のオン・オフはトグルで表す。議事録のチェックボックス（.blk 内）は
      完了の印なので四角のまま。 */
@@ -223,6 +224,11 @@
   .cite:hover { background: var(--accent); color: #fff; }
   .nocite { display: inline-block; margin-left: 6px; font-size: 10px; color: var(--faint);
     border: 1px dashed rgba(56,60,70,.28); border-radius: 5px; padding: 2px 6px; vertical-align: middle; }
+  /* 札の意味の違い。「手書き」は人が足した行（照合対象外）なので実線で落ち着かせ、
+     「編集済み」は再生成で付け直せる呼びかけなのでアクセント色にする。
+     トークンだけで組むので、ダークでもそのまま読める。 */
+  .nocite.manual { border-style: solid; color: var(--muted); }
+  .nocite.stale { color: var(--accent-deep); border-color: var(--accent); }
 
   /* ---------- 文字起こし ---------- */
   .seg { display: flex; gap: 10px; padding: 5px 6px; border-radius: 8px; line-height: 1.8; }
@@ -334,10 +340,10 @@
     }
     body { background: #171a21; }
     .bg { background: linear-gradient(165deg, #191d27 0%, #171a22 45%, #201b17 100%); }
-  }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { height: 100%;
-    /* 変数化から漏れている固定色。ライトの墨色・純白は暗い地では読めない。 */
+    /* 変数化から漏れている固定色。ライトの墨色・純白は暗い地では読めない。
+       ここは必ず @media の直下にフラットに置く。以前、html, body { } の中に
+       ネストして置いたところ、複合セレクタとして詳細度が上がり、@media の
+       外にあったためライトでもダークの薄灰色が当たった（COLOR-05）。 */
     nav button.active { box-shadow: 0 2px 10px rgba(0,0,0,.35), inset 0 1px 0 rgba(var(--srf), .9); }
     button.ghost { color: #c9cdd8; }
     ::placeholder { color: rgba(226,230,240,.35); }
@@ -349,6 +355,8 @@
     /* 背景の装飾ブロブはライト用のパステル。暗い地では光りすぎるので絞る */
     .blob { opacity: .16; }
   }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
 </style>
 </head>
 <body>
@@ -455,10 +463,12 @@
           <div class="field">
             <label for="hotkey">音声入力ホットキー（クリックしてキーを押す）</label>
             <input type="text" id="hotkey" readonly />
+            <div class="desc ng" id="hotkeyWarn" hidden></div>
           </div>
           <div class="field">
             <label for="meetingHotkey">議事録ホットキー（開始／終了をトグル）</label>
             <input type="text" id="meetingHotkey" readonly />
+            <div class="desc ng" id="meetingHotkeyWarn" hidden></div>
             <div class="desc">※ 左右のAltは区別されません（どちらでも動作）。</div>
           </div>
           <div class="field">
@@ -646,6 +656,12 @@
   let mtPausedMs = 0;
   let mtWasActive = false;
   let dragBlockId = null;   // 並べ替え中のブロック
+  let memoTimer = null;     // メモの遅延保存（500ms）。ページ切替・記録開始の前に flushMemo で確定する
+  let memoFlush = null;     // 保留中のメモ保存を即時に走らせる関数
+  const summarizing = new Set();   // 要約を生成中のページ id。描き直してもボタンを押せないままにする
+  // 日本語入力の変換確定 Enter。Chromium は isComposing、古い IME 経路は keyCode 229 で来る。
+  // どの編集欄でも「確定して抜ける」にしてはいけない。
+  const imeEnter = (ev) => ev.isComposing || ev.keyCode === 229;
 
   // ---------------- タブ ----------------
   function showTab(n) {
@@ -832,9 +848,16 @@
 
   // ================= 議事録: ページ =================
   async function openPage(id) {
-    flushSegEdit();
+    flushEdits();
     const r = await window.koeApp.pageGet(id);
-    if (!r) { toast('ページが見つかりません'); return; }
+    if (!r) {
+      // 一覧にあるのに本体が無い「幽霊行」。残しておくと何度押しても開けないので、
+      // 知らせたうえで一覧から外す（本体は無いので削除で失うものは無い）。
+      toast('ページが見つかりません。一覧から外します');
+      await window.koeApp.pageDelete(id);
+      await refreshList();
+      return;
+    }
     curId = id; curPage = r.page; curSegs = r.segments;
     pane = curPage.blocks.length ? 'note' : 'script';
     renderList(); renderPage();
@@ -913,13 +936,23 @@
       b.className = primary ? 'action' : 'ghost'; b.textContent = label; b.onclick = fn;
       acts.appendChild(b); return b;
     };
-    mk(curPage.blocks.length ? '要約を再生成' : '要約を生成', async (e) => {
-      const b = e.target; b.disabled = true; b.textContent = '生成中…';
-      const r = await window.koeApp.pageSummarize(curId);
-      if (!r.ok) { toast(r.error || '生成に失敗しました'); if (/未設定/.test(r.error||'')) showTab('settings'); }
+    // 生成中は押せない。生成の途中で page:updated が来て描き直されても、
+    // summarizing に入っている間は押せないままにする（main 側は同じページの
+    // 二重起動を同じ Promise で返すが、画面側でも二重に押させない）。
+    const sumBtn = mk(curPage.blocks.length ? '要約を再生成' : '要約を生成', async () => {
+      const pid = curId;
+      if (summarizing.has(pid)) return;
+      summarizing.add(pid);
+      sumBtn.disabled = true; sumBtn.textContent = '生成中…';
+      let r;
+      try { r = await window.koeApp.pageSummarize(pid); }
+      catch (e) { r = { ok: false, error: e && e.message ? e.message : String(e) }; }
+      finally { summarizing.delete(pid); }
+      if (!r || !r.ok) { toast((r && r.error) || '生成に失敗しました'); if (/未設定/.test((r && r.error) || '')) showTab('settings'); }
       else toast(`議事録を作成しました（出典 ${r.stat.linked}/${r.stat.total}）`);
-      await openPage(curId);
+      if (pid === curId) await openPage(pid);
     }, !curPage.blocks.length);
+    if (summarizing.has(curId)) { sumBtn.disabled = true; sumBtn.textContent = '生成中…'; }
     // コピーは、いま開いているタブの中身を写す。議事録タブなら議事録、
     // 文字起こしタブなら文字起こし、メモタブならメモ。
     mk('コピー', async () => {
@@ -984,6 +1017,7 @@
       }
     };
     inp.onkeydown = (ev) => {
+      if (imeEnter(ev)) return;
       if (ev.key === 'Enter') { ev.preventDefault(); finish(true); }
       else if (ev.key === 'Escape') { ev.preventDefault(); finish(false); }
     };
@@ -1081,14 +1115,20 @@
       const txt = document.createElement('div');
       txt.className = 'txt'; txt.contentEditable = 'true'; txt.spellcheck = false;
       txt.textContent = b.text;
-      txt.onblur = async () => {
+      // 保存は「編集を始めたページ」に対して行う。flushEdits（ページ切替・記録開始）
+      // からも呼ばれるので、pid を引数で受け、別のページへ移った後は画面を触らない。
+      txt._commit = (pid) => {
         const v = txt.textContent.trim();
         if (v === b.text) return;
         b.text = v;
-        await window.koeApp.blockUpdate(curId, b.id, { text: v });
-        refreshList();
+        // 本文を変えたら出典との対応は古くなる。store も stale を付けるが、
+        // 次に pageGet するまでの間も札で示す。
+        if (b.type === 'bullet' || b.type === 'todo') { b.citeState = 'stale'; renderCiteBadge(el, b); }
+        window.koeApp.blockUpdate(pid, b.id, { text: v }).then(() => { if (pid === curId) refreshList(); });
       };
+      txt.onblur = () => txt._commit(curId);
       txt.onkeydown = async (ev) => {
+        if (imeEnter(ev)) return;   // 変換確定の Enter / 変換中の Backspace は編集操作にしない
         if (ev.key === 'Enter') {
           ev.preventDefault(); txt.blur();
           const r = await window.koeApp.blockInsert(curId, b.id, b.type === 'heading' ? 'bullet' : b.type);
@@ -1124,31 +1164,8 @@
       // 出典チップ
       if (b.type === 'bullet' || b.type === 'todo') {
         const wrap = document.createElement('span'); wrap.className = 'cites';
-        const cites = Array.isArray(b.cites) ? b.cites : [];
-        if (cites.length) {
-          // チップには発言の時刻を出す。以前は「そのブロック内で何番目の出典か」を
-          // 出していたので、出典1件のブロックは必ず「1」になり、
-          // 要約の全要点が同じ1区間に貼り付いていても気づけなかった。
-          // 文字起こしタブが同じ時刻表記なので、そのまま突き合わせられる。
-          cites
-            .map((sid) => ({ sid, i: curSegs.findIndex((s) => s.id === sid) }))
-            .sort((a, z) => a.i - z.i)   // 表示は発言の時系列。保存はスコア順のまま
-            .forEach(({ sid, i }) => {
-              const seg = i >= 0 ? curSegs[i] : null;
-              const c = document.createElement('button');
-              c.className = 'cite';
-              c.textContent = seg ? fmtClock(seg.atMs) : '?';
-              c.title = seg ? `${fmtClock(seg.atMs)} 時点の発言\n${seg.text.slice(0, 80)}`
-                : '該当の発言が見つかりません';
-              c.onclick = () => jumpToSegment(sid);
-              wrap.appendChild(c);
-            });
-        } else if (txt.textContent.trim().length >= 6) {
-          const n = document.createElement('span'); n.className = 'nocite';
-          n.textContent = '根拠なし'; n.title = '文字起こしに対応する発言が見つかりませんでした';
-          wrap.appendChild(n);
-        }
         el.appendChild(wrap);
+        renderCiteBadge(el, b);
       }
 
       const del = document.createElement('button');
@@ -1157,6 +1174,50 @@
       el.appendChild(del);
 
       box.appendChild(el);
+    }
+  }
+
+  // 出典チップと札（.cites の中身）を描く。本文の編集後に札だけ描き直したいので独立させてある。
+  // 札の意味は store / cite 側の印で分ける（画面の文字数では判定しない。短い行は
+  // store が citeSkip を付ける）:
+  //   citeSkip            … 短すぎて照合対象外 → 札なし
+  //   citeState 'manual'  … 人が追加した行 → 「手書き」
+  //   citeState 'stale'   … 編集後に照合し直していない → チップは残しつつ「編集済み」
+  //   それ以外で出典が空  … 照合したが見つからなかった → 「根拠なし」
+  function renderCiteBadge(el, b) {
+    const wrap = el.querySelector('.cites');
+    if (!wrap) return;
+    wrap.textContent = '';
+    const cites = Array.isArray(b.cites) ? b.cites : [];
+    if (cites.length) {
+      // チップには発言の時刻を出す。以前は「そのブロック内で何番目の出典か」を
+      // 出していたので、出典1件のブロックは必ず「1」になり、
+      // 要約の全要点が同じ1区間に貼り付いていても気づけなかった。
+      // 文字起こしタブが同じ時刻表記なので、そのまま突き合わせられる。
+      cites
+        .map((sid) => ({ sid, i: curSegs.findIndex((s) => s.id === sid) }))
+        .sort((a, z) => a.i - z.i)   // 表示は発言の時系列。保存はスコア順のまま
+        .forEach(({ sid, i }) => {
+          const seg = i >= 0 ? curSegs[i] : null;
+          const c = document.createElement('button');
+          c.className = 'cite';
+          c.textContent = seg ? fmtClock(seg.atMs) : '?';
+          c.title = seg ? `${fmtClock(seg.atMs)} 時点の発言\n${seg.text.slice(0, 80)}`
+            : '該当の発言が見つかりません';
+          c.onclick = () => jumpToSegment(sid);
+          wrap.appendChild(c);
+        });
+    }
+    let badge = null;
+    if (b.citeSkip) badge = null;
+    else if (b.citeState === 'manual') badge = ['manual', '手書き', '自分で追加した行（出典の照合対象外）'];
+    else if (b.citeState === 'stale') badge = ['stale', '編集済み', '編集後に出典を照合し直していません。「要約を再生成」で付け直せます'];
+    else if (!cites.length) badge = ['', '根拠なし', '文字起こしに対応する発言が見つかりませんでした'];
+    if (badge) {
+      const n = document.createElement('span');
+      n.className = 'nocite' + (badge[0] ? ` ${badge[0]}` : '');
+      n.textContent = badge[1]; n.title = badge[2];
+      wrap.appendChild(n);
     }
   }
 
@@ -1191,6 +1252,36 @@
     if (t) t.blur();
   }
 
+  // 編集中のものを全部確定させる: タイトル・要点の本文・メモ・文字起こし。
+  // ページ切替と記録開始（ホットキーで来るので blur が来ない）の直前に呼ぶ。
+  // 保存先は「いま開いているページ」で固定し、保存の応答が別ページの表示に
+  // 混ざらないよう、各 commit は pid を閉じ込めて呼ぶ。
+  function flushEdits() {
+    const pid = curId;
+    flushSegEdit();
+    if (!pid || !curPage) return;
+    flushMemo();
+    commitTitle(pid);
+    for (const t of $('pNote').querySelectorAll('.blk .txt')) if (typeof t._commit === 'function') t._commit(pid);
+  }
+
+  // 保留中のメモ保存（500ms の遅延）を今すぐ走らせる
+  function flushMemo() {
+    if (!memoTimer) return;
+    clearTimeout(memoTimer); memoTimer = null;
+    const f = memoFlush; memoFlush = null;
+    if (f) f();
+  }
+
+  // タイトルを保存する。変わっていなければ何もしない。別ページへ移った後は画面を触らない。
+  function commitTitle(pid) {
+    if (!pid || !curPage || pid !== curId) return;
+    const v = $('pTitle').textContent.trim();
+    if (!v || v === curPage.title) { $('pTitle').textContent = curPage.title; return; }
+    curPage.title = v;
+    window.koeApp.pageSetTitle(pid, v).then(() => refreshList());
+  }
+
   function renderScript() {
     const box = $('pScript');
     // 編集中は描き直さない。要約完了などで page:updated が来ても、入力中の行を失わない。
@@ -1212,7 +1303,7 @@
       tx.onfocus = () => el.classList.add('editing');
       tx.onkeydown = (ev) => {
         // 日本語入力の変換確定 Enter を「保存して抜ける」にしない
-        if (ev.isComposing || ev.keyCode === 229) return;
+        if (imeEnter(ev)) return;
         if (ev.key === 'Enter') { ev.preventDefault(); tx.blur(); }
         else if (ev.key === 'Escape') { ev.preventDefault(); tx.textContent = s.text; tx.blur(); }
       };
@@ -1252,10 +1343,17 @@
     const ta = document.createElement('textarea');
     ta.rows = 10; ta.value = curPage.memo || '';
     ta.placeholder = '例: 週次定例。議題: 売上見込み / 案件進捗 / 採用状況';
-    let t = null;
     ta.oninput = () => {
-      clearTimeout(t);
-      t = setTimeout(async () => { await window.koeApp.pageSetMemo(curId, ta.value); curPage.memo = ta.value; }, 500);
+      // 保存先は「書いたときのページ」。500ms の間にページを切り替えると、
+      // 発火時の curId は次のページになっていて、そちらのメモを上書きしてしまう。
+      const pid = curId;
+      clearTimeout(memoTimer);
+      memoFlush = () => {
+        const v = ta.value;
+        window.koeApp.pageSetMemo(pid, v);
+        if (pid === curId && curPage) curPage.memo = v;
+      };
+      memoTimer = setTimeout(() => { memoTimer = null; const f = memoFlush; memoFlush = null; if (f) f(); }, 500);
     };
     label.append(l, ta); box.appendChild(label);
   }
@@ -1269,16 +1367,12 @@
     el.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
 
-  // タイトル編集
-  $('pTitle').onblur = async () => {
-    if (!curId) return;
-    const v = $('pTitle').textContent.trim();
-    if (!v || v === curPage.title) { $('pTitle').textContent = curPage.title; return; }
-    curPage.title = v;
-    await window.koeApp.pageSetTitle(curId, v);
-    refreshList();
+  // タイトル編集（保存の本体は commitTitle。flushEdits からも呼ばれる）
+  $('pTitle').onblur = () => commitTitle(curId);
+  $('pTitle').onkeydown = (e) => {
+    if (imeEnter(e)) return;
+    if (e.key === 'Enter') { e.preventDefault(); $('pTitle').blur(); }
   };
-  $('pTitle').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); $('pTitle').blur(); } };
 
   // ---------------- 録音セッション ----------------
   function mtClock() {
@@ -1297,7 +1391,7 @@
     // 新しい記録が始まったように見えない。
     // （記録中に一覧から過去の議事録を開き直すのは今までどおりできる）
     if (st.active && !mtWasActive && curId) {
-      flushSegEdit();
+      flushEdits();   // ホットキー開始だと blur が来ないので、編集中の要点・タイトル・メモをここで確定する
       curId = null; curPage = null; curSegs = [];
       renderList(); renderPage();
     }
@@ -1342,6 +1436,10 @@
           };
           wrap.append(l, ta);
           memoBox.appendChild(wrap);
+          // 文字起こしタブへ切り替えるのは記録を始めたこの1回だけ。
+          // 区間が届くたび（meeting:update）に切り替えると、メモを書いている
+          // 最中に文字起こしタブへ引き戻されて書けない。
+          setPane('script');
         }
 
         curSegs = st.segments || [];
@@ -1357,7 +1455,6 @@
           d.textContent = '発言を待っています…（最初の結果は開始から30秒〜1分ほどで表示されます）';
           box.appendChild(d);
         }
-        setPane('script');
         box.scrollTop = box.scrollHeight;
       }
     } else {
@@ -1558,6 +1655,23 @@
   }
   attachHotkey('hotkey'); attachHotkey('meetingHotkey');
 
+  // ホットキーの登録状態。他のアプリが同じキーを使っていると globalShortcut の
+  // 登録が黙って失敗し、押しても何も起きない。設定の表示時と保存後に main へ
+  // 聞き、登録できていない欄の下に赤い説明を出す。
+  const HOTKEY_FIELDS = [['hotkey', '音声入力'], ['meetingHotkey', '議事録']];
+  async function refreshHotkeyState() {
+    if (typeof window.koeApp.hotkeyState !== 'function') return;   // 古い preload と組んだときも設定画面は生かす
+    let st;
+    try { st = await window.koeApp.hotkeyState(); } catch (_) { return; }
+    const failed = st && Array.isArray(st.failed) ? st.failed : [];
+    for (const [id, name] of HOTKEY_FIELDS) {
+      const w = $(id + 'Warn'); if (!w) continue;
+      const bad = failed.includes(name);
+      w.textContent = bad ? 'このキーは他のアプリが使用中のため登録できていません' : '';
+      w.hidden = !bad;
+    }
+  }
+
   async function refreshVad() {
     try {
       const s = await window.koeApp.vadStatus();
@@ -1623,7 +1737,10 @@
     if (r.ok) {
       settings = { ...settings, ...next };
       if (!silent) { m.textContent = '保存しました'; m.className = 'save-msg ok'; }
+      // 保存はできたが一部が効いていない（ホットキーを登録できなかった等）
+      if (r.warning) toast(r.warning);
       refreshVad();
+      refreshHotkeyState();
       return true;
     }
     m.textContent = r.error || '保存に失敗しました'; m.className = 'save-msg ng';
@@ -1763,6 +1880,7 @@
     fill(settings);
     settingsLoaded = true;   // ここを通るまで save() は書き込まない
     refreshVad();
+    refreshHotkeyState();
     mtypes = await window.koeApp.meetingTypes();
     try {
       const v = await window.koeApp.appVersion();
