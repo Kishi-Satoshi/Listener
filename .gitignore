@@ -4,3 +4,6 @@ release/
 dist/
 src.backup-*/
 *.log
+
+# Claude Code の作業用 worktree（ツールが作る。リポジトリの内容ではない）
+.claude/
