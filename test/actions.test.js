@@ -241,3 +241,48 @@ test('「担当なし」「期限未定」は落とすだけ（推測で埋め�
   p = parseAction('リリース内容を確定する（費用は要確認）', B);
   assert.strictEqual(p.text, 'リリース内容を確定する（費用は要確認）');
 });
+
+// ---------------------------------------------------------------- 再来週・再来月
+//
+// 「再来週」は「来週」を含むので、左境界の無い /来週/ で拾うと1週間早い日付になる。
+// 会議で「再来週」と言った人は 2 週間後を指している。
+test('「再来週」「再来月」は「来週」「来月」に化けない', () => {
+  assert.strictEqual(due('再来週'), '2026-10-19');
+  assert.notStrictEqual(due('再来週'), due('来週'));
+  assert.strictEqual(due('再来週金曜'), '2026-10-23');
+  assert.strictEqual(due('再来週末'), '2026-10-23');
+  assert.strictEqual(due('再来月'), '2026-12-05');
+  assert.strictEqual(due('再来月末'), '2026-12-31');
+  // approx は「来週」「来月」の扱いに揃える（曜日・末が付けば確定）
+  assert.strictEqual(parseDue('再来週', BASE).approx, true);
+  assert.strictEqual(parseDue('再来月', BASE).approx, true);
+  assert.strictEqual(parseDue('再来週金曜', BASE).approx, false);
+  assert.strictEqual(parseDue('再来月末', BASE).approx, false);
+  // 既存の「来週」「来月」は変わらない
+  assert.strictEqual(due('来週'), '2026-10-12');
+  assert.strictEqual(due('来月'), '2026-11-05');
+});
+
+test('自然文の「再来月末まで」の原文（dueRaw）が「来月末」に潰れない', () => {
+  let r = parseAction('報告書を再来月末までに提出する', BASE);
+  assert.strictEqual(r.dueRaw, '再来月末');
+  assert.strictEqual(r.due, '2026-12-31');
+  r = parseAction('設計書を再来週金曜までに更新する', BASE);
+  assert.strictEqual(r.dueRaw, '再来週金曜');
+  assert.strictEqual(r.due, '2026-10-23');
+});
+
+// ---------------------------------------------------------------- 担当者推定の文字クラス
+//
+// 姓の直前は助詞（に・は・が）なので、ひらがなを名前の文字に含めると
+// 最左貪欲が「今週中に山田」を担当者にしてしまう。長音符「ー」や
+// 異体字「﨑」は名前の一部として受ける。
+test('自然文の担当者推定: 長音符・異体字を落とさず、助詞を飲み込まない', () => {
+  assert.strictEqual(parseAction('ジョーンズさんがレビューする', BASE).assignee, 'ジョーンズ');
+  assert.strictEqual(parseAction('山﨑さんが資料を作る', BASE).assignee, '山﨑');
+  assert.strictEqual(parseAction('今週中に山田さんが資料を作る', BASE).assignee, '山田');
+  assert.strictEqual(parseAction('資料は田中さんに渡す', BASE).assignee, '田中');
+  // 既存の書き方は変わらない
+  assert.strictEqual(parseAction('山田さんが実行計画を確認する', BASE).assignee, '山田');
+  assert.strictEqual(parseAction('佐藤部長が承認する', BASE).assignee, '佐藤');
+});
