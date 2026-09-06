@@ -266,3 +266,229 @@ test('空にした行はコピーに含めない', async () => {
   assert.ok(!/\[0:00\] *\n/.test(c[0].args[0] + '\n'), '空の行が [0:00] だけで写っている');
   assert.ok(c[0].args[0].includes(STANDUP_SEGMENTS[1].text), '残りの行が写っていない');
 });
+
+// ================= 編集中の内容を失わない（メモ・要点・タイトル） =================
+// 保存は「発火したときのページ」に対して行い、ページ切替・記録開始の前には
+// 保留中の編集を確定させる。監査で見つかった取りこぼしをここに移した。
+const メモ欄 = (l) => l.byId.get('pMemo').querySelector('textarea');
+const ブロック = (l, id) => l.byId.get('pNote').querySelectorAll('.blk').find((e) => e.dataset.id === id);
+
+test('メモの遅延保存は、書いたときに開いていたページへ書く（切替後の別ページに書かない）', async () => {
+  const l = await 開いた();
+  const ta = メモ欄(l);
+  assert.ok(ta, 'メモ欄が無い');
+  ta.value = '前のページに書いたメモ';
+  ta.dispatchEvent({ type: 'input' });
+  l.fire('onPageOpen', 'p2');            // 保存が走る前にページ切替
+  await l.drain();
+  const calls = l.called('pageSetMemo');
+  assert.strictEqual(calls.length, 1, '切替の前に保留中のメモが確定されない');
+  assert.deepStrictEqual(calls[0].args, ['p1', '前のページに書いたメモ']);
+  assert.strictEqual(l.byId.get('pTitle').textContent, '二つ目の議事録');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('ホットキーで記録開始しても、編集中の要点とタイトルは元のページへ保存される', async () => {
+  const l = await 開いた();
+  const t = ブロック(l, 'b2').querySelector('.txt');
+  t.textContent = '週次の締めを木曜にする';
+  l.byId.get('pTitle').textContent = '新しい題';
+  l.fire('onMeetingUpdate', { active: true, startedAt: Date.now(), segments: [] });   // 記録開始（blur は来ない）
+  await l.drain();
+  assert.deepStrictEqual(l.called('blockUpdate').map((c) => c.args), [['p1', 'b2', { text: '週次の締めを木曜にする' }]]);
+  assert.deepStrictEqual(l.called('pageSetTitle').map((c) => c.args), [['p1', '新しい題']]);
+  // 記録開始で議事録は閉じているので、画面（白紙）は触らない
+  assert.strictEqual(l.byId.get('pTitle').textContent, '');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('変えていない要点・タイトルは、ページ切替のたびに保存しない', async () => {
+  const l = await 開いた();
+  l.fire('onPageOpen', 'p2');
+  await l.drain();
+  assert.deepStrictEqual(l.called('blockUpdate'), []);
+  assert.deepStrictEqual(l.called('pageSetTitle'), []);
+});
+
+// ================= IME の変換確定 Enter =================
+const TODO_PAGE = () => Object.assign(clone(PAGE), {
+  blocks: [{ id: 't1', type: 'todo', text: '見積を送る', cites: [], assignee: '', dueRaw: '' }],
+});
+
+test('日本語入力の変換確定 Enter は、要点・担当チップ・タイトルのどれでも確定にならない', async () => {
+  const l = await 開いた({ pageGet: (id) => ({ page: Object.assign(TODO_PAGE(), { id }), segments: clone(STANDUP_SEGMENTS) }) });
+  const ime = [{ type: 'keydown', key: 'Enter', isComposing: true }, { type: 'keydown', key: 'Enter', keyCode: 229 }];
+  // 要点: Enter は行の追加、空行の Backspace は削除。変換中はどちらも走らない
+  const txt = ブロック(l, 't1').querySelector('.txt');
+  for (const ev of ime) txt.dispatchEvent(ev);
+  txt.textContent = '';
+  txt.dispatchEvent({ type: 'keydown', key: 'Backspace', keyCode: 229 });
+  await l.drain();
+  assert.deepStrictEqual(l.called('blockInsert'), [], '変換確定の Enter で行が追加される');
+  assert.deepStrictEqual(l.called('blockRemove'), [], '変換中の Backspace で行が消える');
+  // 担当チップ: Enter で確定して入力欄がボタンに戻る。変換中は戻らない
+  const who = ブロック(l, 't1').querySelector('.atag');
+  // 最小DOMに replaceWith が無いので、ここだけ本物と同じ動きを補う
+  const replaceWith = function (n) { this.parentNode.insertBefore(n, this); this.remove(); };
+  who.replaceWith = replaceWith;
+  who.dispatchEvent({ type: 'click' });
+  const inp = ブロック(l, 't1').querySelector('.atag-edit');
+  assert.ok(inp, '担当の入力欄が出ない');
+  inp.replaceWith = replaceWith;
+  for (const ev of ime) inp.dispatchEvent(ev);
+  assert.ok(ブロック(l, 't1').querySelector('.atag-edit'), '変換確定の Enter で担当の編集が終わってしまう');
+  // タイトル
+  const title = l.byId.get('pTitle');
+  const blurs = spyBlur(title);
+  for (const ev of ime) title.dispatchEvent(ev);
+  assert.strictEqual(blurs(), 0, '変換確定の Enter でタイトルの編集が終わってしまう');
+  title.dispatchEvent({ type: 'keydown', key: 'Enter' });
+  assert.strictEqual(blurs(), 1, '普通の Enter で確定しない');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+// ================= 記録中のタブ =================
+test('記録中に区間が届いても、見ていたメモタブから文字起こしタブへ引き戻さない', async () => {
+  const l = await load(APP);
+  const st = { active: true, startedAt: Date.now(), segments: [] };
+  l.fire('onMeetingUpdate', st);
+  await l.drain();
+  assert.ok(l.byId.get('pScript').classList.contains('active'), '記録開始で文字起こしタブに切り替わらない（前提）');
+  l.byId.get('paneBtnMemo').dispatchEvent({ type: 'click' });
+  for (let i = 1; i <= 3; i++) {
+    l.fire('onMeetingUpdate', Object.assign({}, st, { pending: i, segments: [{ id: `s${i}`, atMs: i * 1000, text: `発言${i}` }] }));
+    await l.drain();
+  }
+  assert.ok(l.byId.get('pMemo').classList.contains('active'), '区間が届くたびに文字起こしタブへ強制切替される');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+// ================= ダーク専用色がライトに漏れない =================
+const simcss = require('./helpers/simcss.js');
+test('ライト配色で button.ghost の文字は地に対して 4.5:1 以上ある（ダーク用の薄灰色が漏れていない）', () => {
+  const { root } = parseHTML(fs.readFileSync(APP, 'utf8'));
+  const css = root.querySelectorAll('style').map((s) => s._raw).join('\n');
+  const rules = simcss.parse(css);
+  const light = { at: '' };
+  const ink = simcss.firstColor(simcss.declsFor(rules, 'button.ghost', light).color);
+  const ground = simcss.firstColor(simcss.declsFor(rules, 'body', light).background);
+  assert.ok(ink && ground, '色が読めない（検査が空振りしている）');
+  // ボタンの面は白の半透明。地そのものと純白のどちらの上でも読めること
+  for (const bg of [ground, [255, 255, 255, 1]]) {
+    const c = simcss.contrast(simcss.over(ink, bg), bg);
+    assert.ok(c >= 4.5, `button.ghost の文字 ${JSON.stringify(ink)} の対比が ${c.toFixed(2)} しかない`);
+  }
+});
+
+// ================= 要約ボタンの二重押し =================
+test('要約の生成中は、page:updated で描き直されてもボタンが押せないまま', async () => {
+  let done;
+  const l = await 開いた({ pageSummarize: () => new Promise((r) => { done = r; }) });
+  const btn = () => l.byId.get('pActs').querySelectorAll('button').find((b) => /要約/.test(b.textContent) || /生成中/.test(b.textContent));
+  btn().dispatchEvent({ type: 'click' });
+  await l.drain();
+  assert.strictEqual(l.called('pageSummarize').length, 1);
+  l.fire('onPageUpdated', { page: clone(PAGE), segments: clone(STANDUP_SEGMENTS) });
+  await l.drain();
+  assert.strictEqual(btn().disabled, true, '描き直しでボタンが押せるようになっている（二重起動できる）');
+  done({ ok: true, stat: { linked: 1, total: 1 } });
+  await l.drain();
+  assert.ok(!btn().disabled, '完了後もボタンが押せない');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+// ================= ホットキーの登録状態 =================
+// preload に hotkeyState が足されるまでは、テスト側で公開名だけ補う
+const PRELOAD = fs.readFileSync(path.join(__dirname, '..', 'src', 'preload.js'), 'utf8');
+const preloadWithHotkey = () => PRELOAD.includes('hotkeyState') ? PRELOAD
+  : PRELOAD.replace("exposeInMainWorld('koeApp', {", "exposeInMainWorld('koeApp', {\n  hotkeyState: () => ipcRenderer.invoke('app:hotkey-state'),");
+
+test('登録できなかったホットキーの欄の下に、赤い説明が出る（設定の表示時と保存後）', async () => {
+  let st = { ok: false, failed: ['議事録'], message: '' };
+  const l = await load(APP, { preloadSrc: preloadWithHotkey(), returns: {
+    hotkeyState: () => st,
+    saveSettings: () => ({ ok: true, warning: '議事録ホットキーを登録できませんでした' }),
+  } });
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+  assert.ok(l.called('hotkeyState').length >= 1, '設定の表示時に登録状態を見ていない');
+  const warn = (id) => l.document.getElementById(id + 'Warn');
+  assert.ok(warn('meetingHotkey') && !warn('meetingHotkey').hidden, '議事録ホットキーの警告が出ない');
+  assert.ok(/他のアプリが使用中/.test(warn('meetingHotkey').textContent), '警告の文言が違う');
+  assert.ok(!warn('hotkey') || warn('hotkey').hidden, '登録できている方にも警告が出ている');
+  assert.ok(warn('meetingHotkey').closest('.field') === l.byId.get('meetingHotkey').closest('.field'), '警告が欄の下に無い');
+  // 保存 → 戻り値の warning を toast で出し、状態を取り直す
+  st = { ok: true, failed: [], message: '' };
+  const before = l.called('hotkeyState').length;
+  l.byId.get('tabSettings').dispatchEvent({ type: 'change' });
+  await l.drain();
+  assert.ok(/登録できませんでした/.test(l.byId.get('toast').textContent), 'warning が toast に出ない');
+  assert.ok(l.called('hotkeyState').length > before, '保存後に登録状態を取り直していない');
+  assert.ok(warn('meetingHotkey').hidden, '登録できるようになったのに警告が残る');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('保存が ok:false のときは、これまで通り保存メッセージに赤で出る', async () => {
+  const l = await load(APP, { preloadSrc: preloadWithHotkey(), returns: { saveSettings: () => ({ ok: false, error: '書き込めません' }) } });
+  l.byId.get('tabSettings').dispatchEvent({ type: 'change' });
+  await l.drain();
+  assert.strictEqual(l.byId.get('saveMsg').textContent, '書き込めません');
+  assert.ok(l.byId.get('saveMsg').className.includes('ng'));
+});
+
+// ================= 「根拠なし」札の意味 =================
+const CITE_PAGE = () => Object.assign(clone(PAGE), {
+  blocks: [
+    { id: 'c1', type: 'bullet', text: '短い', cites: [], citeSkip: true },
+    { id: 'c2', type: 'bullet', text: '自分で足した行です', cites: [], citeState: 'manual' },
+    { id: 'c3', type: 'bullet', text: '編集したあと照合していない行', cites: ['s1'], citeState: 'stale' },
+    { id: 'c4', type: 'bullet', text: '照合できなかった行です', cites: [] },
+    { id: 'c5', type: 'bullet', text: '短', cites: [] },
+  ],
+});
+const 札 = (l, id) => { const n = ブロック(l, id).querySelector('.nocite'); return n ? { text: n.textContent, cls: n.className, title: n.title } : null; };
+
+test('札は「照合対象外 / 手書き / 編集済み / 根拠なし」を区別する（文字数では判定しない）', async () => {
+  const l = await 開いた({ pageGet: (id) => ({ page: Object.assign(CITE_PAGE(), { id }), segments: clone(STANDUP_SEGMENTS) }) });
+  assert.strictEqual(札(l, 'c1'), null, '照合対象外の行に札が出ている');
+  assert.strictEqual(札(l, 'c2').text, '手書き');
+  assert.ok(/自分で追加/.test(札(l, 'c2').title));
+  assert.ok(札(l, 'c2').cls.includes('manual'));
+  assert.strictEqual(札(l, 'c3').text, '編集済み');
+  assert.ok(札(l, 'c3').cls.includes('stale'));
+  assert.ok(/再生成/.test(札(l, 'c3').title));
+  assert.strictEqual(ブロック(l, 'c3').querySelectorAll('.cite').length, 1, '編集済みでも出典チップは残す');
+  assert.strictEqual(札(l, 'c4').text, '根拠なし');
+  assert.strictEqual(札(l, 'c5').text, '根拠なし', '短い行は store が citeSkip を付ける。画面の文字数で黙らせない');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('要点の本文を直して blur すると、札が「編集済み」に変わる', async () => {
+  const l = await 開いた({ pageGet: (id) => ({ page: Object.assign(CITE_PAGE(), { id }), segments: clone(STANDUP_SEGMENTS) }) });
+  const t = ブロック(l, 'c4').querySelector('.txt');
+  t.textContent = '照合できなかった行を直した';
+  t.dispatchEvent({ type: 'blur' });
+  await l.drain();
+  assert.deepStrictEqual(l.called('blockUpdate').map((c) => c.args), [['p1', 'c4', { text: '照合できなかった行を直した' }]]);
+  assert.strictEqual(札(l, 'c4').text, '編集済み');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('JS が付ける札のクラス（manual / stale）に CSS の定義がある', () => {
+  const { root } = parseHTML(fs.readFileSync(APP, 'utf8'));
+  const css = root.querySelectorAll('style').map((s) => s._raw).join('\n');
+  const sels = simcss.parse(css).map((r) => r.sel);
+  for (const c of ['.nocite.manual', '.nocite.stale']) assert.ok(sels.some((s) => s.split(',').map((x) => x.trim()).includes(c)), `${c} の定義が無い`);
+});
+
+// ================= 幽霊行 =================
+test('一覧にあるのに開けないページは、知らせて一覧から外す', async () => {
+  const l = await 開いた({ pageGet: (id) => (id === 'ghost' ? null : { page: Object.assign(clone(PAGE), { id }), segments: clone(STANDUP_SEGMENTS) }) });
+  const searches = l.called('pagesSearch').length;
+  l.fire('onPageOpen', 'ghost');
+  await l.drain();
+  assert.ok(/見つかりません/.test(l.byId.get('toast').textContent), 'toast が出ない');
+  assert.deepStrictEqual(l.called('pageDelete').map((c) => c.args), [['ghost']]);
+  assert.ok(l.called('pagesSearch').length > searches, '一覧を取り直していない');
+  assert.strictEqual(l.byId.get('pTitle').textContent, PAGE.title, '開いていたページが消えた');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
