@@ -40,6 +40,11 @@ function parseDue(raw, base) {
   const b = base instanceof Date ? new Date(base) : new Date();
   b.setHours(0, 0, 0, 0);
 
+  // 「再来週」「再来月」は「来週」「来月」を文字列として含む。左境界の無い
+  // /来週/ で拾うと 1 週間早い日付で確定してしまうので、先に「再来」の有無で
+  // 何個先か（1 or 2）を決め、来週系・来月系はそれぞれ nx ぶん進める。
+  const nx = /再来/.test(s) ? 2 : 1;
+
   let m;
 
   // --- 絶対日付 ---
@@ -94,7 +99,7 @@ function parseDue(raw, base) {
     if (/来週|翌週/.test(s)) {
       // 翌週の該当曜日（週の起点は月曜）
       const toNextMonday = ((8 - cur) % 7) || 7;
-      const nextMon = addDays(b, toNextMonday);
+      const nextMon = addDays(b, toNextMonday + (nx - 1) * 7);
       const offset = (target === 0 ? 6 : target - 1);
       return { date: toISO(addDays(nextMon, offset)), approx: false };
     }
@@ -110,7 +115,7 @@ function parseDue(raw, base) {
   // 順序を逆にすると「来週末まで」が今週の金曜になる。
   if (/来週末/.test(s)) {
     const diff = (5 - b.getDay() + 7) % 7;
-    return { date: toISO(addDays(b, (diff === 0 ? 0 : diff) + 7)), approx: false };
+    return { date: toISO(addDays(b, (diff === 0 ? 0 : diff) + nx * 7)), approx: false };
   }
   if (/(今週中|週内|今週末|週末まで)/.test(s)) {
     const diff = (5 - b.getDay() + 7) % 7; // 直近の金曜
@@ -127,7 +132,7 @@ function parseDue(raw, base) {
     }
   }
   if (/(来月末|翌月末)/.test(s)) {
-    return { date: toISO(endOfMonth(new Date(b.getFullYear(), b.getMonth() + 1, 1))), approx: false };
+    return { date: toISO(endOfMonth(new Date(b.getFullYear(), b.getMonth() + nx, 1))), approx: false };
   }
   if (/(今月末|月末)/.test(s)) return { date: toISO(endOfMonth(b)), approx: false };
   if (/(月初|来月初)/.test(s)) return { date: toISO(new Date(b.getFullYear(), b.getMonth() + 1, 1)), approx: true };
@@ -137,8 +142,8 @@ function parseDue(raw, base) {
   // 「来月中旬」が『来月の同じ日』という無関係な日付になる。
   if (/(上旬|中旬|下旬)/.test(s)) return { date: '', approx: true };
 
-  if (/来月/.test(s)) { const d = new Date(b); d.setMonth(d.getMonth() + 1); return { date: toISO(d), approx: true }; }
-  if (/来週/.test(s)) return { date: toISO(addDays(b, 7)), approx: true };
+  if (/来月/.test(s)) { const d = new Date(b); d.setMonth(d.getMonth() + nx); return { date: toISO(d), approx: true }; }
+  if (/来週/.test(s)) return { date: toISO(addDays(b, nx * 7)), approx: true };
   if (/今週/.test(s)) {
     const diff = (5 - b.getDay() + 7) % 7;
     return { date: toISO(addDays(b, diff === 0 ? 0 : diff)), approx: true };
@@ -196,18 +201,23 @@ function parseAction(text, base) {
   }
 
   // (4) 自然文からの推定: 「山田さんが〜」「山田さんは〜」「山田さんに依頼」
-  if (!assignee && (m = body.match(/([一-龥ぁ-んァ-ヶA-Za-z]{1,8}(?:さん|氏|様|部長|課長|主任))\s*(?:が|は|に|へ)/))) {
+  //     名前の文字にひらがなを含めない。姓の直前はたいてい助詞なので、含めると
+  //     最左貪欲が「今週中に山田」を担当者にしてしまう。長音符「ー」（ジョーンズ）や
+  //     異体字「﨑」（U+FA11、[一-龥] の外）を落とさないよう Unicode 文字集合で受ける。
+  if (!assignee && (m = body.match(/([\p{scx=Han}\p{scx=Katakana}A-Za-z々]{1,8}(?:さん|氏|様|部長|課長|主任))\s*(?:が|は|に|へ)/u))) {
     assignee = m[1];
   }
 
   // (5) 自然文からの期限推定: 「来週金曜までに」「8/30まで」
-  if (!dueRaw && (m = body.match(/((?:今日|本日|明日|明後日|今週|来週|再来週|今月|来月|\d{1,2}\s*[月/]\s*\d{1,2}日?|\d{1,2}日|\d+\s*(?:日|週間?|ヶ月)後)(?:末|中)?(?:[日月火水木金土]曜日?)?)\s*(?:まで|迄)/))) {
+  //     「再来週」「再来月」は「来週」「来月」より前に並べる。後ろに置くと
+  //     最左一致で「来月末」が取れ、dueRaw の原文から「再」が落ちる。
+  if (!dueRaw && (m = body.match(/((?:今日|本日|明日|明後日|今週|再来週|来週|今月|再来月|来月|\d{1,2}\s*[月/]\s*\d{1,2}日?|\d{1,2}日|\d+\s*(?:日|週間?|ヶ月)後)(?:末|中)?(?:[日月火水木金土]曜日?)?)\s*(?:まで|迄)/))) {
     dueRaw = m[1].trim();
   }
   // 「まで／迄／中に」を必須にする。無くても拾うと「月末処理の手順を作る」や
   // 「先月末の請求書を確認する」に期限が付いてしまう。
   // (5) の推定も「まで」を必須にしており、そちらと揃える。
-  if (!dueRaw && (m = body.match(/(?<![先前昨])(\d{1,2}\s*月末|(?:今|来)?[週月]末|週内)\s*(?:まで|迄|中に)/))) {
+  if (!dueRaw && (m = body.match(/(?<![先前昨])(\d{1,2}\s*月末|(?:今|再来|来)?[週月]末|週内)\s*(?:まで|迄|中に)/))) {
     dueRaw = m[1].trim();
   }
 
