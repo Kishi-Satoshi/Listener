@@ -590,45 +590,61 @@
     recorder = rec;
     rec.onstop = async () => {
       const durationMs = Date.now() - startedSeg;
-      // 一時停止で締めた区間なら、送り終えたことを resumeRec に知らせる
+      // この区間を送り終えるまで立てておく印。一時停止側が先に立てていればそれを継ぐ。
+      // 上限時間で切られた区間は、変換を待つ間 recorder が「止まっている」ように見える。
+      // ここで印を立てておかないと、その間の一時停止→終了で stop() が空の最後を先に送り、
+      // あとから届く本物の区間が最後の印の後になって main に捨てられる（最大75秒が消える）。
+      if (!segClosing) segClosing = newClosing();
       const closing = segClosing;
-      const done = () => { if (closing && segClosing === closing) { segClosing = null; closing.resolve(); } };
-      if (cancelled) { cleanup(); done(); return; }
-      const blob = new Blob(segChunks, { type: rec.mimeType || 'audio/webm' });
-      let wav = null;
+      const done = () => { if (segClosing === closing) { segClosing = null; closing.resolve(); } };
       try {
-        wav = await blobToWav16k(blob);
-      } catch (e) { wav = null; }
-      // 変換の途中で「終了」「破棄」が押されていることがある。
-      // 区切りの直前に決めた値のままだと、この区間を最後と扱えず次の録音が
-      // 始まってしまい、マイクが開いたまま残る。変換後にもう一度見る。
-      if (cancelled) { cleanup(); done(); return; }
-      const isFinal = stopping;
-      if (wav) window.koeOverlay.sendSegment(wav, durationMs, isFinal);
-      else if (isFinal) window.koeOverlay.sendSegment(new Uint8Array(0), durationMs, true);
-      if (!isFinal && paused) {
-        // 一時停止で締めた区間。区間を送り終えてからマイクを解放する
-        // （先に解放すると、この onstop が読む recorder が消えている）。
-        // 再開まで次の区間は始めない。
-        releaseStream();
+        if (cancelled) { cleanup(); return; }
+        const blob = new Blob(segChunks, { type: rec.mimeType || 'audio/webm' });
+        let wav = null;
+        try {
+          wav = await blobToWav16k(blob);
+        } catch (e) { wav = null; }
+        // 変換の途中で「終了」「破棄」が押されていることがある。
+        // 区切りの直前に決めた値のままだと、この区間を最後と扱えず次の録音が
+        // 始まってしまい、マイクが開いたまま残る。変換後にもう一度見る。
+        if (cancelled) { cleanup(); return; }
+        const isFinal = stopping;
+        if (wav) window.koeOverlay.sendSegment(wav, durationMs, isFinal);
+        else if (isFinal) window.koeOverlay.sendSegment(new Uint8Array(0), durationMs, true);
+        if (!isFinal && paused) {
+          // 一時停止で締めた区間（変換中に一時停止された区間も同じ）。区間を送り終えて
+          // からマイクを解放する（先に解放すると、この onstop が読む recorder が消えている）。
+          // 再開まで次の区間は始めない。
+          releaseStream();
+          return;
+        }
+        if (!isFinal) {
+          // 変換を待つ間に一時停止→再開でストリームが差し替わっていることがある。
+          // そのときは再開側がもう次の区間を始めている。ここでも始めると
+          // 録音が2本走って区間が混ざる。
+          if (recorder === rec) startMeetingSegment(); // 次のセグメントへ
+        } else {
+          stopMeters();
+          releaseStream();
+        }
+      } finally {
+        // どの出口でも印を倒す。倒し忘れると、待っている再開・終了が永久に動かない。
         done();
-        return;
       }
-      if (!isFinal) {
-        // 変換を待つ間に一時停止→再開でストリームが差し替わっていることがある。
-        // そのときは再開側がもう次の区間を始めている。ここでも始めると
-        // 録音が2本走って区間が混ざる。
-        if (recorder === rec) startMeetingSegment(); // 次のセグメントへ
-      } else {
-        stopMeters();
-        releaseStream();
-      }
-      done();
     };
     autoStopId = setTimeout(() => {
       if (recorder && recorder.state === 'recording') recorder.stop();
     }, thisSegMs);
     rec.start(250);
+  }
+
+  // 区間を送り終えるまでの印。待つ側（resumeRec / 一時停止中の stop）は await し、
+  // 送った側（onstop）が resolve する。
+  function newClosing() {
+    let resolve;
+    const p = new Promise((r) => { resolve = r; });
+    p.resolve = resolve;
+    return p;
   }
 
   // 一時停止。録音そのものを止め、それまでの区間はきちんと締めて送る。
@@ -645,13 +661,15 @@
     if (recorder && recorder.state === 'recording') {
       // 区間を締めて送る。onstop は後で来るので、マイクの解放（releaseStream）は
       // 区間を送った後に onstop 側で行う。ここで解放すると onstop が落ちて区間が消える。
-      let resolve;
-      segClosing = new Promise((r) => { resolve = r; });
-      segClosing.resolve = resolve;
+      segClosing = newClosing();
       recorder.stop();
-    } else {
+    } else if (!segClosing) {
       releaseStream();            // マイクを解放する。停止中に録っていないことを機器の表示でも示す
     }
+    // segClosing が立ったまま＝上限時間で切られた区間がまだ変換中（recorder は止まって
+    // 見える）。マイクの解放はその onstop に任せる。送り終えた onstop が paused を見て
+    // 解放し、終了が押されていればその区間を最後として送る。印ではなく recorder の
+    // 状態で判断すると、stop() も待つものが無いと思って空の最後を先に送ってしまう。
     setPhase('recording', recordingLabel());
     window.koeOverlay.reportPause(true);
   }
@@ -696,9 +714,10 @@
       stopping = true;
       setPhase('processing', mode === 'meeting' ? '議事録を作成中…' : '文字起こし中…');
       beep(SND.stop);
-      // 一時停止で締めた区間がまだ送り終えていなければ、その onstop が
-      // （stopping を見て）この区間を最後として送り、マイクも解放する。
-      // ここでも空の最後を送ると最後の区間が二重に届く。
+      // 一時停止で締めた区間（または上限時間で切られて変換中の区間）がまだ
+      // 送り終えていなければ、その onstop が（stopping を見て）この区間を最後として
+      // 送り、マイクも解放する。ここでも空の最後を送ると最後の区間が二重に届き、
+      // 後から届く本物の区間が main に捨てられる。
       if (segClosing) return;
       window.koeOverlay.sendSegment(new Uint8Array(0), 0, true);
       cleanup();
