@@ -322,3 +322,17 @@ test('refreshCitations でも担当名を含めて照合する', () => {
   refreshCitations(blocks, ASSIGN_SEGS, 's3');
   assert.strictEqual(blocks[0].cites[0], 's3');
 });
+
+// ---------------------------------------------------------------- 人が足した行は照合しない
+test('attachCitations / refreshCitations は citeState=manual の行を照合せず、分母にも数えない', () => {
+  const blocks = mkBlocks();
+  blocks.push({ id: 'm1', type: 'bullet', text: '在庫連携のバッチ処理は1万件の取り込みに4分かかっている', cites: [], citeState: 'manual' });
+  const r = attachCitations(blocks, SEGS);
+  const m1 = blocks.find((b) => b.id === 'm1');
+  assert.deepStrictEqual(m1.cites, [], '手書きの行に出典が付いた（「手書き」の札と時刻チップが同じ行に並ぶ）');
+  assert.strictEqual(m1.citeSkip, undefined);
+  assert.strictEqual(r.total, 3, '手書きの行が分母に入った');
+  const r2 = refreshCitations(blocks, SEGS, 's1');
+  assert.deepStrictEqual(m1.cites, [], 'refreshCitations が手書きの行に出典を付けた');
+  assert.strictEqual(r2.total, 3);
+});

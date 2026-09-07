@@ -247,12 +247,13 @@ test('savePage: citeStat を再計算する（manual/citeSkip は分母から外
   fresh();
   const p = store.createPage({ title: 't', segments: [], blocks: [
     blk('h', 'heading', '議題', []),
-    blk('b1', 'bullet', '出典あり', ['s1']),                       // total, linked
-    blk('b2', 'bullet', '出典なし', []),                            // total
-    blk('b3', 'todo', '古い出典', ['s2'], { citeState: 'stale' }),  // total（linked ではない）
-    blk('b4', 'bullet', '人が足した', [], { citeState: 'manual' }), // 対象外
-    blk('b5', 'todo', '短い', ['s3'], { citeSkip: true }),         // 対象外
-    blk('b6', 'todo', '出典あり2', ['s4']),                         // total, linked
+    // 本文は照合対象になる長さ（正規化後6文字以上）にする。短い行は citeSkip と同じく対象外
+    blk('b1', 'bullet', '出典がある要点を書いた行', ['s1']),                       // total, linked
+    blk('b2', 'bullet', '出典が無い要点を書いた行', []),                            // total
+    blk('b3', 'todo', '古い出典が残る要点の行', ['s2'], { citeState: 'stale' }),  // total（linked ではない）
+    blk('b4', 'bullet', '人が足した要点を書いた行', [], { citeState: 'manual' }), // 対象外
+    blk('b5', 'todo', '短い', ['s3'], { citeSkip: true }),                        // 対象外
+    blk('b6', 'todo', '出典がある二つ目の要点の行', ['s4']),                         // total, linked
   ] });
   const page = store.getPage(p.id);
   page.citeStat = { linked: 99, total: 99, extra: 'keep' };
@@ -263,9 +264,42 @@ test('savePage: citeStat を再計算する（manual/citeSkip は分母から外
 
 test('savePage: citeStat が無いページでも作られ、updateBlock 後に数が追随する', () => {
   fresh();
-  const p = store.createPage({ title: 't', segments: [], blocks: [blk('b1', 'bullet', '出典あり', ['s1'])] });
+  const p = store.createPage({ title: 't', segments: [], blocks: [blk('b1', 'bullet', '出典がある要点を書いた行', ['s1'])] });
   const saved = store.savePage(store.getPage(p.id));
   assert.deepStrictEqual(saved.citeStat, { linked: 1, total: 1 });
-  const after = store.updateBlock(p.id, 'b1', { text: '書き換え' });
+  const after = store.updateBlock(p.id, 'b1', { text: '書き換えた要点を書いた行' });
   assert.deepStrictEqual(after.citeStat, { linked: 0, total: 1 });
+});
+
+// ---------------------------------------------------------------- 旧版のページとの互換
+test('getPage: v0.10.8 より前のページの短い要点に citeSkip を補い、分母に数えない', () => {
+  const p = mkPage();
+  // 旧版が書いた形（citeSkip も citeState も無い）を直接ディスクに作る
+  const raw = JSON.parse(fs.readFileSync(path.join(dir, 'data', 'pages', `${p.id}.json`), 'utf8'));
+  raw.blocks = [
+    { id: 'b1', type: 'bullet', text: '承認済み', cites: [] },                                  // 正規化後4文字。旧版は照合せず分母にも入れなかった
+    { id: 'b2', type: 'bullet', text: '受注管理システムの改修は結合テストが完了した', cites: ['s2'] },
+  ];
+  raw.citeStat = { linked: 1, total: 1 };
+  fs.writeFileSync(path.join(dir, 'data', 'pages', `${p.id}.json`), JSON.stringify(raw), 'utf8');
+  const got = store.getPage(p.id);
+  assert.strictEqual(got.blocks[0].citeSkip, true, '短い行に citeSkip が補われない（画面に「根拠なし」が出る）');
+  assert.strictEqual(got.blocks[1].citeSkip, undefined);
+  const saved = store.savePage(got);
+  assert.deepStrictEqual({ linked: saved.citeStat.linked, total: saved.citeStat.total }, { linked: 1, total: 1 }, '短い行が分母に入って 1/2 になった');
+});
+
+test('updateBlock: 本文を長くしたら照合対象に戻り、短くしたら対象外になる', () => {
+  const p = mkPage();
+  const r = store.insertBlock(p.id, null, 'bullet');
+  // 手書きの行は manual のまま（対象外）。別に自動生成相当の行で見る
+  const page = store.getPage(p.id);
+  page.blocks.push({ id: 'auto1', type: 'bullet', text: '承認済み', cites: [] });
+  store.savePage(page);
+  assert.strictEqual(store.getPage(p.id).blocks.find((b) => b.id === 'auto1').citeSkip, true);
+  store.updateBlock(p.id, 'auto1', { text: '承認済み。来週の定例で正式に共有する' });
+  assert.strictEqual(store.getPage(p.id).blocks.find((b) => b.id === 'auto1').citeSkip, undefined, '長くしたのに対象外のまま');
+  store.updateBlock(p.id, 'auto1', { text: '了承' });
+  assert.strictEqual(store.getPage(p.id).blocks.find((b) => b.id === 'auto1').citeSkip, true, '短くしたのに対象のまま');
+  assert.ok(r.blockId);
 });

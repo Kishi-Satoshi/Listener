@@ -13,6 +13,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { isCitable } = require('./cite');
 
 let ROOT = '';
 let index = { version: 2, pages: [] };
@@ -168,7 +169,20 @@ function getPage(id) {
   const page = readJson(pageFile(id), null);
   if (!page) return null;
   if (!Array.isArray(page.blocks)) page.blocks = [];
+  markShortBlocks(page.blocks);
   return page;
+}
+
+// 短すぎて出典の照合対象にならない行に citeSkip を付ける。
+// v0.10.8 より前に要約したページには citeSkip が無く、そのままだと画面が
+// 「根拠なし」の札を出し、保存のたびに分母へ数えてしまう（「出典 1/1」が「1/2」になる）。
+// 読むたびに補うので、古いページも次の保存で正しい形になる。
+function markShortBlocks(blocks) {
+  for (const b of blocks) {
+    if (b.type !== 'bullet' && b.type !== 'todo') continue;
+    if (b.citeState === 'manual') continue;
+    if (!b.citeSkip && !isCitable(b.text)) b.citeSkip = true;
+  }
 }
 
 function getTranscript(id) {
@@ -187,7 +201,7 @@ function citeStatOf(blocks) {
   let linked = 0;
   for (const b of blocks) {
     if (b.type !== 'bullet' && b.type !== 'todo') continue;
-    if (b.citeSkip || b.citeState === 'manual') continue;
+    if (b.citeSkip || b.citeState === 'manual' || !isCitable(b.text)) continue;
     total++;
     if (Array.isArray(b.cites) && b.cites.length && b.citeState !== 'stale') linked++;
   }
@@ -250,6 +264,8 @@ function updateBlock(pageId, blockId, patch) {
     // cites は残す（根拠を辿れる方が有用）が、被覆率の分子からは外す（stale）。
     // 人が足した行（manual）はもともと出典の対象外なので、そのまま。
     if (b.citeState !== 'manual') b.citeState = 'stale';
+    // 書き換えで長さが変わりうる。短くなれば対象外、長くなれば対象に戻す
+    if (isCitable(patch.text)) delete b.citeSkip; else b.citeSkip = true;
     b.text = patch.text;
   }
   if (typeof patch.checked === 'boolean') b.checked = patch.checked;

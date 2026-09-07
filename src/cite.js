@@ -133,6 +133,9 @@ function attachCitations(blocks, segments, opts) {
 
   for (const b of blocks) {
     if (b.type !== 'bullet' && b.type !== 'todo') continue;
+    // 人が足した行（store が citeState:'manual' を付ける）は照合しない。
+    // 照合すると「手書き（照合対象外）」の札と時刻チップが同じ行に並んで矛盾する。
+    if (b.citeState === 'manual') continue;
     if (!isCitable(b.text)) { b.citeSkip = true; skipped++; continue; }
     delete b.citeSkip;
     total++;
@@ -173,7 +176,7 @@ function refreshCitations(blocks, segments, segId) {
   let linked = 0;
   for (const b of blocks) {
     if (b.type !== 'bullet' && b.type !== 'todo') continue;
-    if (!isCitable(b.text)) continue;
+    if (b.citeState === 'manual' || !isCitable(b.text)) continue;
     if (Array.isArray(b.cites) && b.cites.length) linked++;
   }
   return { linked, total: r.total, skipped: r.skipped };

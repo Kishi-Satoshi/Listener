@@ -851,10 +851,10 @@
     flushEdits();
     const r = await window.koeApp.pageGet(id);
     if (!r) {
-      // 一覧にあるのに本体が無い「幽霊行」。残しておくと何度押しても開けないので、
-      // 知らせたうえで一覧から外す（本体は無いので削除で失うものは無い）。
-      toast('ページが見つかりません。一覧から外します');
-      await window.koeApp.pageDelete(id);
+      // 一覧にあるのに本体を読めない「幽霊行」。ここで削除はしない。page.json だけが
+      // 壊れて transcript が無傷、という場合に文字起こしまで消してしまうため。
+      // 壊れた本体は store が .broken- へ退避し、次回起動の reconcile が一覧から外す。
+      toast('ページを開けません（本体が壊れているか消えています）。次回起動時に一覧から外れます');
       await refreshList();
       return;
     }
@@ -1123,7 +1123,7 @@
         b.text = v;
         // 本文を変えたら出典との対応は古くなる。store も stale を付けるが、
         // 次に pageGet するまでの間も札で示す。
-        if (b.type === 'bullet' || b.type === 'todo') { b.citeState = 'stale'; renderCiteBadge(el, b); }
+        if ((b.type === 'bullet' || b.type === 'todo') && b.citeState !== 'manual') { b.citeState = 'stale'; renderCiteBadge(el, b); }
         window.koeApp.blockUpdate(pid, b.id, { text: v }).then(() => { if (pid === curId) refreshList(); });
       };
       txt.onblur = () => txt._commit(curId);
@@ -1489,6 +1489,14 @@
   window.koeApp.onPageUpdated(({ page, segments }) => {
     refreshList();
     if (page.id !== curId) return;
+    // 要約は数分かかる。その間に打ち替えたタイトルや書きかけのメモを、
+    // 届いたページで上書きしない。先に確定させ、確定した値を届いたページに載せる。
+    if (curPage) {
+      flushMemo();
+      commitTitle(curId);
+      page.title = curPage.title;
+      page.memo = curPage.memo;
+    }
     curPage = page; curSegs = segments; renderPage();
   });
   window.koeApp.onNotice((m) => { if (/未設定/.test(m)) showTab('settings'); toast(m); });
@@ -1664,11 +1672,18 @@
     let st;
     try { st = await window.koeApp.hotkeyState(); } catch (_) { return; }
     const failed = st && Array.isArray(st.failed) ? st.failed : [];
+    const fallback = st && st.fallback && typeof st.fallback === 'object' ? st.fallback : {};
     for (const [id, name] of HOTKEY_FIELDS) {
       const w = $(id + 'Warn'); if (!w) continue;
-      const bad = failed.includes(name);
-      w.textContent = bad ? 'このキーは他のアプリが使用中のため登録できていません' : '';
-      w.hidden = !bad;
+      let msg = '';
+      if (failed.includes(name)) {
+        msg = 'このキーは他のアプリが使用中のため登録できていません';
+      } else if (fallback[name] && fallback[name].using) {
+        // 設定したキーは登録できず、既定のキーで動いている。欄には設定した値が残る
+        msg = `設定した ${fallback[name].wanted || ''} は他のアプリが使用中のため、代わりに既定の ${fallback[name].using} を使っています`;
+      }
+      w.textContent = msg;
+      w.hidden = !msg;
     }
   }
 
@@ -1736,6 +1751,13 @@
     const m = $('saveMsg');
     if (r.ok) {
       settings = { ...settings, ...next };
+      // 登録できなかったホットキーは main が前の値に戻している。画面も同じ値に揃える。
+      // 揃えないと、以後の無関係な保存のたびに同じキーで失敗と警告を繰り返す。
+      if (r.applied) {
+        for (const k of ['hotkey', 'meetingHotkey']) {
+          if (typeof r.applied[k] === 'string' && r.applied[k]) { settings[k] = r.applied[k]; $(k).value = r.applied[k]; }
+        }
+      }
       if (!silent) { m.textContent = '保存しました'; m.className = 'save-msg ok'; }
       // 保存はできたが一部が効いていない（ホットキーを登録できなかった等）
       if (r.warning) toast(r.warning);

@@ -481,14 +481,77 @@ test('JS が付ける札のクラス（manual / stale）に CSS の定義があ�
 });
 
 // ================= 幽霊行 =================
-test('一覧にあるのに開けないページは、知らせて一覧から外す', async () => {
+test('一覧にあるのに開けないページは知らせるだけで、削除はしない（文字起こしを道連れにしない）', async () => {
   const l = await 開いた({ pageGet: (id) => (id === 'ghost' ? null : { page: Object.assign(clone(PAGE), { id }), segments: clone(STANDUP_SEGMENTS) }) });
   const searches = l.called('pagesSearch').length;
   l.fire('onPageOpen', 'ghost');
   await l.drain();
-  assert.ok(/見つかりません/.test(l.byId.get('toast').textContent), 'toast が出ない');
-  assert.deepStrictEqual(l.called('pageDelete').map((c) => c.args), [['ghost']]);
+  assert.ok(/開けません/.test(l.byId.get('toast').textContent), 'toast が出ない');
+  // page.json だけが壊れて transcript が無傷、という行を deletePage すると文字起こしまで消える。
+  // 掃除は次回起動の reconcile に任せる。
+  assert.deepStrictEqual(l.called('pageDelete'), [], '幽霊行で pageDelete を呼んだ');
   assert.ok(l.called('pagesSearch').length > searches, '一覧を取り直していない');
   assert.strictEqual(l.byId.get('pTitle').textContent, PAGE.title, '開いていたページが消えた');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+// ================= 統合レビューで見つかった取りこぼし =================
+test('手書きの行は本文を直しても「手書き」のまま（store と同じ規則。「編集済み」に塗り替えない）', async () => {
+  const l = await 開いた({ pageGet: (id) => ({
+    page: Object.assign(clone(PAGE), { id, blocks: [...clone(PAGE.blocks), { id: 'm1', type: 'bullet', text: '自分で足した要点です', cites: [], citeState: 'manual' }] }),
+    segments: clone(STANDUP_SEGMENTS),
+  }) });
+  const el = ブロック(l, 'm1');
+  assert.ok(el, '手書きの行が描かれていない');
+  const t = el.querySelector('.txt');
+  t.textContent = '自分で足した要点を書き直した';
+  t.dispatchEvent({ type: 'blur' });
+  await l.drain();
+  const badge = el.querySelector('.nocite');
+  assert.ok(badge && badge.textContent === '手書き', `札が「手書き」でない: ${badge && badge.textContent}`);
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('要約完了の page:updated が、打ち替え中のタイトルと書きかけのメモを捨てない', async () => {
+  const l = await 開いた();
+  l.byId.get('pTitle').textContent = '打ち替えた題';
+  const ta = メモ欄(l);
+  ta.value = '書きかけのメモ';
+  ta.dispatchEvent({ type: 'input' });
+  // blur も 500ms も来ないうちに要約が終わって届く（main は古い題・古いメモを持っている）
+  l.fire('onPageUpdated', { page: Object.assign(clone(PAGE), { id: 'p1' }), segments: clone(STANDUP_SEGMENTS) });
+  await l.drain();
+  assert.strictEqual(l.byId.get('pTitle').textContent, '打ち替えた題', '届いたページの古い題に戻された');
+  assert.deepStrictEqual(l.called('pageSetTitle').map((c) => c.args), [['p1', '打ち替えた題']], '打ち替えた題が保存されない');
+  assert.deepStrictEqual(l.called('pageSetMemo').map((c) => c.args), [['p1', '書きかけのメモ']], '書きかけのメモが保存されない');
+  assert.strictEqual(メモ欄(l).value, '書きかけのメモ', 'メモ欄が古い値で作り直された');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('設定したホットキーが既定で代替されているときは、「登録できていない」ではなく代替中と出す', async () => {
+  const l = await load(APP, { preloadSrc: preloadWithHotkey(), returns: {
+    hotkeyState: () => ({ ok: true, failed: [], fallback: { '音声入力': { wanted: 'Control+Shift+X', using: 'Control+Shift+Space' } }, message: '' }),
+  } });
+  const warn = (id) => l.document.getElementById(id + 'Warn');
+  assert.ok(warn('hotkey') && !warn('hotkey').hidden, '代替中の注意が出ない');
+  assert.ok(/代わりに既定の Control\+Shift\+Space/.test(warn('hotkey').textContent), `文言が違う: ${warn('hotkey').textContent}`);
+  assert.ok(!/登録できていません/.test(warn('hotkey').textContent), '動いているキーに「登録できていない」と出ている');
+  assert.ok(warn('meetingHotkey').hidden, '関係ない欄に注意が出ている');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('保存で登録できなかったキーは、main が採った値に欄と設定を戻す（失敗したキーを持ち続けない）', async () => {
+  const l = await load(APP, { preloadSrc: preloadWithHotkey(), returns: {
+    saveSettings: () => ({ ok: true, warning: '音声入力のホットキー Control+Shift+X は他のアプリが使用中のため登録できませんでした', applied: { hotkey: 'Control+Shift+Space', meetingHotkey: 'Alt+M' } }),
+  } });
+  l.byId.get('hotkey').value = 'Control+Shift+X';
+  l.byId.get('tabSettings').dispatchEvent({ type: 'change' });
+  await l.drain();
+  assert.strictEqual(l.byId.get('hotkey').value, 'Control+Shift+Space', '失敗したキーが欄に残っている');
+  // 次の無関係な保存で、失敗したキーを送り直さない
+  l.byId.get('tabSettings').dispatchEvent({ type: 'change' });
+  await l.drain();
+  const sent = l.called('saveSettings').map((c) => c.args[0].hotkey);
+  assert.deepStrictEqual(sent, ['Control+Shift+X', 'Control+Shift+Space'], `送ったキー: ${JSON.stringify(sent)}`);
   assert.deepStrictEqual(l.errors.map(fmt), []);
 });

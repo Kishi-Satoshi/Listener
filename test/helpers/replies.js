@@ -26,7 +26,7 @@ module.exports = {
   },
   saveSettings: { ok: true },
   // ホットキーの登録状態（main 側の契約: failed は '音声入力' | '議事録' の配列）
-  hotkeyState: { ok: true, failed: [], message: '' },
+  hotkeyState: { ok: true, failed: [], fallback: {}, message: '' },
   testApi: { ok: true, message: 'ok' },
   testSum: { ok: true, message: 'ok' },
   vadStatus: { ready: true, message: '' },

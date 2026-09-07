@@ -286,3 +286,24 @@ test('自然文の担当者推定: 長音符・異体字を落とさず、助詞
   assert.strictEqual(parseAction('山田さんが実行計画を確認する', BASE).assignee, '山田');
   assert.strictEqual(parseAction('佐藤部長が承認する', BASE).assignee, '佐藤');
 });
+
+// ---------------------------------------------------------------- レビューで見つかった取りこぼし
+test('ひらがな表記の名前も担当者に取れる（行頭・句読点の直後だけ。助詞の直後からは取らない）', () => {
+  const B = new Date('2026-10-05');
+  assert.strictEqual(parseAction('たなかさんが対応する', B).assignee, 'たなか');
+  assert.strictEqual(parseAction('、さくらさんに依頼する', B).assignee, 'さくら');
+  // 「にたなか」を名前にしない。曖昧な位置では空のまま（誤った担当者を常設しない）
+  assert.strictEqual(parseAction('今週中にたなかさんが対応する', B).assignee, '');
+  // 漢字の名前は従来どおり（助詞を飲み込まない）
+  assert.strictEqual(parseAction('今週中に山田さんが対応する', B).assignee, '山田');
+});
+
+test('「再来月末中に」「再来週末中に」の期限も「再」を落とさない（第2の正規表現）', () => {
+  const B = new Date('2026-10-05');
+  const a = parseAction('報告書を再来月末中に提出する', B);
+  assert.strictEqual(a.dueRaw, '再来月末');
+  assert.strictEqual(a.due, '2026-12-31');
+  const b = parseAction('再来週末中に片付ける', B);
+  assert.strictEqual(b.dueRaw, '再来週末');
+  assert.strictEqual(b.due, '2026-10-23');
+});
