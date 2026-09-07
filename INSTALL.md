@@ -69,6 +69,11 @@ mkdir "$env:LOCALAPPDATA\Listener-engine"
 ```
 
 エクスプローラーのアドレス欄に `%LOCALAPPDATA%\Listener-engine` と入れれば開けます。
+
+> **OneDrive・Dropbox などの同期フォルダには置かないでください。**
+> 「ファイルオンデマンド」で中身がクラウド側にあるだけのファイル（プレースホルダ）は、
+> 見た目は正常でもエンジンが読めず、起動テストが「モデルの実体がこの PC にありません」で止まります。
+> `%LOCALAPPDATA%` 配下は同期の対象外なので安全です。
 ここに `setup-local-engine.ps1` と `setup-summarizer.ps1` を移動します。
 
 ### 実行する
