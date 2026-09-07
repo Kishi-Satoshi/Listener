@@ -15,7 +15,8 @@ const path = require('path');
 const store = require('../src/store');
 const {
   saveIfExists, meetingDurationSec, promptTail, registerHotkeys,
-  hotkeyFailureMessage, resolveStartupHotkeys,
+  hotkeyFailureMessage, hotkeyStatus, resolveStartupHotkeys, saveHotkeys,
+  makeSummaryRunner, tickStep,
 } = require('../src/mainlib');
 const { normalizeSettings } = require('../src/settings');
 
@@ -139,22 +140,80 @@ test('hotkeyFailureMessage: 失敗した側のキーを名指しで伝える', (
   assert.match(hotkeyFailureMessage(['音声入力', '議事録'], { 音声入力: 'A', 議事録: 'B' }), /音声入力のホットキー A と議事録のホットキー B は/);
 });
 
-test('resolveStartupHotkeys: 失敗した側だけ既定に落とし、成功した側の設定は触らない', () => {
+// bad: 登録できないキーの一覧。apply は main.js の applyHotkeys と同じ形（unregisterAll → 両方登録）で、
+// 呼び出しを記録する
+const fakeApply = (bad) => {
   const calls = [];
   const apply = (hk, mhk) => {
     calls.push([hk, mhk]);
-    return registerHotkeys(entries(hk, mhk), fakeRegister(['Alt+M']).register);
+    return registerHotkeys(entries(hk, mhk), fakeRegister(bad).register);
   };
-  const r = resolveStartupHotkeys({ hotkey: 'Control+Space', meetingHotkey: 'Alt+M' },
-    { hotkey: 'Control+Shift+Space', meetingHotkey: 'Alt+Shift+M' }, apply);
-  assert.strictEqual(r.hotkey, 'Control+Space', '成功した側まで既定に戻した');
-  assert.strictEqual(r.meetingHotkey, 'Alt+Shift+M');
+  return { apply, calls };
+};
+
+test('hotkeyStatus: 既定で代替している側は fallback に、登録できていない側は failed に載る', () => {
+  // hotkey:state の形。failed は「いま登録できていない側」、fallback は「利用者のキーの
+  // 代わりに既定で動いている側」。ok は利用者の設定どおりに全部登録できているときだけ
+  const wanted = { hotkey: 'Control+Shift+X', meetingHotkey: 'Alt+M' };
+  const r = hotkeyStatus(wanted, { hotkey: 'Control+Shift+Space', meetingHotkey: 'Alt+M' }, []);
+  assert.deepStrictEqual(r.state, {
+    ok: false,
+    failed: [],
+    fallback: { 音声入力: { wanted: 'Control+Shift+X', using: 'Control+Shift+Space' } },
+    message: '音声入力のホットキー Control+Shift+X は他のアプリが使用中のため、代わりに既定の Control+Shift+Space を使っています',
+  });
+  assert.strictEqual(r.note, '（音声入力: 既定の Control+Shift+Space を使用中）');
+  assert.deepStrictEqual(r.active, { hotkey: 'Control+Shift+Space', meetingHotkey: 'Alt+M' });
+
+  const f = hotkeyStatus(wanted, wanted, ['議事録']);
+  assert.deepStrictEqual(f.state, {
+    ok: false, failed: ['議事録'], fallback: {},
+    message: '議事録のホットキー Alt+M は他のアプリが使用中のため登録できていません',
+  });
+  assert.strictEqual(f.note, '（Alt+M は登録できず）');
+
+  const ok = hotkeyStatus(wanted, wanted, []);
+  assert.deepStrictEqual(ok.state, { ok: true, failed: [], fallback: {}, message: '' });
+  assert.strictEqual(ok.note, '');
+});
+
+test('hotkeyStatus: 両方に問題があれば一つの文に、トレイの注記も一つにまとめる', () => {
+  const wanted = { hotkey: 'A', meetingHotkey: 'B' };
+  const r = hotkeyStatus(wanted, { hotkey: 'X', meetingHotkey: 'B' }, ['議事録']);
+  assert.strictEqual(r.state.message,
+    '音声入力のホットキー A は他のアプリが使用中のため、代わりに既定の X を使っています。議事録のホットキー B は他のアプリが使用中のため登録できていません');
+  assert.strictEqual(r.note, '（音声入力: 既定の X を使用中・B は登録できず）');
+  const both = hotkeyStatus(wanted, wanted, ['音声入力', '議事録']);
+  assert.strictEqual(both.state.message, '音声入力のホットキー A と議事録のホットキー B は他のアプリが使用中のため登録できていません');
+  assert.strictEqual(both.note, '（A・B は登録できず）');
+});
+
+test('hotkeyStatus: 登録できていない側は、トレイ用の active に利用者のキーを名乗る', () => {
+  // 既定に落として既定も駄目だったとき、active に既定を残すとトレイに「既定のキー: 音声入力」と
+  // 出て、そのキーが効くように見える。効いていないのは利用者のキーなので、そちらを出す
+  const wanted = { hotkey: 'A', meetingHotkey: 'B' };
+  const r = hotkeyStatus(wanted, { hotkey: 'X', meetingHotkey: 'B' }, ['音声入力']);
+  assert.deepStrictEqual(r.active, { hotkey: 'A', meetingHotkey: 'B' });
+  assert.deepStrictEqual(r.state.fallback, {}, '登録できていない側を fallback にも載せている');
+});
+
+test('resolveStartupHotkeys: 失敗した側だけ既定に落とし、成功した側はそのまま。設定は書き換えない', () => {
+  const { apply, calls } = fakeApply(['Alt+M']);
+  const cfg = { hotkey: 'Control+Space', meetingHotkey: 'Alt+M', theme: 'dark' };
+  const snapshot = JSON.stringify(cfg);
+  const r = resolveStartupHotkeys(cfg, { hotkey: 'Control+Shift+Space', meetingHotkey: 'Alt+Shift+M' }, apply);
+  assert.deepStrictEqual(r.active, { hotkey: 'Control+Space', meetingHotkey: 'Alt+Shift+M' }, '成功した側まで既定に戻した');
   assert.deepStrictEqual(calls, [['Control+Space', 'Alt+M'], ['Control+Space', 'Alt+Shift+M']]);
+  // (a) 利用者の設定は読むだけ。ここを書き換えると settings:get が既定を返して設定画面に既定が出、
+  //     次の無関係な保存（自動起動の切り替えなど）でディスクにも漏れて、利用者のキーが黙って消える
+  assert.strictEqual(JSON.stringify(cfg), snapshot, '設定オブジェクトを書き換えている');
+  assert.ok(!('hotkey' in r) && !('meetingHotkey' in r), '設定に書き戻せる形（hotkey/meetingHotkey）で返している');
+  // (b) 既定で登録できた側は「登録できていない」ではなく「代替中」
+  assert.deepStrictEqual(r.state.failed, [], '既定で登録できたのに failed に残っている');
+  assert.deepStrictEqual(r.state.fallback, { 議事録: { wanted: 'Alt+M', using: 'Alt+Shift+M' } });
   assert.strictEqual(r.state.ok, false);
-  assert.deepStrictEqual(r.state.failed, ['議事録']);
-  assert.match(r.state.message, /Alt\+M/);
-  assert.match(r.state.message, /Alt\+Shift\+M/, '代わりに使うキーを伝えていない');
-  assert.strictEqual(r.note, '（Alt+M は登録できず）');
+  assert.strictEqual(r.state.message, '議事録のホットキー Alt+M は他のアプリが使用中のため、代わりに既定の Alt+Shift+M を使っています');
+  assert.strictEqual(r.note, '（議事録: 既定の Alt+Shift+M を使用中）');
 });
 
 test('resolveStartupHotkeys: 全部登録できれば ok で、再試行しない', () => {
@@ -162,16 +221,165 @@ test('resolveStartupHotkeys: 全部登録できれば ok で、再試行しな�
   const apply = () => { n++; return { ok: true, failed: [] }; };
   const r = resolveStartupHotkeys({ hotkey: 'A', meetingHotkey: 'B' }, { hotkey: 'X', meetingHotkey: 'Y' }, apply);
   assert.strictEqual(n, 1);
-  assert.deepStrictEqual(r.state, { ok: true, failed: [], message: '' });
+  assert.deepStrictEqual(r.state, { ok: true, failed: [], fallback: {}, message: '' });
   assert.strictEqual(r.note, '');
-  assert.strictEqual(r.hotkey, 'A');
+  assert.deepStrictEqual(r.active, { hotkey: 'A', meetingHotkey: 'B' });
 });
 
-test('resolveStartupHotkeys: 既定でも登録できないときは、その旨を伝える', () => {
-  const apply = () => ({ ok: false, failed: ['音声入力'] });
+test('resolveStartupHotkeys: 既定でも登録できないときは failed に残し、既定も駄目だったと伝える', () => {
+  const { apply, calls } = fakeApply(['A', 'X']);
   const r = resolveStartupHotkeys({ hotkey: 'A', meetingHotkey: 'B' }, { hotkey: 'X', meetingHotkey: 'Y' }, apply);
+  assert.deepStrictEqual(calls, [['A', 'B'], ['X', 'B']]);
+  assert.deepStrictEqual(r.state.failed, ['音声入力']);
+  assert.deepStrictEqual(r.state.fallback, {});
   assert.strictEqual(r.state.ok, false);
-  assert.match(r.state.message, /X も登録できませんでした/);
+  assert.match(r.state.message, /^音声入力のホットキー A は他のアプリが使用中のため登録できていません/);
+  assert.match(r.state.message, /既定の X も登録できませんでした/);
+  assert.deepStrictEqual(r.active, { hotkey: 'A', meetingHotkey: 'B' });
+  assert.strictEqual(r.note, '（A は登録できず）');
+});
+
+test('resolveStartupHotkeys: 設定がもともと既定なら、同じキーで再試行しない', () => {
+  const { apply, calls } = fakeApply(['X']);
+  const r = resolveStartupHotkeys({ hotkey: 'X', meetingHotkey: 'B' }, { hotkey: 'X', meetingHotkey: 'Y' }, apply);
+  assert.deepStrictEqual(calls, [['X', 'B']], '同じキーをもう一度試している');
+  assert.deepStrictEqual(r.state.failed, ['音声入力']);
+  assert.strictEqual(r.state.message, '音声入力のホットキー X は他のアプリが使用中のため登録できていません');
+});
+
+// ---------------------------------------------------------------- 保存時のホットキー
+test('saveHotkeys: 両方とも変えていなければ何もしない（登録し直さず、状態も触らない）', () => {
+  const { apply, calls } = fakeApply([]);
+  const prev = { hotkey: 'A', meetingHotkey: 'B' };
+  // 起動時に既定へ退避している状態で、無関係な項目だけ保存しても再登録・再警告しない
+  const r = saveHotkeys(prev, { hotkey: 'X', meetingHotkey: 'B' }, { ...prev, autoLaunch: true }, apply);
+  assert.strictEqual(r, null);
+  assert.deepStrictEqual(calls, []);
+});
+
+test('saveHotkeys: 新しいキーが失敗した側だけ前の値に戻し、戻した値を applied で返す', () => {
+  // (c) 画面は applied を欄に戻す。失敗したキーが欄に残ると、以後の無関係な保存のたびに
+  //     再失敗して警告が出続ける
+  const { apply, calls } = fakeApply(['Alt+Q']);
+  const prev = { hotkey: 'Control+Space', meetingHotkey: 'Alt+M' };
+  const r = saveHotkeys(prev, { ...prev }, { hotkey: 'Control+Shift+Y', meetingHotkey: 'Alt+Q' }, apply);
+  assert.deepStrictEqual(r.applied, { hotkey: 'Control+Shift+Y', meetingHotkey: 'Alt+M' });
+  assert.deepStrictEqual(r.active, { hotkey: 'Control+Shift+Y', meetingHotkey: 'Alt+M' });
+  assert.strictEqual(r.warning, '議事録のホットキー Alt+Q は他のアプリが使用中のため登録できませんでした');
+  assert.deepStrictEqual(calls, [['Control+Shift+Y', 'Alt+Q'], ['Control+Shift+Y', 'Alt+M']]);
+  // 戻した後は前のキーが登録されているので、登録状態としては問題なし（警告は保存の戻り値で伝える）
+  assert.deepStrictEqual(r.state, { ok: true, failed: [], fallback: {}, message: '' });
+  assert.strictEqual(r.note, '');
+});
+
+test('saveHotkeys: 成功すれば applied は新しいキーで、warning は空', () => {
+  const { apply, calls } = fakeApply([]);
+  const r = saveHotkeys({ hotkey: 'A', meetingHotkey: 'B' }, { hotkey: 'A', meetingHotkey: 'B' }, { hotkey: 'C', meetingHotkey: 'B' }, apply);
+  assert.deepStrictEqual(calls, [['C', 'B']]);
+  assert.deepStrictEqual(r.applied, { hotkey: 'C', meetingHotkey: 'B' });
+  assert.deepStrictEqual(r.active, { hotkey: 'C', meetingHotkey: 'B' });
+  assert.strictEqual(r.warning, '');
+  assert.deepStrictEqual(r.state, { ok: true, failed: [], fallback: {}, message: '' });
+});
+
+test('saveHotkeys: 変えていない側は「いま動いているキー」のまま登録し直す（起動時の既定退避を壊さない）', () => {
+  // 起動時に 議事録 が Alt+M → 既定 Alt+Shift+M に退避している状態で、音声入力だけ変える。
+  // 利用者のキー Alt+M を再登録すると、衝突がまだあれば再び失敗して、動いていた既定まで失う
+  const { apply, calls } = fakeApply(['Alt+M']);
+  const prev = { hotkey: 'A', meetingHotkey: 'Alt+M' };
+  const active = { hotkey: 'A', meetingHotkey: 'Alt+Shift+M' };
+  const r = saveHotkeys(prev, active, { hotkey: 'C', meetingHotkey: 'Alt+M' }, apply);
+  assert.deepStrictEqual(calls, [['C', 'Alt+Shift+M']]);
+  assert.deepStrictEqual(r.applied, { hotkey: 'C', meetingHotkey: 'Alt+M' });
+  assert.deepStrictEqual(r.active, { hotkey: 'C', meetingHotkey: 'Alt+Shift+M' });
+  assert.strictEqual(r.warning, '');
+  assert.deepStrictEqual(r.state.failed, []);
+  assert.deepStrictEqual(r.state.fallback, { 議事録: { wanted: 'Alt+M', using: 'Alt+Shift+M' } });
+});
+
+test('saveHotkeys: 退避中の側を変えて失敗したら、前の設定と前の（既定の）登録に戻す', () => {
+  const { apply, calls } = fakeApply(['Alt+M', 'Alt+Q']);
+  const prev = { hotkey: 'A', meetingHotkey: 'Alt+M' };
+  const active = { hotkey: 'A', meetingHotkey: 'Alt+Shift+M' };
+  const r = saveHotkeys(prev, active, { hotkey: 'A', meetingHotkey: 'Alt+Q' }, apply);
+  assert.deepStrictEqual(calls, [['A', 'Alt+Q'], ['A', 'Alt+Shift+M']]);
+  assert.deepStrictEqual(r.applied, prev);
+  assert.deepStrictEqual(r.active, active);
+  assert.match(r.warning, /Alt\+Q/);
+  assert.deepStrictEqual(r.state.fallback, { 議事録: { wanted: 'Alt+M', using: 'Alt+Shift+M' } });
+});
+
+test('saveHotkeys: 戻した先も登録できなければ failed に残る（状態は実際の登録結果を写す）', () => {
+  // 前のキーが他のアプリに取られていた（起動後に別のアプリが同じキーを登録した）場合
+  const { apply } = fakeApply(['A', 'Z']);
+  const r = saveHotkeys({ hotkey: 'A', meetingHotkey: 'B' }, { hotkey: 'A', meetingHotkey: 'B' }, { hotkey: 'Z', meetingHotkey: 'B' }, apply);
+  assert.deepStrictEqual(r.applied, { hotkey: 'A', meetingHotkey: 'B' });
+  assert.deepStrictEqual(r.state.failed, ['音声入力']);
+  assert.match(r.warning, /Z は他のアプリが使用中のため登録できませんでした/);
+});
+
+test('saveHotkeys: 設定（prev / next）を書き換えない', () => {
+  const { apply } = fakeApply(['Z']);
+  const prev = { hotkey: 'A', meetingHotkey: 'B' };
+  const next = { hotkey: 'Z', meetingHotkey: 'B' };
+  saveHotkeys(prev, { ...prev }, next, apply);
+  assert.deepStrictEqual(prev, { hotkey: 'A', meetingHotkey: 'B' });
+  assert.deepStrictEqual(next, { hotkey: 'Z', meetingHotkey: 'B' });
+});
+
+// ---------------------------------------------------------------- #10 要約の排他
+test('makeSummaryRunner: 走行中の同じ id は同じ Promise を返し、run は一度しか呼ばない', async () => {
+  // 走行中に「要約を生成」を連打されると、同じ文字起こしに対して要約が二重に走り、
+  // 後から終わった方が前の結果（とその間の編集）を上書きしていた
+  const started = [];
+  const pending = new Map();
+  const run = (id) => new Promise((res) => { started.push(id); pending.set(id, res); });
+  const runSummary = makeSummaryRunner(run);
+  const p1 = runSummary('p1');
+  const p2 = runSummary('p1');
+  assert.strictEqual(p1, p2, '走行中なのに別の Promise を返した（要約が二重に走る）');
+  assert.deepStrictEqual(started, ['p1']);
+  // 別のページは独立して走る
+  const q1 = runSummary('p2');
+  assert.deepStrictEqual(started, ['p1', 'p2']);
+  // 完了したら外れる → 次の呼び出しは新しく走る
+  pending.get('p1')('done');
+  assert.strictEqual(await p1, 'done');
+  const p3 = runSummary('p1');
+  assert.notStrictEqual(p3, p1, '完了したのに古い Promise を返している');
+  assert.deepStrictEqual(started, ['p1', 'p2', 'p1']);
+  pending.get('p1')(); pending.get('p2')();
+  await Promise.all([p3, q1]);
+});
+
+test('makeSummaryRunner: 失敗しても外れる（失敗した id が永久に「走行中」にならない）', async () => {
+  let n = 0;
+  const runSummary = makeSummaryRunner(async () => { n++; throw new Error('summarize failed'); });
+  await assert.rejects(runSummary('p1'), /summarize failed/);
+  await assert.rejects(runSummary('p1'), /summarize failed/);
+  assert.strictEqual(n, 2);
+});
+
+// ---------------------------------------------------------------- #12 overlay:tick の見張り
+test('tickStep: 議事録中は合図を送り、一時停止中は送らないだけで見張りは消さない', () => {
+  // 一時停止で見張りを消すと、再開しても誰も起こし直さず、以後の区切りが画面の
+  // 間引かれるタイマー任せに戻る（1区間が9分になる元の不具合が再発する）
+  const log = [];
+  const send = () => log.push('send');
+  const stop = () => log.push('stop');
+  assert.strictEqual(tickStep({ state: 'meeting', meeting: { paused: false } }, send, stop), 'send');
+  assert.strictEqual(tickStep({ state: 'meeting', meeting: { paused: true } }, send, stop), 'skip');
+  assert.deepStrictEqual(log, ['send'], '一時停止で見張りを消した／合図を送った');
+});
+
+test('tickStep: 議事録が無くなったときだけ見張りを消す', () => {
+  const log = [];
+  const send = () => log.push('send');
+  const stop = () => log.push('stop');
+  assert.strictEqual(tickStep({ state: 'idle', meeting: null }, send, stop), 'stop');
+  assert.strictEqual(tickStep({ state: 'meeting-finalizing', meeting: { paused: false } }, send, stop), 'stop');
+  assert.strictEqual(tickStep({ state: 'meeting', meeting: null }, send, stop), 'stop');
+  assert.deepStrictEqual(log, ['stop', 'stop', 'stop']);
 });
 
 // ---------------------------------------------------------------- #26 設定の正規化
