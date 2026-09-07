@@ -62,39 +62,150 @@ function registerHotkeys(entries, register) {
 }
 
 // failed: registerHotkeys の failed。accelOf: { 音声入力: 'Control+…', 議事録: 'Alt+M' }
+// 保存時の warning（その場の一回の失敗「登録できませんでした」）に使う。
+// いまの登録状態（「登録できていません」）は hotkeyStatus が組む。
 function hotkeyFailureMessage(failed, accelOf) {
   if (!failed.length) return '';
   return `${failed.map((l) => `${l}のホットキー ${accelOf[l]} `).join('と')}は他のアプリが使用中のため登録できませんでした`;
 }
 
-// 起動時: 登録できなかった側だけ既定に落として一度だけ再試行する。
-// 戻り値の hotkey / meetingHotkey はメモリ上の値。呼び出し側はこれを
-// ディスクへ書かない（利用者の設定を黙って既定に上書きしない）。
-// apply(hk, mhk) は registerHotkeys の戻り値を返す。
-function resolveStartupHotkeys(cfg, defaults, apply) {
-  const out = { hotkey: cfg.hotkey, meetingHotkey: cfg.meetingHotkey };
-  const first = apply(out.hotkey, out.meetingHotkey);
-  if (first.ok) return { ...out, state: { ok: true, failed: [], message: '' }, note: '' };
+// 側（画面に出す名前）と設定のキー名の対応
+const HOTKEY_SIDES = [['音声入力', 'hotkey'], ['議事録', 'meetingHotkey']];
+const HOTKEY_KEY_OF = { 音声入力: 'hotkey', 議事録: 'meetingHotkey' };
+const accelOf = (keys) => ({ 音声入力: keys.hotkey, 議事録: keys.meetingHotkey });
 
-  const keyOf = { 音声入力: 'hotkey', 議事録: 'meetingHotkey' };
-  const tried = { 音声入力: cfg.hotkey, 議事録: cfg.meetingHotkey };
-  for (const l of first.failed) out[keyOf[l]] = defaults[keyOf[l]];
-  const second = apply(out.hotkey, out.meetingHotkey);
-
-  const parts = first.failed.map((l) => {
-    const def = defaults[keyOf[l]];
-    return second.failed.includes(l)
-      ? `${l}のホットキー ${tried[l]} は登録できず、既定の ${def} も登録できませんでした`
-      : `${l}のホットキー ${tried[l]} は登録できませんでした。代わりに既定の ${def} を使います`;
-  });
+// 「設定（利用者が選んだキー）」と「実際に登録しているキー」の関係を、画面と
+// トレイに出す形にする。設定と登録を分けて持つのは、起動時に既定へ退避しても
+// 設定を書き換えないため（設定を書き換えると settings:get が既定を返して設定
+// 画面に既定が出、次の無関係な保存でディスクにも漏れて利用者のキーが黙って消える）。
+//   wanted: 設定のキー { hotkey, meetingHotkey }
+//   active: 登録を試みたキー（退避で既定になっている側がある）
+//   failed: registerHotkeys(active…) の failed ＝ いま登録できていない側
+// 戻り値:
+//   active: トレイに出すキー。登録できていない側は利用者のキーを名乗る
+//           （既定のキーを出すと、そのキーが効くように見える）
+//   state : hotkey:state で画面に返す { ok, failed, fallback, message }
+//           failed   … いま登録できていない側（退避後の結果）
+//           fallback … { 側: { wanted: 利用者のキー, using: 既定のキー } } 退避中の側
+//           ok       … 利用者の設定どおりに全部登録できているときだけ true
+//                      （退避中も false。利用者の選んだキーは効いていない）
+//           message  … 画面に出す一文
+//   note  : トレイの注記「（音声入力: 既定の … を使用中・Alt+M は登録できず）」
+function hotkeyStatus(wanted, active, failed) {
+  const act = { ...active };
+  const fallback = {};
+  for (const [label, key] of HOTKEY_SIDES) {
+    if (failed.includes(label)) { act[key] = wanted[key]; continue; }
+    if (act[key] !== wanted[key]) fallback[label] = { wanted: wanted[key], using: act[key] };
+  }
+  const parts = [];
+  const notes = [];
+  for (const [label] of HOTKEY_SIDES) {
+    const f = fallback[label];
+    if (!f) continue;
+    parts.push(`${label}のホットキー ${f.wanted} は他のアプリが使用中のため、代わりに既定の ${f.using} を使っています`);
+    notes.push(`${label}: 既定の ${f.using} を使用中`);
+  }
+  if (failed.length) {
+    const keys = failed.map((l) => wanted[HOTKEY_KEY_OF[l]]);
+    parts.push(`${failed.map((l, i) => `${l}のホットキー ${keys[i]} `).join('と')}は他のアプリが使用中のため登録できていません`);
+    notes.push(`${keys.join('・')} は登録できず`);
+  }
   return {
-    ...out,
-    state: { ok: false, failed: first.failed, message: `${parts.join('。')}（他のアプリが使用中の可能性）` },
-    note: `（${first.failed.map((l) => tried[l]).join('・')} は登録できず）`,
+    active: act,
+    state: { ok: parts.length === 0, failed: [...failed], fallback, message: parts.join('。') },
+    note: notes.length ? `（${notes.join('・')}）` : '',
   };
+}
+
+// 起動時: 登録できなかった側だけ既定に落として一度だけ再試行する。
+// cfg（利用者の設定）は読むだけで書き換えない。有効なキーは戻り値の active で返す
+// ので、呼び出し側は settings ではなく別の変数（activeHotkeys）に持つ。
+// apply(hk, mhk) は registerHotkeys の戻り値を返す（解除して両方を登録し直す）。
+function resolveStartupHotkeys(cfg, defaults, apply) {
+  const wanted = { hotkey: cfg.hotkey, meetingHotkey: cfg.meetingHotkey };
+  const first = apply(wanted.hotkey, wanted.meetingHotkey);
+  if (first.ok) return hotkeyStatus(wanted, wanted, []);
+
+  // 設定がもともと既定なら、同じキーをもう一度試しても同じなので落とさない
+  const active = { ...wanted };
+  const retried = [];
+  for (const l of first.failed) {
+    const k = HOTKEY_KEY_OF[l];
+    if (defaults[k] && defaults[k] !== wanted[k]) { active[k] = defaults[k]; retried.push(l); }
+  }
+  const second = retried.length ? apply(active.hotkey, active.meetingHotkey) : first;
+
+  // failed は「いま登録できていない側」＝ 既定でも駄目だった側。既定で登録できた側は
+  // fallback に載る。以前は最初の失敗をそのまま failed にしていたので、既定で動いている
+  // キーの下に「登録できていません」が出ていた。
+  const r = hotkeyStatus(wanted, active, second.failed);
+  const alsoDefault = retried.filter((l) => second.failed.includes(l)).map((l) => defaults[HOTKEY_KEY_OF[l]]);
+  if (alsoDefault.length) r.state.message += `（既定の ${alsoDefault.join('・')} も登録できませんでした）`;
+  return r;
+}
+
+// 保存時: 変えた側だけ新しいキーで登録し直す。変えていない側は「いま動いているキー」
+// （active。起動時に既定へ退避していればその既定）のまま。利用者のキーを再登録すると、
+// 退避した理由の衝突がまだあれば再び失敗して、動いていた既定まで失う。
+//   prev  : いまの設定（利用者のキー）、active: いま登録しているキー、next: 保存する設定
+// 新しいキーが登録できなかった側は、設定を prev に、登録を active に戻す。
+// 戻り値の applied は「設定として残ったキー」。画面はこれを欄に戻す（失敗したキーが
+// 欄に残ると、以後の無関係な保存のたびに再失敗して警告が出続ける）。
+// 両方とも変えていなければ null（登録し直さず、状態も触らない）。
+function saveHotkeys(prev, active, next, apply) {
+  const changed = HOTKEY_SIDES.filter(([, k]) => next[k] !== prev[k]).map(([l]) => l);
+  if (!changed.length) return null;
+  const want = { ...active };
+  for (const l of changed) want[HOTKEY_KEY_OF[l]] = next[HOTKEY_KEY_OF[l]];
+  let r = apply(want.hotkey, want.meetingHotkey);
+
+  const applied = { hotkey: next.hotkey, meetingHotkey: next.meetingHotkey };
+  const rejected = changed.filter((l) => r.failed.includes(l));
+  let warning = '';
+  if (rejected.length) {
+    warning = hotkeyFailureMessage(rejected, accelOf(next));
+    for (const l of rejected) {
+      const k = HOTKEY_KEY_OF[l];
+      applied[k] = prev[k];
+      want[k] = active[k];
+    }
+    r = apply(want.hotkey, want.meetingHotkey);
+  }
+  return { applied, warning, ...hotkeyStatus(applied, want, r.failed) };
+}
+
+// ---------------------------------------------------------------- 要約の排他
+// 同じ id の要約は同時に一つだけ。走行中に「要約を生成」を連打されると、同じ
+// 文字起こしに対して要約が二重に走り、後から終わった方が前の結果（とその間の
+// 編集）を上書きしていた。走行中なら同じ Promise を返し、終わったら（失敗でも）外す。
+// run(id) は Promise を返す。
+function makeSummaryRunner(run) {
+  const running = new Map();
+  return (id) => {
+    if (running.has(id)) return running.get(id);
+    let p;
+    try { p = Promise.resolve(run(id)); } catch (e) { p = Promise.reject(e); }
+    p = p.finally(() => running.delete(id));
+    running.set(id, p);
+    return p;
+  };
+}
+
+// ---------------------------------------------------------------- overlay:tick の見張り
+// main のタイマーから5秒ごとに呼ぶ。戻り値は判断（'send' | 'skip' | 'stop'）。
+// 見張りを消す（stop）のは議事録が無くなったときだけ。一時停止は送信を飛ばす（skip）
+// だけにする。一時停止で消すと、再開しても誰も起こし直さず、以後の区切りが画面の
+// 間引かれるタイマー任せに戻る（1区間が9分になる元の不具合が再発する）。
+function tickStep({ state, meeting }, send, stop) {
+  if (state !== 'meeting' || !meeting) { stop(); return 'stop'; }
+  if (meeting.paused) return 'skip';
+  send();
+  return 'send';
 }
 
 module.exports = {
   saveIfExists, meetingDurationSec, promptTail,
-  registerHotkeys, hotkeyFailureMessage, resolveStartupHotkeys,
+  registerHotkeys, hotkeyFailureMessage, hotkeyStatus, resolveStartupHotkeys, saveHotkeys,
+  makeSummaryRunner, tickStep,
 };

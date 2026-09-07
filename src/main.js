@@ -31,7 +31,7 @@ const dropTemplateEcho = minutes.dropTemplateEcho || ((b) => b);
 const { normalizeSettings } = require('./settings');
 const {
   saveIfExists, meetingDurationSec, promptTail,
-  registerHotkeys, hotkeyFailureMessage, resolveStartupHotkeys,
+  registerHotkeys, resolveStartupHotkeys, saveHotkeys, makeSummaryRunner, tickStep,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -101,11 +101,13 @@ let meetingTickId = null;
 function startMeetingTick() {
   if (meetingTickId) return;
   meetingTickId = setInterval(() => {
-    // 見張りを消すのは議事録が無くなったときだけ。一時停止は送信を飛ばすだけにする。
+    // 送る／飛ばす／消す の判断は mainlib.tickStep（main.test.js で実行して固定）。
+    // 見張りを消すのは議事録が無くなったときだけで、一時停止は送信を飛ばすだけにする。
     // 一時停止で消すと、再開しても誰も起こし直さず、以後の区切りが画面の
     // 間引かれるタイマー任せに戻る（1区間が9分になる元の不具合が再発する）。
-    if (state !== 'meeting' || !meeting) { clearInterval(meetingTickId); meetingTickId = null; return; }
-    if (!meeting.paused) sendToOverlay('overlay:tick', {});
+    tickStep({ state, meeting },
+      () => sendToOverlay('overlay:tick', {}),
+      () => { clearInterval(meetingTickId); meetingTickId = null; });
   }, 5000);
 }
 function applyTheme() {
@@ -950,16 +952,11 @@ async function maybeFinalizeMeeting() {
   await runSummary(page.id);
 }
 
-// 同じページの要約は同時に一つだけ。走行中に「要約を生成」を連打されると、
-// 同じ文字起こしに対して要約が二重に走り、後から終わった方が前の結果
-// （とその間の編集）を上書きしていた。走行中なら同じ Promise を返す。
-const summarizing = new Map();
-function runSummary(pageId) {
-  if (summarizing.has(pageId)) return summarizing.get(pageId);
-  const p = doRunSummary(pageId).finally(() => summarizing.delete(pageId));
-  summarizing.set(pageId, p);
-  return p;
-}
+// 同じページの要約は同時に一つだけ（mainlib.makeSummaryRunner。main.test.js で
+// 実行して固定）。走行中に「要約を生成」を連打されると、同じ文字起こしに対して
+// 要約が二重に走り、後から終わった方が前の結果（とその間の編集）を上書きしていた。
+// 走行中なら同じ Promise を返す。
+const runSummary = makeSummaryRunner(doRunSummary);
 
 // 要約の生成 → ブロック化 → 出典付与 → 保存
 async function doRunSummary(pageId) {
@@ -1071,10 +1068,16 @@ async function doRunSummary(pageId) {
 
 // ---------------------------------------------------------------- ホットキー / トレイ
 // 登録できていないホットキーの状態。画面（hotkey:state）とトレイに出す。
+// 形は mainlib.hotkeyStatus の state: { ok, failed, fallback, message }。
 // 以前は片方が他アプリと衝突すると両方を黙って既定に戻し、ディスクにも
 // 書いていたので、利用者は「設定したキーが勝手に変わる」としか見えなかった。
-let hotkeyState = { ok: true, failed: [], message: '' };
-let hotkeyNote = '';   // トレイに添える「（Alt+M は登録できず）」
+let hotkeyState = { ok: true, failed: [], fallback: {}, message: '' };
+let hotkeyNote = '';   // トレイに添える「（音声入力: 既定の … を使用中）」「（Alt+M は登録できず）」
+// 実際に登録しているキー。settings は常に利用者が選んだキーを持ち、起動時に既定へ
+// 退避してもここにだけ入れる。settings に書くと settings:get が既定を返して設定画面に
+// 既定が出、次の無関係な保存（自動起動の切り替えなど）でディスクにも漏れて、
+// 利用者のキーが黙って消える。トレイと保存時の登録し直しはこちらを使う。
+let activeHotkeys = { hotkey: '', meetingHotkey: '' };
 
 // 片方ずつ独立に登録する。片方が失敗しても成功した側は解除しない
 // （mainlib.registerHotkeys）。戻り値 { ok, failed: ['音声入力'|'議事録'…] }
@@ -1175,14 +1178,16 @@ function updateTray() {
   items.push({ label: '更新を確認', enabled: state === 'idle', click: checkUpdateFromTray });
   items.push({ type: 'separator' });
   items.push({ label: '終了', click: () => { quitting = true; app.quit(); } });
-  // 登録できていないキーがあれば、その旨を添える（画面を開かなくても気づけるように）
+  // 既定で代替している／登録できていないキーがあれば、その旨を添える
+  // （画面を開かなくても気づけるように）
   if (hotkeyNote) items.push({ label: `ホットキー ${hotkeyNote}`, enabled: false });
   tray.setContextMenu(Menu.buildFromTemplate(items));
+  // 出すのは設定のキーではなく実際に登録しているキー（退避中は設定のキーは効かない）
   tray.setToolTip(
     state === 'meeting' ? 'Listener — 議事録を記録中'
       : state === 'recording' ? 'Listener — 録音中'
         : state === 'processing' || state === 'meeting-finalizing' ? 'Listener — 処理中'
-          : `Listener — ${settings.hotkey}: 音声入力 / ${settings.meetingHotkey || '未設定'}: 議事録${hotkeyNote}`,
+          : `Listener — ${activeHotkeys.hotkey}: 音声入力 / ${activeHotkeys.meetingHotkey || '未設定'}: 議事録${hotkeyNote}`,
   );
 }
 
@@ -1232,29 +1237,26 @@ function updateTarget() {
 function setupIpc() {
   ipcMain.handle('settings:get', () => settings);
   ipcMain.handle('settings:save', (_e, next) => {
-    const prevHotkey = settings.hotkey;
-    const prevMeetingHotkey = settings.meetingHotkey;
     const prevAutoLaunch = settings.autoLaunch;
     const prevPillPos = settings.pillPos;
     const merged = normalizeSettings({ ...settings, ...next }, DEFAULT_SETTINGS);
 
-    // ホットキーは失敗した側だけ前の値に戻し、他の設定は保存する。
-    // 以前は片方の衝突で保存全体を失敗にしていたので、同時に変えた
-    // 他の項目まで黙って捨てられていた。失敗は warning で画面に返す。
+    // ホットキーは変えた側だけ登録し直し、失敗した側だけ前の値に戻して、他の設定は
+    // 保存する（判断は mainlib.saveHotkeys。main.test.js で実行して固定）。
+    // 以前は片方の衝突で保存全体を失敗にしていたので、同時に変えた他の項目まで
+    // 黙って捨てられていた。失敗は warning で画面に返す。
+    // 設定として残ったキーは applied で返す。画面はこれを欄に戻す（失敗したキーが
+    // 欄に残ると、以後の無関係な保存のたびに再失敗して警告が出続ける）。
+    // 両方とも変えていなければ hk は null で、登録も状態も触らない。
     let warning = '';
-    if (merged.hotkey !== prevHotkey || merged.meetingHotkey !== prevMeetingHotkey) {
-      const r = applyHotkeys(merged.hotkey, merged.meetingHotkey);
-      if (!r.ok) {
-        warning = hotkeyFailureMessage(r.failed, { 音声入力: merged.hotkey, 議事録: merged.meetingHotkey });
-        hotkeyNote = `（${r.failed.map((l) => (l === '音声入力' ? merged.hotkey : merged.meetingHotkey)).join('・')} は登録できず）`;
-        if (r.failed.includes('音声入力')) merged.hotkey = prevHotkey;
-        if (r.failed.includes('議事録')) merged.meetingHotkey = prevMeetingHotkey;
-        applyHotkeys(merged.hotkey, merged.meetingHotkey);
-        hotkeyState = { ok: false, failed: r.failed, message: warning };
-      } else {
-        hotkeyState = { ok: true, failed: [], message: '' };
-        hotkeyNote = '';
-      }
+    const hk = saveHotkeys(settings, activeHotkeys, merged, applyHotkeys);
+    if (hk) {
+      merged.hotkey = hk.applied.hotkey;
+      merged.meetingHotkey = hk.applied.meetingHotkey;
+      activeHotkeys = hk.active;
+      hotkeyState = hk.state;
+      hotkeyNote = hk.note;
+      warning = hk.warning;
     }
     if (merged.pillPos !== prevPillPos) merged.pillCustom = null;
     settings = merged;
@@ -1265,7 +1267,8 @@ function setupIpc() {
       try { app.setLoginItemSettings({ openAtLogin: settings.autoLaunch }); } catch (_) { /* noop */ }
     }
     updateTray();
-    return warning ? { ok: true, warning } : { ok: true };
+    const applied = { hotkey: settings.hotkey, meetingHotkey: settings.meetingHotkey };
+    return warning ? { ok: true, applied, warning } : { ok: true, applied };
   });
   ipcMain.handle('hotkey:state', () => hotkeyState);
 
@@ -1460,19 +1463,19 @@ if (!gotLock) {
       }));
     });
     createOverlay();
-    createTray();
     // 登録できなかった側だけ既定に落として再試行する（成功した側はそのまま）。
-    // 結果はメモリ上だけで、ディスクには書かない。利用者が選んだキーを
-    // 黙って既定に書き換えると、衝突が解けた後も元に戻らない。
+    // 有効なキーは activeHotkeys にだけ持ち、settings には書かない。settings に書くと
+    // settings:get が既定を返して設定画面に既定が出、次の無関係な保存（自動起動の
+    // 切り替えなど）でディスクにも漏れて、利用者が選んだキーが黙って消える。
+    // トレイより先に決めておく（トレイの表示は activeHotkeys から組む）。
     {
       const r = resolveStartupHotkeys(settings, DEFAULT_SETTINGS, applyHotkeys);
-      settings.hotkey = r.hotkey;
-      settings.meetingHotkey = r.meetingHotkey;
+      activeHotkeys = r.active;
       hotkeyState = r.state;
       hotkeyNote = r.note;
       if (!r.state.ok) engineLog(`ホットキー: ${r.state.message}`);
-      updateTray();
     }
+    createTray();
     if (engineValid(whisperEng)) startEngine(whisperEng);
     ensurePaster();
     createMainWindow();

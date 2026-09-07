@@ -586,7 +586,9 @@ test('一時停止中は無音警告も区間の切り出しも動かない', ()
   const c = code(overlayHtml);
   assert.match(c, /function checkSilence\([^)]*\) \{\s*if \(stopping \|\| cancelled \|\| paused/);
   assert.match(c, /function cutSegmentIfOverdue\([^)]*\) \{\s*if \(paused\) return;/);
-  assert.match(main, /if \(!meeting\.paused\) sendToOverlay\('overlay:tick'/);
+  // main 側の「一時停止中は合図を送らない」は mainlib.tickStep の判断（main.test.js で実行）。
+  // ここでは interval が tickStep に overlay:tick を送る手を渡していることだけ見る
+  assert.match(code(main), /tickStep\(\{ state, meeting \},\s*\(\) => sendToOverlay\('overlay:tick', \{\}\)/);
 });
 
 test('議事録の破棄ボタンは録音バーに出さない（誤操作で会議が消える）', () => {
@@ -722,21 +724,25 @@ test('#46 要約完了時に手元の古い page で書き戻さない（削除�
 });
 
 test('#10 同じページの要約は同時に一つだけ走る', () => {
-  assert.match(main, /const summarizing = new Map\(\)/);
-  const fn = fnBody(code(main), 'function runSummary(pageId)', '\n}');
-  assert.ok(fn.includes('summarizing.has(pageId)') && fn.includes('summarizing.get(pageId)'), '走行中なら同じ Promise を返していない');
-  assert.ok(fn.includes('summarizing.delete(pageId)'), '完了時に外していない');
+  // 排他の判断は mainlib.makeSummaryRunner（実行して検査するのは main.test.js）。
+  // ここは main.js がそれを通しているか（結線）だけを見る。
+  assert.match(main, /const runSummary = makeSummaryRunner\(doRunSummary\)/, '排他を mainlib.makeSummaryRunner で作っていない');
+  assert.ok(!/new Map\(\)[^\n]*\n[^\n]*function runSummary/.test(code(main)) && !/const summarizing = new Map\(\)/.test(code(main)),
+    '排他を main.js に手書きしている（mainlib を通していない）');
   assert.match(main, /ipcMain\.handle\('page:summarize', \(_e, id\) => runSummary\(id\)\)/);
   assert.match(main, /await runSummary\(page\.id\)/, '議事録終了後の要約が排他を通っていない');
 });
 
 test('#12 一時停止しても overlay:tick の見張りを消さない', () => {
-  // interval を消すのは議事録が無くなったときだけ。一時停止は送信を飛ばすだけ。
+  // 送る／飛ばす／消す の判断は mainlib.tickStep（実行して検査するのは main.test.js）。
+  // ここは interval の中でそれを通しているか（結線）だけを見る。
   const fn = fnBody(code(main), 'function startMeetingTick', '\nfunction applyTheme');
+  assert.ok(fn.includes('tickStep({ state, meeting }'), 'interval の中で mainlib.tickStep を通していない');
+  assert.ok(fn.includes("sendToOverlay('overlay:tick', {})"), '合図を送る手を渡していない');
   const clearing = fn.split('\n').filter((l) => l.includes('clearInterval'));
-  assert.ok(clearing.length > 0);
+  assert.ok(clearing.length > 0, '見張りを消す手を渡していない');
   for (const l of clearing) assert.ok(!l.includes('paused'), `一時停止で見張りを消している: ${l.trim()}`);
-  assert.ok(!/paused\)\s*\{?\s*clearInterval/.test(fn.replace(/\n/g, ' ')), '一時停止で見張りを消している');
+  assert.ok(!/paused/.test(fn), '判断を main.js に手書きしている（mainlib を通していない）');
 });
 
 test('#14 一時停止したまま停止したら、停止時刻で一時停止を締める', () => {
@@ -769,22 +775,35 @@ test('#35/#49 ホットキーは片方ずつ登録し、失敗を画面とトレ
   const apply = fnBody(code(main), 'function applyHotkeys', '\n}');
   assert.ok(apply.includes('registerHotkeys('), '独立登録の純関数を通っていない');
   assert.ok(!apply.includes('unregisterAll(); return { ok: false'), '片方の失敗で両方を解除している');
-  // 保存時: 失敗した側だけ前の値に戻し、他の設定は保存する。戻り値は warning 付きの ok
+  // 保存時: 判断は mainlib.saveHotkeys。失敗した側だけ前の値に戻し、他の設定は保存する。
+  // 設定として残ったキーを applied で画面に返す（画面はこれを欄に戻す。失敗したキーが
+  // 欄に残ると、以後の無関係な保存のたびに再失敗して警告が出続ける）
   const save = fnBody(code(main), "ipcMain.handle('settings:save'", '\n  });');
   assert.ok(!save.includes("return { ok: false, error: `${r.which}"), '全体を失敗として返している');
-  assert.match(save, /warning/);
-  assert.ok(save.includes('merged.hotkey = prevHotkey') && save.includes('merged.meetingHotkey = prevMeetingHotkey'));
-  // 起動時: 失敗した側だけ既定に落とし、ディスクには書かない
-  assert.match(main, /let hotkeyState = \{ ok: true, failed: \[\], message: '' \}/);
+  assert.ok(save.includes('saveHotkeys(settings, activeHotkeys, merged, applyHotkeys)'), 'mainlib.saveHotkeys を通していない');
+  assert.ok(save.includes('merged.hotkey = hk.applied.hotkey') && save.includes('merged.meetingHotkey = hk.applied.meetingHotkey'), '戻した値を設定に反映していない');
+  assert.ok(save.includes('activeHotkeys = hk.active') && save.includes('hotkeyState = hk.state') && save.includes('hotkeyNote = hk.note'),
+    '実際に登録したキー・状態・トレイの注記を残していない');
+  assert.match(save, /const applied = \{ hotkey: settings\.hotkey, meetingHotkey: settings\.meetingHotkey \}/, '設定として残ったキーを applied に組んでいない');
+  assert.match(save, /return warning \? \{ ok: true, applied, warning \} : \{ ok: true, applied \}/, '画面が欄に戻す applied を返していない');
+  // 起動時: 失敗した側だけ既定に落とす。settings（メモリもディスクも）には書かず、有効なキーは
+  // activeHotkeys に持つ。settings に書くと settings:get が既定を返し、次の保存でディスクに漏れる
+  assert.match(main, /let hotkeyState = \{ ok: true, failed: \[\], fallback: \{\}, message: '' \}/);
+  assert.match(main, /let activeHotkeys = \{ hotkey: /, '実際に登録しているキーを持つ変数が無い');
   const boot = fnBody(code(main), 'resolveStartupHotkeys(', '\n    if (engineValid(whisperEng))');
   assert.ok(!boot.includes('persistSettings'), '起動時のホットキーの失敗で設定をディスクに書いている');
-  assert.ok(boot.includes('hotkeyState = '), '起動時の結果を hotkeyState に残していない');
-  // 画面から状態を引ける
+  assert.ok(!/settings\.(hotkey|meetingHotkey)\s*=/.test(boot), '起動時の退避を settings に書いている（settings:get が既定を返し、次の保存でディスクに漏れる）');
+  assert.ok(boot.includes('activeHotkeys = r.active'), '実際に登録したキーを activeHotkeys に残していない');
+  assert.ok(boot.includes('hotkeyState = r.state'), '起動時の結果を hotkeyState に残していない');
+  // 画面から状態を引ける。settings:get は利用者の設定をそのまま返す
   assert.match(main, /ipcMain\.handle\('hotkey:state', \(\) => hotkeyState\)/);
+  assert.match(main, /ipcMain\.handle\('settings:get', \(\) => settings\)/);
   assert.ok(preload.includes("  hotkeyState: () => ipcRenderer.invoke('hotkey:state'),"));
-  // トレイに「（… は登録できず）」を添える
+  // トレイは実際に登録しているキーを出し、「（…: 既定の … を使用中）」「（… は登録できず）」を添える
   const tray = fnBody(code(main), 'function updateTray()', '\nfunction createTray');
   assert.ok(tray.includes('hotkeyNote'), 'トレイに登録できなかったキーの注記が無い');
+  assert.ok(tray.includes('activeHotkeys.hotkey') && tray.includes('activeHotkeys.meetingHotkey'), 'トレイが実際に登録しているキーを出していない');
+  assert.ok(!/settings\.(hotkey|meetingHotkey)/.test(tray), 'トレイが設定のキーを出している（退避中は効かないキーが表示される）');
 });
 
 test('#18 テンプレートの写しを落とす結線（minutes.dropTemplateEcho が無ければ素通し）', () => {
