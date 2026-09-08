@@ -550,6 +550,7 @@
           <div class="field">
             <textarea id="dictionary" rows="5" placeholder="1行に1語ずつ&#10;自社名&#10;製品名&#10;部署名"></textarea>
             <div class="desc">固有名詞・社内用語をエンジンへ渡し、認識精度を上げます。</div>
+            <div class="desc ng" id="dictWarn" hidden></div>
           </div>
           <label class="check"><input type="checkbox" id="useBuiltinTerms" />
             <span>業務でよく使う言葉のヒントも渡す<br />
@@ -1757,6 +1758,20 @@
     }
   }
 
+  // 辞書は認識ヒント（whisper のプロンプト）として渡すが、載せられる長さに上限があり、
+  // 超えた分は黙って捨てられる。何語まで効いているかを辞書欄の下に出す。
+  // 設定の表示時と保存後に main へ聞く。
+  async function refreshPromptInfo() {
+    const w = $('dictWarn');
+    if (typeof window.koeApp.promptInfo !== 'function') return;   // 古い preload と組んだときも設定画面は生かす
+    let r;
+    try { r = await window.koeApp.promptInfo(); } catch (_) { return; }
+    const over = Boolean(r && r.ok !== false && r.over);
+    w.textContent = over
+      ? `辞書が認識ヒントの上限を超えています（先頭から ${Number(r.kept) || 0} 語まで有効。それ以降は渡されません）` : '';
+    w.hidden = !over;
+  }
+
   async function refreshVad() {
     try {
       const s = await window.koeApp.vadStatus();
@@ -1833,6 +1848,7 @@
       if (r.warning) toast(r.warning);
       refreshVad();
       refreshHotkeyState();
+      refreshPromptInfo();
       return true;
     }
     m.textContent = r.error || '保存に失敗しました'; m.className = 'save-msg ng';
@@ -1973,6 +1989,7 @@
     settingsLoaded = true;   // ここを通るまで save() は書き込まない
     refreshVad();
     refreshHotkeyState();
+    refreshPromptInfo();
     mtypes = await window.koeApp.meetingTypes();
     try {
       const v = await window.koeApp.appVersion();
