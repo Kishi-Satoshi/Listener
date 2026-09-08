@@ -193,5 +193,34 @@ function refreshCitations(blocks, segments, segId) {
   return { linked, total: r.total, skipped: r.skipped };
 }
 
-module.exports = { attachCitations, refreshCitations, buildIndex, matchOne, bigrams, normalize,
-  searchFold, isCitable, citeText, MIN_CITE_CHARS };
+/**
+ * 文字起こしの世代をまたいで出典を付ける（#4）。
+ *
+ * 文字起こしをやり直す（別モデル・別設定で再認識する）と、区間は id と時刻が同じまま
+ * text だけ変わる。要約は古い世代の本文から作られていることがあり、新しい本文だけに
+ * 照合すると、「アイス推進室」（旧）の文言で書かれた要点が「AI推進室」（新）の区間に届かない。
+ *
+ * id が同じで text が違う区間は「新しい本文 + 改行 + 古い本文」を1区間として照合する。
+ * どちらの言い回しでも同じ id に当たり、cites に入るのは実在の id だけ
+ * （合成区間の id は元の id そのもの。古い世代にしか無い区間は使わない —
+ * もう文字起こしに無い発言へはリンクできない）。
+ * 認識に失敗した区間（failed）は両側とも材料にしない。失敗の定型文を要約が写して
+ * いても、そこへリンクしても何も読めない。
+ * 古い世代が無い・全て同じ本文なら attachCitations(blocks, fresh) と同じ結果になる。
+ * @returns {{linked:number, total:number, skipped:number}}
+ */
+function attachCitationsAcross(blocks, freshSegments, oldSegments, opts) {
+  const fresh = (Array.isArray(freshSegments) ? freshSegments : []).filter((s) => s && !s.failed);
+  const old = new Map();
+  for (const s of (Array.isArray(oldSegments) ? oldSegments : [])) {
+    if (s && !s.failed && typeof s.text === 'string') old.set(s.id, s);
+  }
+  const merged = fresh.map((s) => {
+    const o = old.get(s.id);
+    return (o && o.text !== s.text) ? { ...s, text: `${s.text}\n${o.text}` } : s;
+  });
+  return attachCitations(blocks, merged, opts);
+}
+
+module.exports = { attachCitations, refreshCitations, attachCitationsAcross, buildIndex, matchOne,
+  bigrams, normalize, searchFold, isCitable, citeText, MIN_CITE_CHARS };

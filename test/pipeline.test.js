@@ -208,3 +208,35 @@ test('表で出た数値行に出典が付く', () => {
   assert.strictEqual(citeStat.total, 2);
   assert.strictEqual(citeStat.linked, 2);
 });
+
+// ---------------------------------------------------------------- 文字起こしのやり直し（#4）
+// 旧世代（s6 が誤認識）から作った要約は、その誤認識の文言で書かれている。新世代（直った
+// 文字起こし）に対して出典を付け直しても、その要点は同じ id（s6）を指し、他の要点は
+// 新世代だけで付けた結果と 1 文字も変わらない。
+test('やり直した文字起こしに対しても、旧文言の要点が同じ区間を指し、他の要点は動かない', () => {
+  const { attachCitationsAcross } = require('../src/cite');
+  const BROKEN = '再曜の往復は今月八名でした。位置面接まで済んだのが参名です。';
+  const oldGen = STANDUP_SEGMENTS.map((s) => (s.id === 's6' ? { ...s, text: BROKEN } : s));
+  // 旧世代から作った要約: 採用の行だけ誤認識の文言を写している
+  const md = STANDUP_SUMMARY_MD.replace('- 今月の応募は8名、一次面接まで進んだのが3名、内定は0名。', '- 再曜の往復は今月八名。');
+  assert.notStrictEqual(md, STANDUP_SUMMARY_MD, '置換対象の行が要約に無い');
+
+  const plain = runPipeline(md, STANDUP_SEGMENTS, BASE);   // 新世代だけで付けた結果
+  const blocks = dropRedundantEmpty(markdownToBlocks(md));
+  enrichActionBlocks(blocks, BASE);
+  const stat = attachCitationsAcross(blocks, STANDUP_SEGMENTS, oldGen);
+
+  const find = (bs) => bs.find((b) => b.type === 'bullet' && b.text.includes('再曜の往復'));
+  assert.deepStrictEqual(find(plain.blocks).cites, [], '前提が崩れた（新世代だけで旧文言の要点に出典が付いている）');
+  assert.deepStrictEqual(find(blocks).cites, ['s6'], `旧文言の要点が s6 を指さない: ${JSON.stringify(find(blocks).cites)}`);
+  for (const b of blocks) {
+    if (b === find(blocks)) continue;
+    const same = plain.blocks.find((x) => x.text === b.text && x.type === b.type);
+    assert.ok(same, `比較対象の行が見つからない: ${b.text}`);
+    assert.deepStrictEqual(b.cites || [], same.cites || [], `旧世代の混入で無関係な要点「${b.text}」の出典が動いた`);
+  }
+  const ids = new Set(STANDUP_SEGMENTS.map((s) => s.id));
+  for (const b of blocks) for (const c of b.cites || []) assert.ok(ids.has(c), `存在しない id ${c}`);
+  assert.strictEqual(stat.total, plain.citeStat.total);
+  assert.strictEqual(stat.linked, plain.citeStat.linked + 1);
+});

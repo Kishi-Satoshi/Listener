@@ -8,7 +8,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { attachCitations, refreshCitations, buildIndex, matchOne, bigrams, normalize,
+const { attachCitations, refreshCitations, attachCitationsAcross, buildIndex, matchOne, bigrams, normalize,
   isCitable, citeText, MIN_CITE_CHARS } = require('../src/cite');
 
 const SEGS = [
@@ -335,4 +335,85 @@ test('attachCitations / refreshCitations は citeState=manual の行を照合せ
   const r2 = refreshCitations(blocks, SEGS, 's1');
   assert.deepStrictEqual(m1.cites, [], 'refreshCitations が手書きの行に出典を付けた');
   assert.strictEqual(r2.total, 3);
+});
+
+// ---------------------------------------------------------------- 文字起こしの世代をまたぐ出典（#4）
+// 文字起こしをやり直すと区間は id と時刻が同じまま本文だけ変わる。要約が古い世代の
+// 文言で書かれていても、同じ id の区間に出典が付くこと。実在しない id・古い世代にしか
+// 無い区間・認識に失敗した区間へはリンクしないこと（誤リンクは無リンクより有害）。
+const GEN_OLD = [
+  { id: 's1', atMs: 0, text: 'アイス推進室は来期に立ち上げます。' },                 // 旧: 誤認識
+  { id: 's2', atMs: 1000, text: '在庫連携のバッチ処理は今週中に見直します。' },
+  { id: 's3', atMs: 2000, text: '採用の応募は今月8名でした。' },                     // 旧は読めたが新は失敗
+  { id: 's4', atMs: 3000, text: '（この区間の認識に失敗: timeout）', failed: true },   // 旧は失敗、新は読めた
+  { id: 's9', atMs: 9000, text: '宇宙開発の予算が増額されました。' },                 // 旧世代にしか無い区間
+];
+const GEN_NEW = [
+  { id: 's1', atMs: 0, text: 'AI推進室は来期に立ち上げます。' },
+  { id: 's2', atMs: 1000, text: '在庫連携のバッチ処理は今週中に見直します。' },
+  { id: 's3', atMs: 2000, text: '（この区間の認識に失敗: timeout）', failed: true },
+  { id: 's4', atMs: 3000, text: '請求書の締め処理は毎月20日までにお願いします。' },
+];
+
+test('attachCitationsAcross: 古い文言（アイス推進室）の要点が、新しい本文（AI推進室）の同じ区間を指す', () => {
+  // 要点の大半が変わった語で占められていて、新しい本文だけでは被覆率に届かない形にする
+  // （少しの違いならバイグラム照合がもともと吸収するので、この機能の効き目が見えない）
+  const mk = () => [{ id: 'b1', type: 'bullet', text: 'アイス推進室を新設', cites: [] }];
+  const only = mk();
+  attachCitations(only, GEN_NEW.filter((s) => !s.failed));
+  assert.deepStrictEqual(only[0].cites, [], '前提が崩れた（新しい本文だけで届いている）');
+  const across = mk();
+  const r = attachCitationsAcross(across, GEN_NEW, GEN_OLD);
+  assert.deepStrictEqual(across[0].cites, ['s1']);
+  assert.deepStrictEqual(r, { linked: 1, total: 1, skipped: 0 });
+});
+
+test('attachCitationsAcross: 出典は新しい世代に実在する id だけ（旧世代にしか無い区間・失敗した区間は使わない）', () => {
+  const blocks = [
+    { id: 'b1', type: 'bullet', text: '宇宙開発の予算が増額', cites: [] },        // 旧世代にしか無い s9
+    { id: 'b2', type: 'bullet', text: '採用の応募は今月8名', cites: [] },          // 新世代で失敗した s3
+    { id: 'b3', type: 'bullet', text: 'この区間の認識に失敗', cites: [] },        // 旧世代の失敗の定型文（s4）
+    { id: 'b4', type: 'bullet', text: '請求書の締め処理は毎月20日まで', cites: [] }, // 新世代で読めた s4
+    { id: 'b5', type: 'bullet', text: '全社的なクラウド移行の方針決定が遅れている', cites: [] },
+  ];
+  attachCitationsAcross(blocks, GEN_NEW, GEN_OLD);
+  assert.deepStrictEqual(blocks[0].cites, [], '旧世代にしか無い区間へリンクした');
+  assert.deepStrictEqual(blocks[1].cites, [], '新世代で失敗した区間へリンクした');
+  assert.deepStrictEqual(blocks[2].cites, [], '旧世代の失敗の定型文が照合の材料になった');
+  assert.deepStrictEqual(blocks[3].cites, ['s4']);
+  assert.deepStrictEqual(blocks[4].cites, [], '無関係な要点にリンクが付いた');
+  const ids = new Set(GEN_NEW.filter((s) => !s.failed).map((s) => s.id));
+  for (const b of blocks) for (const c of b.cites) assert.ok(ids.has(c), `実在しない id ${c}`);
+});
+
+test('attachCitationsAcross: 旧世代と新世代が同じなら attachCitations(blocks, fresh) と同じ結果', () => {
+  const a = mkBlocks();
+  const b = mkBlocks();
+  const ra = attachCitations(a, SEGS);
+  const rb = attachCitationsAcross(b, SEGS, JSON.parse(JSON.stringify(SEGS)));
+  assert.deepStrictEqual(b.map((x) => x.cites), a.map((x) => x.cites));
+  assert.deepStrictEqual(rb, ra);
+  assert.ok(ra.linked > 0, '前提が崩れた（比較対象に出典が1つも無い）');
+});
+
+test('attachCitationsAcross: 旧世代が無い・空でも attachCitations と同じで、落ちない', () => {
+  for (const old of [undefined, null, []]) {
+    const a = mkBlocks();
+    const b = mkBlocks();
+    const ra = attachCitations(a, SEGS);
+    const rb = attachCitationsAcross(b, SEGS, old);
+    assert.deepStrictEqual(b.map((x) => x.cites), a.map((x) => x.cites));
+    assert.deepStrictEqual(rb, ra);
+  }
+  const c = mkBlocks();
+  assert.deepStrictEqual(attachCitationsAcross(c, [], GEN_OLD), { linked: 0, total: 0, skipped: 0 });
+  assert.deepStrictEqual(c.map((x) => x.cites), mkBlocks().map((x) => x.cites), '新世代が空なのに出典に触った');
+});
+
+test('attachCitationsAcross: 渡した区間配列を書き換えない（合成は照合用の写しだけ）', () => {
+  const freshSnap = JSON.stringify(GEN_NEW);
+  const oldSnap = JSON.stringify(GEN_OLD);
+  attachCitationsAcross(mkBlocks(), GEN_NEW, GEN_OLD);
+  assert.strictEqual(JSON.stringify(GEN_NEW), freshSnap);
+  assert.strictEqual(JSON.stringify(GEN_OLD), oldSnap);
 });
