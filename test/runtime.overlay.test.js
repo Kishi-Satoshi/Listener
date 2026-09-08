@@ -198,7 +198,10 @@ test('上限時間で切られた区間の変換中に一時停止→終了し�
   await log.drain();
   assert.deepStrictEqual(log.errors.map(fmt), [], '例外');
   const segs = log.called('sendSegment');
-  assert.deepStrictEqual(segs.map((c) => c.args[2]), [true],
+  // #13 以降、切られた区間の変換中も次の区間が録っている。一時停止はその次の区間を
+  // 締めるので、届く順は「切られた区間（途中）→ 一時停止で締めた区間（最後）」。
+  // 守るべきことは変わらない: 最後の印は1回だけ、切られた区間の音声は捨てない。
+  assert.deepStrictEqual(segs.map((c) => c.args[2]), [false, true],
     '最後の区間が二重に届く／届かない（本物の区間が空の最後の後に届き、main に捨てられる）');
   assert.ok(segs[0].args[0].length > 0, '切られた区間の音声が捨てられている');
   assert.ok(streams[0].track.stops >= 1, '終了後もマイクが開いたまま');
@@ -258,3 +261,106 @@ test('音声入力の WAV 変換に失敗すると、エラーを1回だけ伝�
   assert.strictEqual(log.called('sendAudio').length, 0, '変換に失敗したのに音声が送られている');
   assert.deepStrictEqual(log.called('sendError').map((c) => c.args[0]), ['音声の変換に失敗しました']);
 });
+
+/*
+ * #13 区間の境目の空白。切られた区間は onstop → WAV 変換 → 送信 → 次の区間、の順で
+ * 動いていたので、変換の間（実機で数百ms〜数秒）は誰も録っていなかった。
+ * 空白のぶん atMs も会議が進むほど手前へずれる。次の区間は切った瞬間に始め、
+ * 変換は裏で続ける。送る順は区間の番号で守る（短い後の区間が先に変換し終えても
+ * 先に届かない。main は届いた順に atMs を積む）。
+ */
+/** overlay の Date.now() をテストが進める時計に差し替える（with(window) 経由で引かれる） */
+function 時計(log, t0 = 1_700_000_000_000) {
+  let t = t0;
+  log.window.Date = { now: () => t };
+  return { now: () => t, 進める(ms) { t += ms; return t; } };
+}
+/** WAV 変換を呼ばれた順に個別に止める。戻り値の配列の要素を呼ぶと、その変換だけ進む */
+function 変換を個別に待たせる(log) {
+  const gates = [];
+  log.window.AudioContext.prototype.decodeAudioData = () => new Promise((r) => {
+    gates.push(() => r({ duration: 0.01, sampleRate: 48000, numberOfChannels: 1, length: 480 }));
+  });
+  return gates;
+}
+const FIRST_SEG = 20000, GRACE = 2000;   // overlay.html の FIRST_SEG_MS と cutSegmentIfOverdue の猶予
+
+async function 議事録を開始(opt = {}) {
+  const log = await load(OVL, opt.load || {});
+  非同期onstopに(log);
+  if (opt.setup) opt.setup(log);
+  const clock = 時計(log);
+  log.fire('onStart', Object.assign({ mode: 'meeting', segmentSec: 75, sound: false, systemAudio: false }, opt.start || {}));
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '録音開始で例外');
+  assert.strictEqual(log.recorders.length, 1, '最初の区間の recorder が始まっていない（検査が空振り）');
+  return { log, clock };
+}
+
+test('区切りの見張りで区間を切ると、変換を待たずに次の区間が始まる', async () => {
+  let 変換を進める;
+  const { log, clock } = await 議事録を開始({ setup: (l) => { 変換を進める = 変換を待たせる(l); } });
+  clock.進める(FIRST_SEG + GRACE + 1);
+  log.fire('onTick');                       // 区切りの見張り（main からの overlay:tick）
+  assert.strictEqual(log.recorders.length, 2, '切った瞬間に次の区間が始まっていない（変換の間の録音が空白になる）');
+  assert.strictEqual(log.recorders[0].state, 'inactive', '前の区間が止まっていない');
+  assert.strictEqual(log.recorders[1].state, 'recording', '次の区間が録っていない');
+  await log.drain();
+  assert.strictEqual(log.called('sendSegment').length, 0, '変換が終わる前に区間が送られている（検査が空振り）');
+  assert.strictEqual(log.recorders.length, 2, '変換待ちの間に区間が余計に始まっている（録音が2本走る）');
+  変換を進める();
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '例外');
+  const segs = log.called('sendSegment');
+  assert.strictEqual(segs.length, 1, '切った区間が届かない／二重に届く');
+  assert.strictEqual(segs[0].args[2], false, '途中の区間が最後の印で届いている');
+  assert.strictEqual(segs[0].args[1], FIRST_SEG + GRACE + 1, '区間の長さが録った長さと違う');
+  assert.strictEqual(log.recorders.length, 2, '変換後にもう一度次の区間を始めている（録音が2本走る）');
+});
+
+test('上限で止まった区間の onstop でも、変換を待たずに次の区間が始まる', async () => {
+  let 変換を進める;
+  const { log } = await 議事録を開始({ setup: (l) => { 変換を進める = 変換を待たせる(l); } });
+  log.recorders[0].stop();                  // 上限時間の打ち切り（recorder.stop() を直に呼ぶ経路）
+  await log.drain();                        // onstop が走り、変換待ちで止まる
+  assert.strictEqual(log.called('sendSegment').length, 0, '変換が終わる前に区間が送られている（検査が空振り）');
+  assert.strictEqual(log.recorders.length, 2, 'onstop が変換を待ってから次の区間を始めている（その間の録音が空白になる）');
+  assert.strictEqual(log.recorders[1].state, 'recording', '次の区間が録っていない');
+  変換を進める();
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '例外');
+  assert.deepStrictEqual(log.called('sendSegment').map((c) => c.args[2]), [false], '切った区間が届かない／二重に届く');
+  assert.strictEqual(log.recorders.length, 2, '変換後にもう一度次の区間を始めている（録音が2本走る）');
+});
+
+test('先に切った区間の変換が後から終わっても、区間は切った順に届き、長さに変換の時間を含めない', async () => {
+  let gates;
+  const { log, clock } = await 議事録を開始({ setup: (l) => { gates = 変換を個別に待たせる(l); } });
+  const durA = FIRST_SEG + GRACE + 1;
+  clock.進める(durA);
+  log.fire('onTick');                       // A を切る → B が始まる
+  await log.drain();
+  const durB = 75000 + GRACE + 1;
+  clock.進める(durB);
+  log.fire('onTick');                       // B を切る → C が始まる
+  await log.drain();
+  assert.strictEqual(log.recorders.length, 3, '区間が3つ目まで進んでいない（検査が空振り）');
+  assert.strictEqual(gates.length, 2, '2つの区間が変換待ちになっていない（検査が空振り）');
+  gates[1]();                               // 後の区間（B）の変換が先に終わる
+  await log.drain();
+  assert.strictEqual(log.called('sendSegment').length, 0, '前の区間より先に後の区間が届いている（main の atMs がずれ、文脈の並びも狂う）');
+  clock.進める(50000);                      // A の変換に時間がかかった。これは区間の長さに入れない
+  gates[0]();
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '例外');
+  assert.deepStrictEqual(log.called('sendSegment').map((c) => c.args[1]), [durA, durB],
+    '区間が切った順に届いていない／長さに変換の時間が混ざっている');
+  log.fire('onStop');                       // C を最後として締める
+  await log.drain();
+  assert.strictEqual(gates.length, 3, '最後の区間が変換に入っていない（検査が空振り）');
+  gates[2]();
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '終了で例外');
+  assert.deepStrictEqual(log.called('sendSegment').map((c) => c.args[2]), [false, false, true], '最後の印が最後の区間だけに1回付いていない');
+});
+
