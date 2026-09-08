@@ -398,10 +398,12 @@ test('要約の生成中は、page:updated で描き直されてもボタンが�
 });
 
 // ================= ホットキーの登録状態 =================
-// preload に hotkeyState が足されるまでは、テスト側で公開名だけ補う
+// preload にまだ無い公開名は、テスト側で名前だけ補う（main / preload は別の作業で足される。
+// 画面の側だけ先に作って検査できるようにする）。既にある名前は二重に足さない。
 const PRELOAD = fs.readFileSync(path.join(__dirname, '..', 'src', 'preload.js'), 'utf8');
-const preloadWithHotkey = () => PRELOAD.includes('hotkeyState') ? PRELOAD
-  : PRELOAD.replace("exposeInMainWorld('koeApp', {", "exposeInMainWorld('koeApp', {\n  hotkeyState: () => ipcRenderer.invoke('app:hotkey-state'),");
+const preloadWith = (...names) => names.reduce((src, n) => (new RegExp(`^\\s+${n}\\s*:`, 'm').test(src) ? src
+  : src.replace("exposeInMainWorld('koeApp', {", `exposeInMainWorld('koeApp', {\n  ${n}: (...a) => ipcRenderer.invoke('test:${n}', ...a),`)), PRELOAD);
+const preloadWithHotkey = () => preloadWith('hotkeyState');
 
 test('登録できなかったホットキーの欄の下に、赤い説明が出る（設定の表示時と保存後）', async () => {
   let st = { ok: false, failed: ['議事録'], message: '' };
@@ -553,5 +555,276 @@ test('保存で登録できなかったキーは、main が採った値に欄と
   await l.drain();
   const sent = l.called('saveSettings').map((c) => c.args[0].hotkey);
   assert.deepStrictEqual(sent, ['Control+Shift+X', 'Control+Shift+Space'], `送ったキー: ${JSON.stringify(sent)}`);
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+// ================= 一覧のキーボード操作（#55） =================
+// 一覧の行は div + onclick なので、そのままでは Tab で辿れず Enter でも開けない。
+const 二件 = () => ({
+  pagesSearch: () => [
+    { id: 'p1', title: '一つ目', date: '9/1', durationSec: 60, hasSummary: true },
+    { id: 'p2', title: '二つ目', date: '9/2', durationSec: 60, hasSummary: true },
+  ],
+});
+const 行を開く = (l) => l.called('pageGet').map((c) => c.args[0]);
+
+test('議事録の一覧は listbox で、行は Tab で辿れ Enter / Space で開ける（マウスは今まで通り）', async () => {
+  const l = await 開いた(二件());
+  const list = l.byId.get('plist');
+  assert.strictEqual(list.getAttribute('role'), 'listbox', '一覧に listbox の役割が無い');
+  assert.ok(list.getAttribute('aria-label'), '一覧に読み上げ用の名前が無い');
+  let rows = list.querySelectorAll('.pitem');
+  assert.strictEqual(rows.length, 2, '前提: 行が2つ描かれる');
+  for (const r of rows) {
+    assert.strictEqual(r.tabIndex, 0, `${r.textContent} が Tab で辿れない`);
+    assert.strictEqual(r.getAttribute('role'), 'option', `${r.textContent} に option の役割が無い`);
+  }
+  assert.strictEqual(rows[0].getAttribute('aria-selected'), 'true', '開いているページが選択中と示されない');
+  assert.strictEqual(rows[1].getAttribute('aria-selected'), 'false', '開いていないページが選択中になっている');
+  const n0 = 行を開く(l).length;
+  rows[1].dispatchEvent({ type: 'keydown', key: 'a' });
+  rows[1].dispatchEvent({ type: 'keydown', key: 'Escape' });
+  await l.drain();
+  assert.strictEqual(行を開く(l).length, n0, '無関係なキーで開いてしまう');
+  rows[1].dispatchEvent({ type: 'keydown', key: 'Enter' });
+  await l.drain();
+  assert.deepStrictEqual(行を開く(l).slice(n0), ['p2'], 'Enter で開かない');
+  // 開き直すと行は作り直される。選択の印も移る
+  rows = list.querySelectorAll('.pitem');
+  assert.strictEqual(rows[1].getAttribute('aria-selected'), 'true', '開いた行に選択の印が移らない');
+  assert.strictEqual(rows[0].getAttribute('aria-selected'), 'false');
+  rows[0].dispatchEvent({ type: 'keydown', key: ' ' });
+  await l.drain();
+  assert.deepStrictEqual(行を開く(l).slice(n0), ['p2', 'p1'], 'Space で開かない');
+  rows = list.querySelectorAll('.pitem');
+  rows[1].dispatchEvent({ type: 'click' });
+  await l.drain();
+  assert.deepStrictEqual(行を開く(l).slice(n0), ['p2', 'p1', 'p2'], 'マウスで開けなくなった');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('アクション横断ビューの出典行も、Tab で辿れ Enter で元の議事録を開ける', async () => {
+  const l = await 開いた({
+    openActions: () => [
+      { pageId: 'p1', pageTitle: '一つ目', blockId: 'b2', text: 'やること', assignee: '佐藤', date: '9/1' },
+      { pageId: 'p2', pageTitle: '二つ目', blockId: 'b9', text: '別のやること', assignee: '', date: '9/2' },
+    ],
+    assigneeList: () => [],
+  });
+  l.byId.get('fltActions').dispatchEvent({ type: 'click' });
+  await l.drain();
+  const rows = l.byId.get('plist').querySelectorAll('.src');
+  assert.strictEqual(rows.length, 2, '前提: 出典行が2つ描かれる');
+  for (const r of rows) {
+    assert.strictEqual(r.tabIndex, 0, '出典行が Tab で辿れない');
+    assert.strictEqual(r.getAttribute('role'), 'option');
+  }
+  assert.strictEqual(rows[0].getAttribute('aria-selected'), 'true', '開いているページの出典行が選択中と示されない');
+  assert.strictEqual(rows[1].getAttribute('aria-selected'), 'false');
+  const n0 = 行を開く(l).length;
+  rows[1].dispatchEvent({ type: 'keydown', key: 'Tab' });
+  await l.drain();
+  assert.strictEqual(行を開く(l).length, n0, '無関係なキーで開いてしまう');
+  rows[1].dispatchEvent({ type: 'keydown', key: 'Enter' });
+  await l.drain();
+  assert.deepStrictEqual(行を開く(l).slice(n0), ['p2'], 'Enter で元の議事録が開かない');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('一覧の行にキーボードのフォーカスが見える（:focus-visible の定義がある）', () => {
+  const { root } = parseHTML(fs.readFileSync(APP, 'utf8'));
+  const css = root.querySelectorAll('style').map((s) => s._raw).join('\n');
+  const rules = simcss.parse(css);
+  for (const sel of ['.pitem:focus-visible', '.actrow .src:focus-visible']) {
+    const r = rules.find((x) => x.sel.split(',').map((s) => s.trim()).includes(sel));
+    assert.ok(r, `${sel} の定義が無い（Tab で辿れても今どこにいるか見えない）`);
+    assert.ok(r.decls && r.decls.outline && !/none/.test(r.decls.outline), `${sel} に outline が無い`);
+  }
+});
+
+// ================= 検索の正規化（#53） =================
+// 全角／半角・大文字小文字・句読点や空白の違いで取りこぼさない。
+// main 側（cite.js の searchFold）と同じ規則で両辺を畳んでから含有を見る。
+test('音声入力の履歴検索は、全角と半角・大文字小文字の違いを越えて当たる', async () => {
+  const l = await load(APP, { returns: { getHistory: () => [
+    { id: 'h1', text: 'ＡＩ戦略の会議', createdAt: new Date().toISOString(), durationSec: 5, chars: 7 },
+    { id: 'h2', text: '昼食の相談', createdAt: new Date().toISOString(), durationSec: 5, chars: 5 },
+  ] } });
+  const hits = () => l.byId.get('histList').querySelectorAll('.entry').length;
+  const search = (q) => { l.byId.get('histSearch').value = q; l.byId.get('histSearch').dispatchEvent({ type: 'input' }); };
+  assert.strictEqual(hits(), 2, '前提: 検索前は全件');
+  search('ai戦略');
+  assert.strictEqual(hits(), 1, '「ＡＩ戦略」が ai戦略 で当たらない');
+  search('A I 戦略');
+  assert.strictEqual(hits(), 1, '空白の違いで当たらない');
+  search('存在しない');
+  assert.strictEqual(hits(), 0, '当たらないものまで出る');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('アクション横断ビューの絞り込みは、句読点の違いを越えて当たる', async () => {
+  const l = await 開いた({
+    openActions: () => [
+      { pageId: 'p1', pageTitle: '一つ目', blockId: 'b2', text: '予算案の、作成', assignee: '佐藤', date: '9/1' },
+      { pageId: 'p1', pageTitle: '一つ目', blockId: 'b3', text: '会場の予約', assignee: '', date: '9/1' },
+    ],
+    assigneeList: () => [],
+  });
+  const rows = () => l.byId.get('plist').querySelectorAll('.actrow').map((r) => r.querySelector('.body').childNodes[0].textContent);
+  // 検索欄の input は遅延（220ms）で走るので、チップを押して即時に描き直す
+  l.byId.get('searchBox').value = '予算案の作成';
+  l.byId.get('fltActions').dispatchEvent({ type: 'click' });
+  await l.drain();
+  assert.deepStrictEqual(rows(), ['予算案の、作成'], '「予算案の、作成」が 予算案の作成 で当たらない');
+  l.byId.get('searchBox').value = 'さとう';
+  l.byId.get('fltActions').dispatchEvent({ type: 'click' });
+  await l.drain();
+  assert.deepStrictEqual(rows(), [], '当たらないものまで出る');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+// ================= 作成中の進捗と打ち切り（#8 / #42） =================
+// 終了後の文字起こしが長いと、何分待てばよいか分からず、途中で諦める手段も無かった。
+const 作成中 = (extra) => Object.assign({ active: true, finalizing: true, stopping: true, pending: 3, etaSec: 150, startedAt: Date.now() - 60000, stoppedAt: Date.now(), segments: [] }, extra);
+const バー = (l, id) => l.document.getElementById(id);
+
+test('作成中は残りの区間数と見込み時間が出て、打ち切りボタンは確認のうえ meetingSkipPending を呼ぶ', async () => {
+  let st = 作成中();
+  const l = await load(APP, { preloadSrc: preloadWith('meetingSkipPending', 'promptInfo'), returns: { meetingStatus: () => st } });
+  l.fire('onMeetingUpdate', st);
+  await l.drain();
+  const eta = バー(l, 'liveEta');
+  assert.ok(eta && !eta.hidden, '残りの区間数が出ない');
+  assert.strictEqual(eta.textContent, '残り 3 区間（約 3 分）');
+  assert.ok(eta.closest('.live'), '記録中バーの中に無い');
+  const btn = バー(l, 'liveSkipBtn');
+  assert.ok(btn && !btn.hidden, '打ち切りボタンが出ない');
+  assert.strictEqual(btn.textContent, '文字起こしを打ち切って要約');
+  assert.ok(btn.closest('.live'), '記録中バーの中に無い');
+  // 確認で「いいえ」なら何もしない
+  l.window.confirm = () => false;
+  btn.dispatchEvent({ type: 'click' });
+  await l.drain();
+  assert.deepStrictEqual(l.called('meetingSkipPending'), [], '確認せずに打ち切った');
+  // 「はい」で打ち切り、状態を取り直して描き直す
+  l.window.confirm = () => true;
+  st = 作成中({ pending: 0, etaSec: null, skipped: 3 });
+  const before = l.called('meetingStatus').length;
+  btn.dispatchEvent({ type: 'click' });
+  await l.drain();
+  assert.strictEqual(l.called('meetingSkipPending').length, 1, '打ち切りが呼ばれない');
+  assert.ok(l.called('meetingStatus').length > before, '打ち切り後に状態を取り直していない');
+  assert.ok(バー(l, 'liveSkipBtn').hidden, '残りが無いのにボタンが残る');
+  assert.ok(バー(l, 'liveEta').hidden, '残りが無いのに区間数が残る');
+  const sk = バー(l, 'liveSkipped');
+  assert.ok(sk && !sk.hidden, '打ち切った区間数が出ない');
+  assert.strictEqual(sk.textContent, '3 区間を打ち切りました');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('見込み時間が分からなければ区間数だけ出す。記録中（終了前）は打ち切りボタンを出さない', async () => {
+  const l = await load(APP, { preloadSrc: preloadWith('meetingSkipPending', 'promptInfo') });
+  l.fire('onMeetingUpdate', 作成中({ pending: 2, etaSec: null }));
+  await l.drain();
+  assert.strictEqual(バー(l, 'liveEta').textContent, '残り 2 区間');
+  assert.ok(!バー(l, 'liveSkipBtn').hidden);
+  assert.ok(バー(l, 'liveSkipped').hidden, '打ち切っていないのに「打ち切りました」が出る');
+  // 記録中に区間を変換している（stopping でない）ときは、まだ打ち切る対象ではない
+  l.fire('onMeetingUpdate', { active: true, startedAt: Date.now(), segments: [], pending: 2, etaSec: 90 });
+  await l.drain();
+  assert.ok(バー(l, 'liveSkipBtn').hidden, '記録中に打ち切りボタンが出る');
+  assert.ok(バー(l, 'liveEta').hidden);
+  assert.ok(/2区間を文字起こし中/.test(バー(l, 'liveTitle').textContent), '記録中の表示が変わった');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+// ================= マイクの代替（#56） =================
+test('選んだマイクが見つからず既定のマイクで録っているときは、記録中バーに赤で出す', async () => {
+  const l = await load(APP);
+  l.fire('onMeetingUpdate', { active: true, startedAt: Date.now(), segments: [], micFallback: true });
+  await l.drain();
+  const m = バー(l, 'liveMic');
+  assert.ok(m && !m.hidden, '代替の注意が出ない');
+  assert.strictEqual(m.textContent, '選んだマイクが見つからないため、既定のマイクで録音しています');
+  assert.ok(m.className.split(/\s+/).includes('ng'), '赤（.ng）になっていない');
+  assert.ok(m.closest('.live'), '記録中バーの中に無い');
+  l.fire('onMeetingUpdate', { active: true, startedAt: Date.now(), segments: [], micFallback: false });
+  await l.drain();
+  assert.ok(バー(l, 'liveMic').hidden, '選んだマイクで録れているのに注意が残る');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+// ================= 辞書の上限（#23） =================
+// 辞書は認識ヒント（whisper のプロンプト）に載るが長さに上限があり、超えた分は黙って捨てられる。
+test('辞書が認識ヒントの上限を超えていたら、辞書欄の下に何語まで効くかを出す（表示時と保存後）', async () => {
+  let info = { ok: true, kept: 12, total: 20, over: true };
+  const l = await load(APP, { preloadSrc: preloadWith('meetingSkipPending', 'promptInfo'), returns: { promptInfo: () => info } });
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+  assert.ok(l.called('promptInfo').length >= 1, '設定の表示時に見ていない');
+  const w = l.byId.get('dictWarn');
+  assert.ok(w && !w.hidden, '上限超えの注意が出ない');
+  assert.strictEqual(w.textContent, '辞書が認識ヒントの上限を超えています（先頭から 12 語まで有効。それ以降は渡されません）');
+  assert.ok(w.className.split(/\s+/).includes('ng'), '赤（.ng）になっていない');
+  assert.strictEqual(w.closest('.field'), l.byId.get('dictionary').closest('.field'), '辞書欄の下に無い');
+  info = { ok: true, kept: 5, total: 5, over: false };
+  const before = l.called('promptInfo').length;
+  l.byId.get('tabSettings').dispatchEvent({ type: 'change' });
+  await l.drain();
+  assert.ok(l.called('promptInfo').length > before, '保存後に取り直していない');
+  assert.ok(w.hidden, '収まったのに注意が残る');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('promptInfo の無い古い preload と組んでも、設定画面は生きて注意は出ない', async () => {
+  const l = await load(APP);
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+  assert.deepStrictEqual(l.consoleErrors, []);
+  assert.ok(l.byId.get('dictWarn').hidden);
+});
+
+// ================= 記録中の設定（#57） =================
+const ENGINE_FIELDS = ['language', 'segmentSec', 'localServerExe', 'localModelPath', 'localThreads', 'localPort',
+  'vadModelPath', 'useVad', 'suppressNst', 'sumServerExe', 'sumModelPath', 'sumThreads', 'sumPort'];
+
+test('記録中はエンジンの設定欄が触れなくなり理由が出る。記録が終わると戻る', async () => {
+  const l = await load(APP);
+  const lang = l.byId.get('language');
+  assert.ok(!lang.disabled, '前提: 記録前は触れる');
+  const notes = l.byId.get('tabSettings').querySelectorAll('.lockNote');
+  assert.ok(notes.length >= 2, '理由の説明が無い');
+  assert.ok(notes.every((n) => n.hidden), '記録前から理由が出ている');
+  l.fire('onMeetingUpdate', { active: true, startedAt: Date.now(), segments: [] });
+  await l.drain();
+  for (const id of ENGINE_FIELDS) assert.strictEqual(l.byId.get(id).disabled, true, `${id} が記録中でも触れる`);
+  for (const id of ['autoPaste', 'hotkey', 'dictionary', 'pillPos']) assert.ok(!l.byId.get(id).disabled, `${id} は記録中でも変えてよい`);
+  assert.ok(notes.every((n) => !n.hidden), '理由の説明が出ない');
+  assert.ok(notes.every((n) => /記録中はエンジンの設定を変更できません/.test(n.textContent)), '文言が違う');
+  l.fire('onMeetingUpdate', { active: false });
+  await l.drain();
+  for (const id of ENGINE_FIELDS) assert.strictEqual(l.byId.get(id).disabled, false, `${id} が記録後も触れない`);
+  assert.ok(notes.every((n) => n.hidden), '記録後も理由が残る');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('保存で main が採らなかった値は、ホットキー以外でも欄と設定に戻す（記録中のエンジン設定）', async () => {
+  const l = await load(APP, { returns: { saveSettings: () => ({
+    ok: true,
+    warning: '記録中のため、認識言語などエンジンの設定は記録が終わるまで変わりません',
+    applied: { language: 'ja', useVad: true, localThreads: 4, hotkey: 'Control+Shift+Space', meetingHotkey: 'Alt+M' },
+  }) } });
+  l.byId.get('language').value = 'en';
+  l.byId.get('useVad').checked = false;
+  l.byId.get('localThreads').value = '8';
+  l.byId.get('tabSettings').dispatchEvent({ type: 'change' });
+  await l.drain();
+  assert.strictEqual(l.byId.get('language').value, 'ja', '採られなかった値が select に残っている');
+  assert.strictEqual(l.byId.get('useVad').checked, true, '採られなかった値がチェックに残っている');
+  assert.strictEqual(l.byId.get('localThreads').value, '4', '採られなかった値が入力欄に残っている');
+  assert.ok(/記録が終わるまで/.test(l.byId.get('toast').textContent), 'warning が toast に出ない');
+  // 次の無関係な保存で、採られなかった値を送り直さない
+  l.byId.get('tabSettings').dispatchEvent({ type: 'change' });
+  await l.drain();
+  const sent = l.called('saveSettings').map((c) => [c.args[0].language, c.args[0].useVad]);
+  assert.deepStrictEqual(sent, [['en', false], ['ja', true]], `送った値: ${JSON.stringify(sent)}`);
   assert.deepStrictEqual(l.errors.map(fmt), []);
 });
