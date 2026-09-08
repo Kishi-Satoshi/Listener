@@ -16,6 +16,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { execFile, spawn } = require('child_process');
+const net = require('net');
 
 const store = require('./store');
 const { attachCitations, refreshCitations } = require('./cite');
@@ -34,6 +35,7 @@ const {
   saveIfExists, meetingDurationSec, promptTail,
   registerHotkeys, resolveStartupHotkeys, saveHotkeys, makeSummaryRunner, tickStep,
   pasterScript, copyCommand,
+  engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -125,7 +127,8 @@ function applyTheme() {
 }
 
 function updatePowerBlock() {
-  const busy = state !== 'idle';
+  // 要約中も忙しい（#52）。省電力で絞られると、数分かかる要約が静かに止まる
+  const busy = state !== 'idle' || isSummarizing();
   if (busy && powerBlockId === null) {
     try { powerBlockId = powerSaveBlocker.start('prevent-app-suspension'); } catch (_) { powerBlockId = null; }
   } else if (!busy && powerBlockId !== null) {
@@ -256,7 +259,7 @@ function buildPrompt(extraTail) {
 
 // ---------------------------------------------------------------- エンジン管理
 function makeEngine(name) {
-  return { name, proc: null, ready: false, lastError: '', readyPromise: null, sig: '', stderrTail: '', stopping: false };
+  return { name, proc: null, ready: false, lastError: '', readyPromise: null, startPromise: null, sig: '', stderrTail: '', stopping: false };
 }
 const whisperEng = makeEngine('文字起こしエンジン');
 const sumEng = makeEngine('要約エンジン');
@@ -304,7 +307,29 @@ const engineExe = (e) => (e === whisperEng ? settings.localServerExe : settings.
 const engineModel = (e) => (e === whisperEng ? settings.localModelPath : settings.sumModelPath);
 const enginePort = (e) => (e === whisperEng ? settings.localPort : settings.sumPort);
 const engineConfigured = (e) => Boolean(engineExe(e) && engineModel(e));
-const engineValid = (e) => engineConfigured(e) && fs.existsSync(engineExe(e)) && fs.existsSync(engineModel(e));
+// 実行ファイルとモデルは「あるか」だけでなく中身まで見る（#32。判断は mainlib.engineFileIssue）。
+// 存在だけを見ると、OneDrive のプレースホルダ（大きさはあるが実体がこの PC に無い）や
+// 途中で切れたダウンロードを「ある」と誤認し、起動して落ちるまで原因が分からない。
+// 下限はどの配布物でも下回らない大きさ（exe は数 MB、whisper は tiny でも 75MB、
+// 要約の gguf は最小のものでも数百 MB）。
+const ENGINE_MIN_BYTES = { exe: 100_000, whisper: 50_000_000, gguf: 300_000_000 };
+const fileSize = (f) => { try { return fs.statSync(f).size; } catch (_) { return 0; } };
+// 問題があれば利用者向けの一文、無ければ ''
+function engineCheck(eng) {
+  if (!engineConfigured(eng)) return `${eng.name}の実行ファイルまたはモデルが見つかりません`;
+  const stat = (f) => fs.statSync(f);
+  const exe = engineFileIssue(engineExe(eng), ENGINE_MIN_BYTES.exe, stat);
+  if (exe !== 'ok') return `${eng.name}の${engineIssueMessage(exe, 'exe', fileSize(engineExe(eng)))}`;
+  const model = engineFileIssue(engineModel(eng), eng === whisperEng ? ENGINE_MIN_BYTES.whisper : ENGINE_MIN_BYTES.gguf, stat);
+  if (model !== 'ok') return `${eng.name}の${engineIssueMessage(model, 'model', fileSize(engineModel(eng)))}`;
+  return '';
+}
+const engineValid = (e) => !engineCheck(e);
+// 未設定なのか、設定はあるが中身に問題があるのかを分けて伝える
+function whisperProblem() {
+  if (!engineConfigured(whisperEng)) return '文字起こしエンジンが未設定です。設定タブでパスを指定してください。';
+  return engineCheck(whisperEng);
+}
 
 function engineSignature(eng) {
   return [engineExe(eng), engineModel(eng), enginePort(eng),
@@ -313,30 +338,75 @@ function engineSignature(eng) {
     eng === whisperEng ? `${settings.useVad ? resolveVadModel() : ''}|${settings.suppressNst}` : ''].join('|');
 }
 
-function startEngine(eng) {
-  if (eng.proc) return;
-  if (!engineValid(eng)) { eng.lastError = `${eng.name}の実行ファイルまたはモデルが見つかりません`; return; }
-  eng.lastError = ''; eng.ready = false; eng.stopping = false; eng.stderrTail = '';
-  eng.sig = engineSignature(eng);
-  engineLog(`${eng.name} 起動: ${engineExe(eng)} ${engineSpawnArgs(eng).join(' ')}`);
-  try {
-    eng.proc = spawn(engineExe(eng), engineSpawnArgs(eng), { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
-  } catch (e) {
-    eng.lastError = `${eng.name}を起動できません: ${e.message}`; engineLog(eng.lastError); eng.proc = null; return;
-  }
-  eng.proc.stderr.on('data', (d) => { eng.stderrTail = (eng.stderrTail + d.toString()).slice(-1500); });
-  eng.proc.on('error', (e) => {
-    eng.lastError = `${eng.name}を起動できません: ${e.message}`; engineLog(eng.lastError);
-    eng.proc = null; eng.ready = false;
+// 127.0.0.1:port を一瞬だけ listen して空きを見る（#28/#31）。EADDRINUSE だけを「使用中」
+// とし、それ以外（権限など）はエンジン自身の起動に任せる。直前に止めた自分のエンジンが
+// まだ手放していないことがあるので、短い間隔で数回まで見直してから「使用中」と決める。
+function portInUse(port, tries = 5) {
+  const probe = () => new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.once('error', (e) => resolve(Boolean(e && e.code === 'EADDRINUSE')));
+    srv.listen({ host: '127.0.0.1', port, exclusive: true }, () => srv.close(() => resolve(false)));
   });
-  eng.proc.on('exit', (code) => {
-    if (!quitting && !eng.stopping) {
-      const tail = eng.stderrTail.split('\n').filter(Boolean).slice(-3).join(' / ');
-      eng.lastError = `${eng.name}が終了しました (code ${code})${tail ? `: ${tail}` : ''}`.trim();
-      engineLog(eng.lastError);
+  return (async () => {
+    for (let i = 0; i < tries; i++) {
+      if (!(await probe())) return false;
+      await new Promise((r) => setTimeout(r, 200));
     }
-    eng.proc = null; eng.ready = false; eng.readyPromise = null;
-  });
+    return true;
+  })();
+}
+
+// 起動は非同期（ポートの空きを見てから spawn する）。戻り値の Promise は spawn まで
+// （準備完了までではない。それは ensureEngineReady）。同時に二度呼ばれても spawn は
+// 一度だけ（startPromise で束ねる）。
+function startEngine(eng) {
+  if (eng.proc) return Promise.resolve();
+  if (eng.startPromise) return eng.startPromise;
+  eng.startPromise = (async () => {
+    const issue = engineCheck(eng);
+    if (issue) { eng.lastError = issue; return; }
+    eng.lastError = ''; eng.ready = false; eng.stopping = false; eng.stderrTail = '';
+    // 塞がっているポートで spawn すると、エンジンはモデルを読み終えてから bind に失敗して
+    // 落ちる。それまで「起動中」に見え、/health は塞いでいる別のプロセスに当たって
+    // 「準備完了」と誤認することさえある。先に見て、塞がっていれば起動しない。
+    const port = enginePort(eng);
+    if (await portInUse(port)) {
+      eng.lastError = portInUseError(port); engineLog(`${eng.name}: ${eng.lastError}`); return;
+    }
+    // 待っている間に終了が始まっていたら起動しない（孤児プロセスになる）
+    if (quitting) return;
+    if (eng.proc) return;
+    eng.sig = engineSignature(eng);
+    engineLog(`${eng.name} 起動: ${engineExe(eng)} ${engineSpawnArgs(eng).join(' ')}`);
+    let p;
+    try {
+      p = spawn(engineExe(eng), engineSpawnArgs(eng), { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch (e) {
+      eng.lastError = `${eng.name}を起動できません: ${e.message}`; engineLog(eng.lastError); return;
+    }
+    eng.proc = p;
+    // 以下のハンドラは「自分が起動したプロセス」のときだけ状態を触る（#57）。
+    // 再起動のあとに古いプロセスの exit が届き、新しいプロセスを null にしていた。
+    p.stderr.on('data', (d) => {
+      if (eng.proc !== p) return;
+      eng.stderrTail = (eng.stderrTail + d.toString()).slice(-1500);
+    });
+    p.on('error', (e) => {
+      if (eng.proc !== p) return;
+      eng.lastError = `${eng.name}を起動できません: ${e.message}`; engineLog(eng.lastError);
+      eng.proc = null; eng.ready = false;
+    });
+    p.on('exit', (code) => {
+      if (eng.proc !== p) return;
+      if (!quitting && !eng.stopping) {
+        const tail = eng.stderrTail.split('\n').filter(Boolean).slice(-3).join(' / ');
+        eng.lastError = `${eng.name}が終了しました (code ${code})${tail ? `: ${tail}` : ''}`.trim();
+        engineLog(eng.lastError);
+      }
+      eng.proc = null; eng.ready = false; eng.readyPromise = null;
+    });
+  })().finally(() => { eng.startPromise = null; });
+  return eng.startPromise;
 }
 
 function stopEngine(eng) {
@@ -347,9 +417,10 @@ function stopEngine(eng) {
 function ensureEngineReady(eng) {
   if (eng.ready && eng.proc) return Promise.resolve(true);
   if (eng.readyPromise) return eng.readyPromise;
-  eng.readyPromise = (async () => {
-    if (!eng.proc) startEngine(eng);
-    if (!eng.proc) return false;
+  const self = (async () => {
+    if (!eng.proc) await startEngine(eng);
+    let p = eng.proc;
+    if (!p) return false;
     // 「/」は見ない。llama-server はモデル読み込み中でも「/」に 200 を
     // 返すため、準備完了と誤認して直後の推論が 503 になる（実機で発生）。
     // /health は読み込み中 503・完了で 200 を返す。エンドポイントを持たない
@@ -357,9 +428,12 @@ function ensureEngineReady(eng) {
     const url = `http://127.0.0.1:${enginePort(eng)}/health`;
     const deadline = Date.now() + ENGINE_READY_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      if (!eng.proc) return false;
+      // 待っている間に再起動されていたら、新しいプロセスを待ち直す（#57）
+      if (eng.proc !== p) { if (!eng.proc) return false; p = eng.proc; }
       try {
         const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
+        // 応答を待つ間に再起動されていたら、その応答は古い（または他の）プロセスのもの
+        if (eng.proc !== p) continue;
         if (res.ok || res.status === 404) { eng.ready = true; return true; }
       } catch (e) {
         // 接続先の URL 自体が組み立てられない（ポートが不正）なら、90秒待っても
@@ -379,8 +453,9 @@ function ensureEngineReady(eng) {
       eng.lastError = `${eng.name}の起動がタイムアウトしました${tail ? `: ${tail}` : '（モデル読み込み中の可能性）'}`;
     }
     return false;
-  })().finally(() => { eng.readyPromise = null; });
-  return eng.readyPromise;
+  })().finally(() => { if (eng.readyPromise === self) eng.readyPromise = null; });   // 再起動後の新しい待ちを消さない
+  eng.readyPromise = self;
+  return self;
 }
 
 function restartEnginesIfNeeded() {
@@ -672,13 +747,13 @@ function createMainWindow() {
   mainWin.on('close', (e) => {
     if (quitting) return;
     if (settings.stayInTray) { e.preventDefault(); mainWin.hide(); return; }
-    if (state === 'meeting' || state === 'meeting-finalizing') {
-      // 記録中の閉じ間違いで会議を失わせない。draft からの復旧はあるが、
-      // 要約前の状態に戻るので、一度は確認を挟む。
+    // 記録中・要約中の閉じ間違いで会議や要約を失わせない（文は mainlib.closeConfirm）。
+    // draft からの復旧はあるが要約前の状態に戻るので、一度は確認を挟む。
+    const confirm = closeConfirm(state === 'meeting' || state === 'meeting-finalizing', isSummarizing());
+    if (confirm) {
       const r = dialog.showMessageBoxSync(mainWin, {
         type: 'warning', buttons: ['終了する', 'キャンセル'], defaultId: 1, cancelId: 1,
-        message: '議事録を記録中です',
-        detail: '終了すると録音が止まります。ここまでの文字起こしは、次回起動時に復旧できます。',
+        message: confirm.message, detail: confirm.detail,
       });
       if (r !== 0) { e.preventDefault(); return; }
     }
@@ -690,9 +765,10 @@ function createMainWindow() {
 // ---------------------------------------------------------------- 音声入力
 function startRecording() {
   if (state !== 'idle') return;
-  if (!engineValid(whisperEng)) {
+  const problem = whisperProblem();
+  if (problem) {
     createMainWindow();
-    sendToMainWin('app:notice', '文字起こしエンジンが未設定です。設定タブでパスを指定してください。');
+    sendToMainWin('app:notice', problem);
     return;
   }
   ensureEngineReady(whisperEng);
@@ -816,7 +892,8 @@ function recoverDraftIfAny() {
 
 function startMeeting() {
   if (state !== 'idle') return { ok: false, error: '他の処理を実行中です' };
-  if (!engineValid(whisperEng)) return { ok: false, error: '文字起こしエンジンが未設定です。設定タブでパスを指定してください。' };
+  const problem = whisperProblem();
+  if (problem) return { ok: false, error: problem };
   meeting = { startedAt: Date.now(), memo: '', segments: [], offsetMs: 0, stopping: false, seq: 0,
     systemAudio: false, paused: false, pausedMs: 0, pausedAt: 0 };
   segChain = Promise.resolve(); pendingSegs = 0;
@@ -984,7 +1061,10 @@ async function maybeFinalizeMeeting() {
 // 実行して固定）。走行中に「要約を生成」を連打されると、同じ文字起こしに対して
 // 要約が二重に走り、後から終わった方が前の結果（とその間の編集）を上書きしていた。
 // 走行中なら同じ Promise を返す。
-const runSummary = makeSummaryRunner(doRunSummary);
+const runSummary = makeSummaryRunner(doRunSummary, () => updateTray());
+// 要約が走っている間はアプリを「忙しい」として扱う（#52）: 省電力を止めない・終了前に
+// 確かめる・更新と再起動を拒む。件数は mainlib.makeSummaryRunner が持つ。
+const isSummarizing = () => runSummary.running().length > 0;
 
 // 要約の生成 → ブロック化 → 出典付与 → 保存
 async function doRunSummary(pageId) {
@@ -1086,6 +1166,7 @@ async function doRunSummary(pageId) {
     sendToMainWin('page:updated', { page: latest, segments });
     return { ok: true, page: latest, stat };
   } catch (e) {
+    if (quitting) return { ok: false, error: e.message };   // 終了中: before-quit が書いた「中断」の文を上書きしない
     const latest = saveIfExists(store, pageId, (saved) => { saved.summaryError = e.message; });
     if (!latest) return gone();
     clearUi();
@@ -1168,6 +1249,10 @@ async function checkUpdateFromTray() {
     detail: String(r.notes || '').slice(0, 800),
   });
   if (pick !== 0) return;
+  if (isSummarizing()) {   // 確認の間に要約が始まっていることがある（#52）
+    dialog.showMessageBox({ type: 'info', message: '要約を作成中です', detail: '終わってから更新してください' });
+    return;
+  }
   const res = await updater.apply(r.url, target.root, app.getPath('userData'), () => {});
   if (!res.ok) {
     dialog.showMessageBox({ type: 'error', message: '更新に失敗しました', detail: res.error || '' });
@@ -1203,7 +1288,7 @@ function updateTray() {
   // つまずくと、設定タブの「更新を確認」ボタンごと動かなくなり、
   // アプリ内更新で直すこともできなくなる（実機で起きた）。
   // 復旧の手段が、壊れうるものに依存していてはいけない。
-  items.push({ label: '更新を確認', enabled: state === 'idle', click: checkUpdateFromTray });
+  items.push({ label: '更新を確認', enabled: state === 'idle' && !isSummarizing(), click: checkUpdateFromTray });
   items.push({ type: 'separator' });
   items.push({ label: '終了', click: () => { quitting = true; app.quit(); } });
   // 既定で代替している／登録できていないキーがあれば、その旨を添える
@@ -1268,6 +1353,11 @@ function setupIpc() {
     const prevAutoLaunch = settings.autoLaunch;
     const prevPillPos = settings.pillPos;
     const merged = normalizeSettings({ ...settings, ...next }, DEFAULT_SETTINGS);
+    // 記録中はエンジンに関わる設定を前の値に留める（#57。判断は mainlib.guardEngineSettings）。
+    // 保存のたびにエンジンが再起動すると、文字起こし中の区間が失われる。留めた値は
+    // applied で画面へ戻し、warning で伝える。
+    const guard = guardEngineSettings(settings, merged, Boolean(meeting));
+    Object.assign(merged, guard.settings);
 
     // ホットキーは変えた側だけ登録し直し、失敗した側だけ前の値に戻して、他の設定は
     // 保存する（判断は mainlib.saveHotkeys。main.test.js で実行して固定）。
@@ -1286,16 +1376,20 @@ function setupIpc() {
       hotkeyNote = hk.note;
       warning = hk.warning;
     }
+    if (guard.warning) warning = warning ? `${warning}。${guard.warning}` : guard.warning;
     if (merged.pillPos !== prevPillPos) merged.pillCustom = null;
     settings = merged;
     persistSettings();
     applyTheme();
-    restartEnginesIfNeeded();
+    if (!guard.kept.length) restartEnginesIfNeeded();
     if (settings.autoLaunch !== prevAutoLaunch) {
       try { app.setLoginItemSettings({ openAtLogin: settings.autoLaunch }); } catch (_) { /* noop */ }
     }
     updateTray();
     const applied = { hotkey: settings.hotkey, meetingHotkey: settings.meetingHotkey };
+    // 画面が送った値と違う値で残ったキーは全部載せる（記録中に留めたエンジン設定・
+    // 正規化で丸めた値も）。画面はこれを欄に戻す（mainlib.keptDifferent）
+    Object.assign(applied, keptDifferent(next, settings));
     return warning ? { ok: true, applied, warning } : { ok: true, applied };
   });
   ipcMain.handle('hotkey:state', () => hotkeyState);
@@ -1366,7 +1460,8 @@ function setupIpc() {
 
   ipcMain.handle('clipboard:copy', (_e, t) => { copyPrivate(String(t ?? '')); return true; });
   ipcMain.handle('app:test', async () => {
-    if (!engineValid(whisperEng)) return { ok: false, error: 'whisper-server.exe またはモデルファイルのパスが正しくありません' };
+    const problem = engineCheck(whisperEng);   // 原因を名指しする（#32）
+    if (problem) return { ok: false, error: problem };
     const ok = await ensureEngineReady(whisperEng);
     if (!ok) return { ok: false, error: whisperEng.lastError || '起動に失敗しました' };
     const vad = settings.useVad ? resolveVadModel() : '';
@@ -1375,7 +1470,8 @@ function setupIpc() {
     return { ok: true, info: `文字起こしエンジンは起動済みです（${notes.join(' / ')}）` };
   });
   ipcMain.handle('app:test-sum', async () => {
-    if (!engineValid(sumEng)) return { ok: false, error: 'llama-server.exe またはモデルファイルのパスが正しくありません' };
+    const problem = engineCheck(sumEng);
+    if (problem) return { ok: false, error: problem };
     const ok = await ensureEngineReady(sumEng);
     return ok ? { ok: true, info: '要約エンジンは起動済みです（オフライン動作可）' }
       : { ok: false, error: sumEng.lastError || '起動に失敗しました' };
@@ -1405,12 +1501,14 @@ function setupIpc() {
     return { ...r, applyable: updateTarget().ok };
   });
   ipcMain.handle('update:apply', async (_e, url) => {
+    if (isSummarizing()) return { ok: false, error: '要約を作成中です。終わってから更新してください' };
     const t = updateTarget();
     if (!t.ok) return { ok: false, error: t.error };
     return updater.apply(url, t.root, app.getPath('userData'),
       (msg) => sendToMainWin('update:progress', { message: msg }));
   });
   ipcMain.handle('app:restart', () => {
+    if (isSummarizing()) return { ok: false, error: '要約を作成中です。終わってから再起動してください' };
     quitting = true;
     stopEngine(whisperEng); stopEngine(sumEng); stopPaster();
     app.relaunch();
@@ -1522,6 +1620,16 @@ if (!gotLock) {
     }, 8000);
   });
   app.on('window-all-closed', () => { /* トレイ常駐 */ });
-  app.on('before-quit', () => { quitting = true; stopEngine(whisperEng); stopEngine(sumEng); stopPaster(); });
+  app.on('before-quit', () => {
+    quitting = true;
+    // 要約の途中で終了するなら、そのページに「中断された」と書いておく（#52。同期・できる範囲で）。
+    // 書かないと、次に開いたときに要約が空のまま何も言わないページになる。
+    for (const id of runSummary.running()) {
+      try {
+        saveIfExists(store, id, (p) => { p.summaryError = '要約が中断されました。「要約を生成」で作り直せます'; });
+      } catch (_) { /* noop */ }
+    }
+    stopEngine(whisperEng); stopEngine(sumEng); stopPaster();
+  });
   app.on('will-quit', () => { globalShortcut.unregisterAll(); stopEngine(whisperEng); stopEngine(sumEng); stopPaster(); });
 }

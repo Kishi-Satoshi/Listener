@@ -726,7 +726,7 @@ test('#46 要約完了時に手元の古い page で書き戻さない（削除�
 test('#10 同じページの要約は同時に一つだけ走る', () => {
   // 排他の判断は mainlib.makeSummaryRunner（実行して検査するのは main.test.js）。
   // ここは main.js がそれを通しているか（結線）だけを見る。
-  assert.match(main, /const runSummary = makeSummaryRunner\(doRunSummary\)/, '排他を mainlib.makeSummaryRunner で作っていない');
+  assert.match(main, /const runSummary = makeSummaryRunner\(doRunSummary(, \(\) => updateTray\(\))?\)/, '排他を mainlib.makeSummaryRunner で作っていない');
   assert.ok(!/new Map\(\)[^\n]*\n[^\n]*function runSummary/.test(code(main)) && !/const summarizing = new Map\(\)/.test(code(main)),
     '排他を main.js に手書きしている（mainlib を通していない）');
   assert.match(main, /ipcMain\.handle\('page:summarize', \(_e, id\) => runSummary\(id\)\)/);
@@ -848,4 +848,67 @@ test('#27 クリップボードへ書くのは copyPrivate だけ（履歴・ク
   assert.ok(deliver.includes('clipboard.readText()'), '貼り付け後に戻す元の中身を読んでいない');
   assert.match(m, /ipcMain\.handle\('clipboard:copy', \(_e, t\) => \{ copyPrivate\(/, '画面のコピーが copyPrivate を通っていない');
   assert.ok(fnBody(m, 'function ensurePaster()', '\n}').includes('pasterScript()'), '常駐 PowerShell のスクリプトを mainlib から取っていない');
+});
+
+// ---------------------------------------------------------------- 第2段（B: エンジン）
+test('#28/#31 起動前にポートの空きを見て、塞がっていれば spawn しない', () => {
+  const m = code(main);
+  assert.match(m, /require\('net'\)/, 'net を使っていない');
+  const fn = fnBody(m, 'function startEngine(eng)', '\nfunction stopEngine');
+  assert.ok(fn.includes('await portInUse('), 'ポートの空きを見ていない');
+  assert.ok(fn.indexOf('await portInUse(') < fn.indexOf('spawn('), 'spawn の後でポートを見ている');
+  assert.ok(fn.includes('eng.lastError = portInUseError(port)'), '塞がっているときの文を mainlib から取っていない');
+  assert.ok(fn.includes('if (quitting) return;'), '終了中に待ち明けで起動してしまう（孤児プロセスになる）');
+  // 同時に二度呼ばれても spawn は一度だけ
+  assert.ok(fn.includes('if (eng.startPromise) return eng.startPromise;'), '起動中の二重呼び出しを束ねていない');
+  const probe = fnBody(m, 'function portInUse(port', '\n}');
+  assert.ok(probe.includes("host: '127.0.0.1'") && probe.includes('exclusive: true'), 'listen の条件が違う');
+  assert.ok(probe.includes("'EADDRINUSE'"), 'EADDRINUSE 以外を使用中と誤認する');
+});
+
+test('#57(1) エンジンのハンドラは自分が起動したプロセスのときだけ状態を触る', () => {
+  const fn = fnBody(code(main), 'function startEngine(eng)', '\nfunction stopEngine');
+  assert.match(fn, /p = spawn\(engineExe\(eng\)/, 'spawn の戻りをローカルに持っていない');
+  assert.ok((fn.match(/if \(eng\.proc !== p\) return;/g) || []).length >= 3, 'exit / error / stderr の全部で自分のプロセスか見ていない');
+  // /health の応答が返るまでの間に再起動されていたら、その応答で準備完了にしない
+  const ready = fnBody(code(main), 'function ensureEngineReady', '\nfunction restartEnginesIfNeeded');
+  assert.ok(ready.includes('await startEngine(eng)'), '非同期になった起動を待っていない');
+  const afterFetch = ready.slice(ready.indexOf('await fetch(url'));
+  assert.match(afterFetch, /^[^\n]*\n\s*if \(eng\.proc !== p\) continue;/, 'fetch の直後に自分のプロセスか見ていない');
+});
+
+test('#32 エンジンの実行ファイルとモデルは存在だけでなく中身の有無と大きさを見る', () => {
+  const m = code(main);
+  assert.match(m, /const engineValid = \(e\) => !engineCheck\(e\)/, 'engineValid が engineCheck を通っていない');
+  const chk = fnBody(m, 'function engineCheck(eng)', '\n}');
+  assert.strictEqual((chk.match(/engineFileIssue\(/g) || []).length, 2, '実行ファイルとモデルの両方を見ていない');
+  assert.ok(chk.includes('engineIssueMessage('), '原因を名指しする文を mainlib から取っていない');
+  assert.match(m, /exe: 100_000/); assert.match(m, /whisper: 50_000_000/); assert.match(m, /gguf: 300_000_000/);
+  // 設定画面の「テスト」も原因を名指しする
+  assert.ok(!m.includes('またはモデルファイルのパスが正しくありません'), 'テストの失敗が原因を名指ししていない');
+});
+
+test('#57(2) 記録中はエンジンに関わる設定を変えず、留めた値を applied で画面へ戻す', () => {
+  const save = fnBody(code(main), "ipcMain.handle('settings:save'", '\n  });');
+  assert.ok(save.includes('guardEngineSettings(settings, merged, Boolean(meeting))'), 'mainlib.guardEngineSettings を通していない');
+  assert.ok(save.includes('if (!guard.kept.length) restartEnginesIfNeeded();'), '留めたのにエンジンを再起動している');
+  assert.ok(save.includes('Object.assign(applied, keptDifferent(next, settings))'), '留めた値を applied に載せていない');
+  assert.ok(save.includes('guard.warning'), '警告を画面へ返していない');
+});
+
+test('#52 要約中はアプリを「忙しい」として扱う', () => {
+  const m = code(main);
+  assert.match(m, /const isSummarizing = \(\) => runSummary\.running\(\)\.length > 0/);
+  assert.match(m, /const runSummary = makeSummaryRunner\(doRunSummary, \(\) => updateTray\(\)\)/, '件数の増減でトレイ・省電力を更新していない');
+  assert.ok(fnBody(m, 'function updatePowerBlock()', '\n}').includes("state !== 'idle' || isSummarizing()"), '省電力の抑止が要約中に外れる');
+  const close = fnBody(m, "mainWin.on('close'", '\n  });');
+  assert.ok(close.includes('closeConfirm(') && close.includes('isSummarizing()'), '閉じる確認が要約中を見ていない');
+  assert.match(m, /label: '更新を確認', enabled: state === 'idle' && !isSummarizing\(\)/, 'トレイの更新が要約中に押せる');
+  assert.ok(fnBody(m, "ipcMain.handle('app:restart'", '\n  });').includes('要約を作成中です'), '再起動を拒んでいない');
+  assert.ok(fnBody(m, "ipcMain.handle('update:apply'", '\n  });').includes('要約を作成中です'), '更新の適用を拒んでいない');
+  assert.ok(fnBody(m, 'async function checkUpdateFromTray()', '\nfunction updateTray').includes('要約を作成中です'), 'トレイからの更新を拒んでいない');
+  const bq = fnBody(m, "app.on('before-quit'", '\n  });');
+  assert.ok(bq.includes('runSummary.running()') && bq.includes('要約が中断されました。「要約を生成」で作り直せます'), '終了時に中断をページへ書いていない');
+  // 終了中に要約の失敗を書き戻すと、上の「中断」の文を上書きする
+  assert.match(fnBody(m, 'async function doRunSummary', '\nlet hotkeyState'), /catch \(e\) \{\n\s*if \(quitting\) return/);
 });

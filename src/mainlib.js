@@ -179,17 +179,23 @@ function saveHotkeys(prev, active, next, apply) {
 // 同じ id の要約は同時に一つだけ。走行中に「要約を生成」を連打されると、同じ
 // 文字起こしに対して要約が二重に走り、後から終わった方が前の結果（とその間の
 // 編集）を上書きしていた。走行中なら同じ Promise を返し、終わったら（失敗でも）外す。
-// run(id) は Promise を返す。
-function makeSummaryRunner(run) {
+// run(id) は Promise を返す。onChange(件数) は走っている数が変わるたびに呼ばれる
+// （要約中はアプリを「忙しい」として扱うため。#52）。戻り値の runner.running() は
+// 走っている id の一覧（終了時に「中断された」と書く先）。
+function makeSummaryRunner(run, onChange) {
   const running = new Map();
-  return (id) => {
+  const notify = () => { if (onChange) { try { onChange(running.size); } catch (_) { /* noop */ } } };
+  const runner = (id) => {
     if (running.has(id)) return running.get(id);
     let p;
     try { p = Promise.resolve(run(id)); } catch (e) { p = Promise.reject(e); }
-    p = p.finally(() => running.delete(id));
+    p = p.finally(() => { running.delete(id); notify(); });
     running.set(id, p);
+    notify();
     return p;
   };
+  runner.running = () => [...running.keys()];
+  return runner;
 }
 
 // ---------------------------------------------------------------- overlay:tick の見張り
@@ -238,9 +244,108 @@ function copyCommand(text) {
   return `copy ${Buffer.from(String(text ?? ''), 'utf8').toString('base64')}`;
 }
 
+// ---------------------------------------------------------------- エンジンのファイル検査（#32）
+// statFn(path) は fs.statSync 相当（無ければ投げる）。戻り値:
+//   'missing'     … 無い／読めない
+//   'placeholder' … 大きさはあるが割り当てブロックが 0。OneDrive の「ファイル オンデマンド」
+//                   のように、一覧には見えるが実体がこの PC に無い（存在確認は通ってしまう）
+//   'truncated'   … minBytes 未満。ダウンロードが途中で切れた・0 バイト
+//   'ok'
+// blocks が取れない環境（undefined）では実体の有無を判定しない。誤って「実体が無い」と
+// 断じると、正常な環境でエンジンが使えなくなり、その方が害が大きい。
+function engineFileIssue(file, minBytes, statFn) {
+  let st;
+  try { st = statFn(file); } catch (_) { return 'missing'; }
+  if (!st) return 'missing';
+  const size = Number(st.size) || 0;
+  if (size > 0 && st.blocks === 0) return 'placeholder';
+  if (size < minBytes) return 'truncated';
+  return 'ok';
+}
+
+// 検査結果を、原因を名指しする一文にする。kind: 'exe' | 'model'。size は truncated のときの大きさ。
+// 「見つかりません」だけでは、あるように見えるファイルを前に利用者が何もできない。
+function engineIssueMessage(issue, kind, size) {
+  const entity = kind === 'exe' ? '実行ファイル' : 'モデル';
+  const file = kind === 'exe' ? '実行ファイル' : 'モデルファイル';
+  if (issue === 'placeholder') return `${entity}の実体がこの PC にありません（OneDrive などのプレースホルダの可能性）`;
+  if (issue === 'truncated') {
+    const mb = (Number(size) || 0) / 1048576;
+    return `${file}が途中で切れています（${mb >= 10 ? Math.round(mb) : mb.toFixed(1)}MB）。setup-*.ps1 を再実行してください`;
+  }
+  if (issue === 'missing') return `${file}が見つかりません`;
+  return '';
+}
+
+// ---------------------------------------------------------------- ポートの衝突（#28/#31）
+// 塞がっているポートで起動すると、エンジンはモデルを読み終えてから bind に失敗して落ちる。
+// それまで「起動中」に見えるので、起動前に見て、塞がっていればこの文で止める。
+function portInUseError(port) {
+  return `ポート ${port} は他のプロセスが使用中です。設定でポートを変えるか、そのプロセスを終了してください`;
+}
+
+// ---------------------------------------------------------------- 記録中のエンジン設定（#57）
+// これらを変えるとエンジンの再起動（engineSignature）や区間の切り方が変わる。記録中に
+// 再起動すると、文字起こし中の区間が失われる。記録中は前の値に留め、他の設定は保存する。
+const ENGINE_SETTING_LABELS = {
+  language: '言語', localThreads: '文字起こしのスレッド数', sumThreads: '要約のスレッド数',
+  useVad: 'VAD', suppressNst: '非発話トークンの抑制',
+  localServerExe: '文字起こしエンジンの実行ファイル', localModelPath: '文字起こしのモデル', vadModelPath: 'VAD のモデル',
+  sumServerExe: '要約エンジンの実行ファイル', sumModelPath: '要約のモデル',
+  localPort: '文字起こしのポート', sumPort: '要約のポート', segmentSec: '区間の長さ',
+};
+const ENGINE_SETTING_KEYS = Object.keys(ENGINE_SETTING_LABELS);
+const sameValue = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+//   prev: いまの設定、next: 保存しようとする設定（正規化済み）、recording: 議事録を記録中か
+// 戻り値 { settings: 保存する設定, kept: 留めたキー, warning: 画面に出す一文（無ければ ''） }
+// 入力は書き換えない。
+function guardEngineSettings(prev, next, recording) {
+  if (!recording) return { settings: next, kept: [], warning: '' };
+  const settings = { ...next };
+  const kept = [];
+  for (const k of ENGINE_SETTING_KEYS) {
+    if (sameValue(prev[k], next[k])) continue;
+    settings[k] = prev[k];
+    kept.push(k);
+  }
+  const warning = kept.length
+    ? `記録中のため、エンジンに関わる設定（${kept.map((k) => ENGINE_SETTING_LABELS[k]).join('・')}）は変更できません。記録を終えてから変更してください`
+    : '';
+  return { settings, kept, warning };
+}
+
+// 画面が送った値（sent）と保存された値（saved）が違うキーだけを返す。画面はこれを欄に
+// 戻す（ホットキーの登録失敗・記録中に留めたエンジン設定・正規化で丸められた値）。
+// 欄に古い値が残ると、以後の無関係な保存のたびに同じ失敗と警告を繰り返す。
+function keptDifferent(sent, saved) {
+  const out = {};
+  if (!sent || typeof sent !== 'object') return out;
+  for (const k of Object.keys(sent)) {
+    if (!sameValue(sent[k], saved[k])) out[k] = saved[k];
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- 終了の確認（#52）
+// recording: 議事録を記録中、summarizing: 要約を作成中。どちらでもなければ null。
+// 要約は数分かかり、途中で終了すると結果は残らない。記録中と同じく一度は確認を挟む。
+function closeConfirm(recording, summarizing) {
+  if (!recording && !summarizing) return null;
+  const sumLine = '要約を作成中です。終了すると要約は失われます';
+  if (recording) {
+    let detail = '終了すると録音が止まります。ここまでの文字起こしは、次回起動時に復旧できます。';
+    if (summarizing) detail += `\n${sumLine}。`;
+    return { message: '議事録を記録中です', detail };
+  }
+  return { message: sumLine, detail: '「要約を生成」で後から作り直せます。' };
+}
+
 module.exports = {
   saveIfExists, meetingDurationSec, promptTail,
   registerHotkeys, hotkeyFailureMessage, hotkeyStatus, resolveStartupHotkeys, saveHotkeys,
   makeSummaryRunner, tickStep,
   pasterScript, copyCommand,
+  engineFileIssue, engineIssueMessage, portInUseError,
+  ENGINE_SETTING_KEYS, guardEngineSettings, keptDifferent, closeConfirm,
 };

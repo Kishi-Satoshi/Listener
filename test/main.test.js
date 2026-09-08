@@ -18,6 +18,7 @@ const {
   hotkeyFailureMessage, hotkeyStatus, resolveStartupHotkeys, saveHotkeys,
   makeSummaryRunner, tickStep,
   pasterScript, copyCommand,
+  engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
 } = require('../src/mainlib');
 const { normalizeSettings } = require('../src/settings');
 
@@ -455,4 +456,134 @@ test('copyCommand: 1 行の命令に base64 で本文を載せ、改行を含む
   assert.ok(!cmd.includes('\n'));
   assert.strictEqual(Buffer.from(cmd.slice(5), 'base64').toString('utf8'), text);
   assert.strictEqual(copyCommand(null), 'copy ', 'null は空文字として扱う');
+});
+
+// ---------------------------------------------------------------- #32 エンジンのファイル検査
+const statOf = (table) => (f) => { if (!(f in table)) throw new Error('ENOENT'); return table[f]; };
+
+test('engineFileIssue: 無い・切れている・実体が無い・正常 を見分ける', () => {
+  const stat = statOf({
+    ok: { size: 500_000_000, blocks: 976563 },
+    short: { size: 120_000_000, blocks: 234375 },
+    // OneDrive のオンデマンド: 大きさはあるが割り当てブロックが 0
+    cloud: { size: 500_000_000, blocks: 0 },
+    empty: { size: 0, blocks: 0 },
+  });
+  assert.strictEqual(engineFileIssue('ok', 300_000_000, stat), 'ok');
+  assert.strictEqual(engineFileIssue('short', 300_000_000, stat), 'truncated');
+  assert.strictEqual(engineFileIssue('cloud', 300_000_000, stat), 'placeholder');
+  assert.strictEqual(engineFileIssue('none', 300_000_000, stat), 'missing', 'stat が投げたら missing');
+  assert.strictEqual(engineFileIssue('empty', 300_000_000, stat), 'truncated', '0 バイトはプレースホルダではなく切れている');
+});
+
+test('engineFileIssue: blocks が取れない環境では実体の有無を判定しない（誤って使えなくしない）', () => {
+  const stat = statOf({ f: { size: 500_000_000 } });
+  assert.strictEqual(engineFileIssue('f', 300_000_000, stat), 'ok');
+  assert.strictEqual(engineFileIssue('f', 600_000_000, stat), 'truncated');
+});
+
+test('engineIssueMessage: 原因を名指しし、切れているときは大きさと直し方を添える', () => {
+  assert.strictEqual(engineIssueMessage('placeholder', 'model', 500_000_000),
+    'モデルの実体がこの PC にありません（OneDrive などのプレースホルダの可能性）');
+  assert.strictEqual(engineIssueMessage('truncated', 'model', 120_000_000),
+    'モデルファイルが途中で切れています（114MB）。setup-*.ps1 を再実行してください');
+  assert.strictEqual(engineIssueMessage('missing', 'model'), 'モデルファイルが見つかりません');
+  assert.strictEqual(engineIssueMessage('placeholder', 'exe', 1_000_000),
+    '実行ファイルの実体がこの PC にありません（OneDrive などのプレースホルダの可能性）');
+  assert.match(engineIssueMessage('truncated', 'exe', 40_000), /^実行ファイルが途中で切れています（0\.0MB）/);
+  assert.strictEqual(engineIssueMessage('missing', 'exe'), '実行ファイルが見つかりません');
+  assert.strictEqual(engineIssueMessage('ok', 'model', 1), '');
+});
+
+// ---------------------------------------------------------------- #28/#31 ポートの衝突
+test('portInUseError: ポート番号を名指しし、変えるか止めるかを案内する', () => {
+  assert.strictEqual(portInUseError(8990),
+    'ポート 8990 は他のプロセスが使用中です。設定でポートを変えるか、そのプロセスを終了してください');
+});
+
+// ---------------------------------------------------------------- #57 記録中のエンジン設定
+const PREV = {
+  language: 'ja', localThreads: 8, sumThreads: 8, useVad: true, suppressNst: true,
+  localServerExe: 'C:/e/whisper-server.exe', localModelPath: 'C:/m/ggml-small.bin', vadModelPath: '',
+  sumServerExe: 'C:/e/llama-server.exe', sumModelPath: 'C:/m/q.gguf', localPort: 8990, sumPort: 8991,
+  segmentSec: 75, theme: 'system', autoPaste: true, dictionary: ['見積'],
+};
+
+test('guardEngineSettings: 記録中はエンジンに関わる設定を前の値に留め、他は通し、警告で名指しする', () => {
+  const next = { ...PREV, localPort: 9000, language: 'en', segmentSec: 120, theme: 'dark', dictionary: ['見積', '検収'] };
+  const r = guardEngineSettings(PREV, next, true);
+  assert.strictEqual(r.settings.localPort, 8990);
+  assert.strictEqual(r.settings.language, 'ja');
+  assert.strictEqual(r.settings.segmentSec, 75);
+  assert.strictEqual(r.settings.theme, 'dark', 'エンジンに関わらない設定まで止めている');
+  assert.deepStrictEqual(r.settings.dictionary, ['見積', '検収'], '辞書は記録中でも保存できる');
+  assert.deepStrictEqual(r.kept, ['language', 'localPort', 'segmentSec']);
+  assert.match(r.warning, /^記録中のため、エンジンに関わる設定（.+）は変更できません。記録を終えてから変更してください$/);
+  assert.ok(r.warning.includes('言語') && r.warning.includes('ポート') && r.warning.includes('区間'), '止めた設定を名指ししていない');
+  // 入力は書き換えない
+  assert.strictEqual(next.localPort, 9000);
+  assert.strictEqual(PREV.localPort, 8990);
+});
+
+test('guardEngineSettings: 記録中でなければそのまま通す／記録中でも変えていなければ警告しない', () => {
+  const next = { ...PREV, localPort: 9000 };
+  const r = guardEngineSettings(PREV, next, false);
+  assert.strictEqual(r.settings.localPort, 9000);
+  assert.deepStrictEqual(r.kept, []);
+  assert.strictEqual(r.warning, '');
+  const same = guardEngineSettings(PREV, { ...PREV, theme: 'dark' }, true);
+  assert.deepStrictEqual(same.kept, []);
+  assert.strictEqual(same.warning, '');
+  assert.strictEqual(same.settings.theme, 'dark');
+});
+
+test('keptDifferent: 画面が送った値と違う値で残ったキーだけを返す（画面はこれを欄に戻す）', () => {
+  const sent = { hotkey: 'Alt+Q', localPort: '8990', dictionary: [' 見積 ', ''], theme: 'dark' };
+  const saved = { hotkey: 'Alt+M', localPort: 8990, dictionary: ['見積'], theme: 'dark', other: 1 };
+  assert.deepStrictEqual(keptDifferent(sent, saved), { hotkey: 'Alt+M', localPort: 8990, dictionary: ['見積'] });
+  assert.deepStrictEqual(keptDifferent(null, saved), {});
+  assert.deepStrictEqual(keptDifferent({ theme: 'dark' }, saved), {});
+});
+
+// ---------------------------------------------------------------- #52 要約中は「忙しい」
+test('makeSummaryRunner: 走っている id を running() で引け、増減のたびに onChange が件数で呼ばれる', async () => {
+  const counts = [];
+  const pending = new Map();
+  const run = (id) => new Promise((res) => pending.set(id, res));
+  const runSummary = makeSummaryRunner(run, (n) => counts.push(n));
+  assert.deepStrictEqual(runSummary.running(), []);
+  const p1 = runSummary('p1');
+  runSummary('p1');   // 同じ id は数えない
+  const p2 = runSummary('p2');
+  assert.deepStrictEqual(runSummary.running(), ['p1', 'p2']);
+  assert.deepStrictEqual(counts, [1, 2]);
+  pending.get('p1')();
+  await p1;
+  assert.deepStrictEqual(runSummary.running(), ['p2']);
+  pending.get('p2')();
+  await p2;
+  assert.deepStrictEqual(runSummary.running(), []);
+  assert.deepStrictEqual(counts, [1, 2, 1, 0]);
+});
+
+test('makeSummaryRunner: onChange が無くても・投げても動く', async () => {
+  const a = makeSummaryRunner(async () => 'x');
+  assert.strictEqual(await a('p'), 'x');
+  const b = makeSummaryRunner(async () => 'y', () => { throw new Error('boom'); });
+  assert.strictEqual(await b('p'), 'y');
+  assert.deepStrictEqual(b.running(), []);
+});
+
+test('closeConfirm: 記録中・要約中・両方 で終了確認の文を組み、どちらでもなければ null', () => {
+  assert.strictEqual(closeConfirm(false, false), null);
+  const rec = closeConfirm(true, false);
+  assert.strictEqual(rec.message, '議事録を記録中です');
+  assert.match(rec.detail, /次回起動時に復旧できます/);
+  assert.ok(!rec.detail.includes('要約'));
+  const sum = closeConfirm(false, true);
+  assert.strictEqual(sum.message, '要約を作成中です。終了すると要約は失われます');
+  assert.match(sum.detail, /「要約を生成」/);
+  const both = closeConfirm(true, true);
+  assert.strictEqual(both.message, '議事録を記録中です');
+  assert.ok(both.detail.includes('要約を作成中です。終了すると要約は失われます'), '両方のときに要約の分が抜けている');
 });
