@@ -912,3 +912,42 @@ test('#52 要約中はアプリを「忙しい」として扱う', () => {
   // 終了中に要約の失敗を書き戻すと、上の「中断」の文を上書きする
   assert.match(fnBody(m, 'async function doRunSummary', '\nlet hotkeyState'), /catch \(e\) \{\n\s*if \(quitting\) return/);
 });
+
+// ---------------------------------------------------------------- 第2段（C: 要約とプロンプト）
+test('#16 分割要約が切れたら半分に割ってやり直し、それでも切れたパートを名指しする', () => {
+  // やり直しの判断は mainlib.extractNotes、文は mainlib.truncationMessage（main.test.js で実行）
+  const gen = fnBody(code(main), 'async function generateMinutes', '\nfunction ensurePaster');
+  assert.ok(gen.includes('await extractNotes('), 'やり直しを mainlib.extractNotes で行っていない');
+  assert.ok(gen.includes('truncatedParts.push(i + 1)'), '切れたパート番号を記録していない');
+  assert.ok(gen.includes('（※パート${i + 1}の抽出は途中で切れています）'), '要点メモに注記していない');
+  assert.match(gen, /return \{ md: one\.text, truncated: one\.truncated, truncatedParts: \[\], finalTruncated: one\.truncated \}/);
+  assert.match(gen, /truncatedParts, finalTruncated: final\.truncated \}/);
+  const run = fnBody(code(main), 'async function doRunSummary', '\nlet hotkeyState');
+  assert.ok(run.includes('saved.summaryError = truncationMessage(truncatedParts, finalTruncated)'), '文を mainlib.truncationMessage から取っていない');
+  assert.ok(!code(main).includes('要約が長さの上限で打ち切られた可能性があります'), '文が main.js に手書きのまま残っている');
+});
+
+test('#23 初期プロンプトは予算（UTF-8 バイト）に収め、辞書の収まり具合を画面へ返せる', () => {
+  // 予算の判断は mainlib.buildPromptParts（main.test.js で実行）。ここは結線だけ見る
+  const m = code(main);
+  assert.match(m, /const PROMPT_LIMIT_BYTES = PROMPT_MAX_CHARS \* 3/, '予算が文字数 × 3 バイトになっていない');
+  const pp = fnBody(m, 'function promptParts(', '\n}');
+  assert.ok(pp.includes('buildPromptParts({'), 'mainlib.buildPromptParts を通していない');
+  for (const k of ['ja,', 'sample: PROMPT_SAMPLE', 'dictionary: settings.dictionary', 'useBuiltinTerms: settings.useBuiltinTerms',
+    'builtinTerms: BUILTIN_TERMS', 'tail: extraTail', 'limitBytes: PROMPT_LIMIT_BYTES']) {
+    assert.ok(pp.includes(k), `${k} を渡していない`);
+  }
+  assert.match(m, /function buildPrompt\(extraTail\) \{ return promptParts\(extraTail\)\.prompt; \}/);
+  const info = fnBody(m, "ipcMain.handle('prompt:info'", '\n  });');
+  assert.ok(info.includes("promptParts('')"), '尻尾なしで数えていない');
+  assert.ok(info.includes('kept: r.kept') && info.includes('total: r.total') && info.includes('over: r.over'), '{ ok, kept, total, over } の形で返していない');
+  assert.ok(preload.includes("  promptInfo: () => ipcRenderer.invoke('prompt:info'),"), 'preload の promptInfo が無い');
+});
+
+test('#4 出典は要約の材料にした配列と今の配列の両方から付ける（cite 側が無ければ従来どおり）', () => {
+  assert.match(main, /const attachAcross = cite\.attachCitationsAcross \|\| \(\(b, f\) => attachCitations\(b, f\.filter\(\(s\) => !s\.failed\)\)\)/,
+    'cite.attachCitationsAcross への切り替え（無ければ素通し）が無い');
+  const run = fnBody(code(main), 'async function doRunSummary', '\nlet hotkeyState');
+  assert.ok(run.includes('const segmentsAtStart = segments;'), '入口で読んだ配列を取っておいていない');
+  assert.ok(run.includes('const stat = attachAcross(blocks, fresh, segmentsAtStart);'), '両方の配列を渡していない');
+});

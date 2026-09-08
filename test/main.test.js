@@ -19,6 +19,7 @@ const {
   makeSummaryRunner, tickStep,
   pasterScript, copyCommand,
   engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
+  truncationMessage, extractNotes, buildPromptParts,
 } = require('../src/mainlib');
 const { normalizeSettings } = require('../src/settings');
 
@@ -586,4 +587,90 @@ test('closeConfirm: 記録中・要約中・両方 で終了確認の文を組�
   const both = closeConfirm(true, true);
   assert.strictEqual(both.message, '議事録を記録中です');
   assert.ok(both.detail.includes('要約を作成中です。終了すると要約は失われます'), '両方のときに要約の分が抜けている');
+});
+
+// ---------------------------------------------------------------- #16 分割要約の打ち切り
+test('truncationMessage: 切れたパートを名指しし、最終統合だけが切れたときは末尾の文言のまま', () => {
+  assert.strictEqual(truncationMessage([], false), '');
+  assert.strictEqual(truncationMessage([], true),
+    '要約が長さの上限で打ち切られた可能性があります。末尾の議題が欠けていないか確認してください。');
+  assert.strictEqual(truncationMessage([2], false),
+    '要約の材料（パート 2）が長さの上限で切れました。中盤の議題が欠けていないか確認してください。');
+  assert.match(truncationMessage([1, 3], false), /パート 1・3/);
+  const both = truncationMessage([2], true);
+  assert.ok(both.includes('パート 2') && both.includes('末尾の議題'), '両方切れたときに片方しか伝えていない');
+});
+
+test('extractNotes: 切れたら半分に割って両方をやり直し、収まればその結果を使う', async () => {
+  // 上限で切れた要点メモは中盤の議題が黙って欠ける。長い塊は半分にすれば収まることが多い
+  const calls = [];
+  const extract = async (t) => { calls.push(t); return { text: `[${t}]`, truncated: t.length > 4 }; };
+  const r = await extractNotes(extract, 'abcdefgh');
+  assert.deepStrictEqual(calls, ['abcdefgh', 'abcd', 'efgh']);
+  assert.strictEqual(r.text, '[abcd]\n[efgh]');
+  assert.strictEqual(r.truncated, false);
+  assert.strictEqual(r.retried, true);
+});
+
+test('extractNotes: 収まっていればそのまま／半分でも切れたら本文は残して truncated を立てる（やり直しは一度だけ）', async () => {
+  const ok = await extractNotes(async (t) => ({ text: t, truncated: false }), 'short');
+  assert.deepStrictEqual(ok, { text: 'short', truncated: false, retried: false });
+  let n = 0;
+  const still = await extractNotes(async (t) => { n++; return { text: t, truncated: true }; }, 'abcdefgh');
+  assert.strictEqual(n, 3, '二度目以降も割り続けている');
+  assert.strictEqual(still.text, 'abcd\nefgh', '切れても本文を捨てている');
+  assert.strictEqual(still.truncated, true);
+});
+
+// ---------------------------------------------------------------- #23 初期プロンプトの予算
+const SAMPLE = 'お疲れさまです。よろしくお願いします。';
+const BUILTIN = ['不具合', '改修', '受注', '発注'];
+const bytes = (s) => Buffer.byteLength(s, 'utf8');
+
+test('buildPromptParts: 辞書が予算を超えたら先頭行から収まる分だけ残し、文例は必ず残す', () => {
+  // 5 文字 × 3 バイト + 読点 で 1 語 18 バイト。40 語 = 720 バイトは 600 バイトに収まらない
+  const words = Array.from({ length: 40 }, (_, i) => `専門用語${String.fromCharCode(0x3042 + i)}`);
+  const r = buildPromptParts({ ja: true, dictionary: words, useBuiltinTerms: true, tail: '', limitBytes: 600, builtinTerms: BUILTIN, sample: SAMPLE });
+  assert.strictEqual(r.total, 40);
+  assert.ok(r.kept > 0 && r.kept < 40, `収まる分だけ残していない (kept=${r.kept})`);
+  assert.strictEqual(r.over, true);
+  assert.ok(r.prompt.startsWith(SAMPLE), '文例を落としている');
+  assert.ok(bytes(r.prompt) <= 600, `予算を超えている (${bytes(r.prompt)} bytes)`);
+  // 残るのは先頭から kept 語。既定語彙は辞書より先に落ちる
+  for (let i = 0; i < r.kept; i++) assert.ok(r.prompt.includes(words[i]), `先頭の語 ${words[i]} が落ちている`);
+  assert.ok(!r.prompt.includes(words[r.kept]), '予算外の語が残っている');
+  for (const w of BUILTIN) assert.ok(!r.prompt.includes(w), '辞書より先に既定語彙を落としていない');
+});
+
+test('buildPromptParts: 収まるなら 文例 → 辞書 → 既定語彙 → 尻尾 の順で全部入る', () => {
+  const r = buildPromptParts({ ja: true, dictionary: ['見積', ' 検収 ', '見積', ''], useBuiltinTerms: true, tail: '前の発言の末尾', limitBytes: 600, builtinTerms: BUILTIN, sample: SAMPLE });
+  assert.strictEqual(r.prompt, `${SAMPLE} 見積、検収、不具合、改修、受注、発注。 前の発言の末尾`);
+  assert.deepStrictEqual([r.kept, r.total, r.over], [2, 2, false]);
+});
+
+test('buildPromptParts: 予算は UTF-8 のバイト数（文字数ではない）', () => {
+  // 英数字の語は 1 文字 1 バイト。文字数で数えると 3 倍に見積もられて不当に切られる。
+  // 4 文字の語 70 個 = 350 文字（読点込み）は 200 文字を超えるが、
+  // バイト数では 70×4 + 69×3（読点）+ 3（句点）= 490 で 600 に収まる
+  const many = Array.from({ length: 70 }, (_, i) => `w${String(i).padStart(3, '0')}`);
+  const r = buildPromptParts({ ja: false, dictionary: many, useBuiltinTerms: true, tail: '', limitBytes: 600, builtinTerms: BUILTIN, sample: SAMPLE });
+  assert.ok(r.prompt.length > 200, `文字数では ${r.prompt.length} 文字（200 を超えるはず）`);
+  assert.strictEqual(bytes(r.prompt), 490);
+  assert.strictEqual(r.over, false, 'バイト数で収まるのに切っている');
+  assert.deepStrictEqual([r.kept, r.total], [70, 70]);
+});
+
+test('buildPromptParts: 尻尾は語より先に、先頭から削る／日本語以外では文例も既定語彙も付けない', () => {
+  // 辞書だけで予算いっぱい → 尻尾は入る余地の分だけ末尾側を残す
+  const words = Array.from({ length: 30 }, (_, i) => `専門用語${String.fromCharCode(0x3042 + i)}`);
+  const full = buildPromptParts({ ja: true, dictionary: words, useBuiltinTerms: false, tail: '', limitBytes: 600, builtinTerms: BUILTIN, sample: SAMPLE });
+  const withTail = buildPromptParts({ ja: true, dictionary: words, useBuiltinTerms: false, tail: 'あいうえおかきくけこ', limitBytes: 600, builtinTerms: BUILTIN, sample: SAMPLE });
+  assert.strictEqual(withTail.kept, full.kept, '尻尾のために辞書を削っている');
+  assert.ok(bytes(withTail.prompt) <= 600);
+  assert.ok(!withTail.prompt.includes('あいうえお') || withTail.prompt.endsWith('けこ'), '尻尾を末尾側から削っている');
+  const en = buildPromptParts({ ja: false, dictionary: ['Kubernetes'], useBuiltinTerms: true, tail: 'tail', limitBytes: 600, builtinTerms: BUILTIN, sample: SAMPLE });
+  assert.strictEqual(en.prompt, 'Kubernetes。 tail');
+  const noBuiltin = buildPromptParts({ ja: true, dictionary: [], useBuiltinTerms: false, tail: '', limitBytes: 600, builtinTerms: BUILTIN, sample: SAMPLE });
+  assert.strictEqual(noBuiltin.prompt, SAMPLE);
+  assert.deepStrictEqual([noBuiltin.kept, noBuiltin.total, noBuiltin.over], [0, 0, false]);
 });

@@ -341,6 +341,79 @@ function closeConfirm(recording, summarizing) {
   return { message: sumLine, detail: '「要約を生成」で後から作り直せます。' };
 }
 
+// ---------------------------------------------------------------- 分割要約の打ち切り（#16）
+// extract(text) は { text, truncated } を返す（要点の抽出）。長さの上限で切れたら、その塊を
+// 半分に割って両方をやり直す（一度だけ）。切れたままだと中盤の議題が黙って欠ける。
+// 半分でも切れたら本文は残して truncated を立てる（呼び出し側が注記し、パートを名指しする）。
+async function extractNotes(extract, text) {
+  const first = await extract(text);
+  if (!first.truncated) return { text: first.text, truncated: false, retried: false };
+  const half = Math.ceil(text.length / 2);
+  const a = await extract(text.slice(0, half));
+  const b = await extract(text.slice(half));
+  return { text: `${a.text}\n${b.text}`, truncated: Boolean(a.truncated || b.truncated), retried: true };
+}
+
+// summaryError に書く一文。parts: 半分にしても切れたパート番号（1 始まり）、
+// finalTruncated: 最終の統合が切れたか。どちらも無ければ ''。
+// パートが切れた＝中盤の議題が欠けうる、最終が切れた＝末尾の議題が欠けうる、で文を分ける。
+function truncationMessage(parts, finalTruncated) {
+  const ps = (Array.isArray(parts) ? parts : []).filter((n) => Number.isInteger(n) && n > 0);
+  const out = [];
+  if (ps.length) out.push(`要約の材料（パート ${ps.join('・')}）が長さの上限で切れました。中盤の議題が欠けていないか確認してください。`);
+  if (finalTruncated) out.push('要約が長さの上限で打ち切られた可能性があります。末尾の議題が欠けていないか確認してください。');
+  return out.join('');
+}
+
+// ---------------------------------------------------------------- 初期プロンプトの予算（#23）
+// whisper.cpp の初期プロンプトは n_text_ctx/2（既定 224 トークン）で切られる。どちら側から
+// 切られるかはビルドで変わりうるので、そもそも溢れさせない。
+// 予算の単位は UTF-8 のバイト数。日本語は 1 文字 ≒ 1 トークン ≒ 3 バイト、英数字は数文字で
+// 1 トークン ≒ 3〜4 バイトなので、文字数より「バイト数 ÷ 3」の方が両方の文字種でトークン数に
+// 近い（文字数で数えると英数字の語が実際の 3 倍に見積もられ、辞書が不当に切られる）。
+// 上限は PROMPT_MAX_CHARS × 3 バイト（日本語だけなら従来どおり 200 文字）。
+// 優先順は 文例 → 辞書（先頭行から）→ 既定語彙 → 直前の発言の尻尾。予算を超えたら後ろから
+// 落とす（尻尾は先頭から削る・既定語彙、辞書の順に末尾の語から外す）。文例だけは落とさない。
+// 以前は辞書を無制限に渡していたが、溢れた分は黙って効かなくなっていた。切るなら切ったと
+// 伝える（kept/total を prompt:info で画面へ返す）。
+//   戻り値 { prompt, kept: 辞書のうち収まった語数, total: 辞書の語数, over: kept < total }
+function buildPromptParts({ ja, dictionary, useBuiltinTerms, tail, limitBytes, builtinTerms, sample }) {
+  const uniq = (list) => {
+    const out = [];
+    for (const raw of (Array.isArray(list) ? list : [])) {
+      const w = String(raw ?? '').trim();
+      if (w && !out.includes(w)) out.push(w);
+    }
+    return out;
+  };
+  const words = uniq(dictionary);
+  // 既定語彙は日本語のときだけ。英語や自動判定で日本語の語を渡すと、その語が出力に漏れ、
+  // 言語の推定も日本語へ引っぱられる。辞書と重なる語は足さない。
+  const builtin = (ja && useBuiltinTerms !== false) ? uniq(builtinTerms).filter((w) => !words.includes(w)) : [];
+  const head = ja ? String(sample || '') : '';
+  const limit = Number(limitBytes) > 0 ? Number(limitBytes) : Infinity;
+  let tailChars = Array.from(String(tail || ''));   // サロゲートペアを割らないよう文字単位
+  let nWords = words.length;
+  let nBuiltin = builtin.length;
+  const assemble = () => {
+    const parts = [];
+    if (head) parts.push(head);
+    const terms = words.slice(0, nWords).concat(builtin.slice(0, nBuiltin));
+    if (terms.length) parts.push(`${terms.join('、')}。`);
+    if (tailChars.length) parts.push(tailChars.join(''));
+    return parts.join(' ');
+  };
+  let prompt = assemble();
+  while (Buffer.byteLength(prompt, 'utf8') > limit) {
+    if (tailChars.length) tailChars = tailChars.slice(1);
+    else if (nBuiltin > 0) nBuiltin--;
+    else if (nWords > 0) nWords--;
+    else break;   // 文例だけになったらそれ以上は落とさない
+    prompt = assemble();
+  }
+  return { prompt, kept: nWords, total: words.length, over: nWords < words.length };
+}
+
 module.exports = {
   saveIfExists, meetingDurationSec, promptTail,
   registerHotkeys, hotkeyFailureMessage, hotkeyStatus, resolveStartupHotkeys, saveHotkeys,
@@ -348,4 +421,5 @@ module.exports = {
   pasterScript, copyCommand,
   engineFileIssue, engineIssueMessage, portInUseError,
   ENGINE_SETTING_KEYS, guardEngineSettings, keptDifferent, closeConfirm,
+  extractNotes, truncationMessage, buildPromptParts,
 };

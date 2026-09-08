@@ -212,19 +212,24 @@ test('要約の後処理と文字起こしの設定が main.js に結線され�
 
 test('日本語以外では既定語彙を渡さない', () => {
   // 英語や自動判定で日本語の語を渡すと、その語が出力に漏れ、
-  // 言語の推定も日本語へ引っぱられる
-  const bp = main.match(/function buildPrompt\([\s\S]*?\n\}/);
-  assert.ok(bp, 'buildPrompt が見つからない');
-  assert.match(bp[0], /const ja = settings\.language === 'ja'/);
-  assert.match(bp[0], /if \(ja && settings\.useBuiltinTerms !== false\)/);
+  // 言語の推定も日本語へ引っぱられる。判断は mainlib.buildPromptParts
+  // （main.test.js で実行）。ここは main.js が言語の判定を渡していることを見る
+  const pp = main.match(/function promptParts\([\s\S]*?\n\}/);
+  assert.ok(pp, 'promptParts が見つからない');
+  assert.match(pp[0], /const ja = settings\.language === 'ja'/);
+  assert.match(pp[0], /buildPromptParts\(\{/);
+  const lib = fs.readFileSync(path.join(ROOT, 'src/mainlib.js'), 'utf8');
+  assert.match(lib, /\(ja && useBuiltinTerms !== false\)/, '既定語彙を日本語のときだけにしていない');
 });
 
-test('ユーザー辞書は予算で切らない', () => {
-  // 辞書を育ててきた利用者の認識精度が黙って落ちるのを防ぐ
-  const bp = main.match(/function buildPrompt\([\s\S]*?\n\}/)[0];
-  const userLoop = bp.slice(bp.indexOf('settings.dictionary'), bp.indexOf('if (ja &&'));
-  assert.ok(!userLoop.includes('budget'), 'ユーザー辞書に予算を掛けている');
-  assert.ok(!/break;/.test(bp), '長い語ひとつで後続を捨てている');
+test('ユーザー辞書は先頭行から予算に収め、文例は必ず残す（#23）', () => {
+  // 以前は辞書を無制限に渡していたが、whisper.cpp の初期プロンプトは 224 トークンで
+  // 切られる（どちら側からかはビルド次第）ので、溢れた辞書は黙って効かなくなっていた。
+  // 収まった語数は prompt:info で画面へ返し、辞書の欄で伝える
+  const lib = fs.readFileSync(path.join(ROOT, 'src/mainlib.js'), 'utf8');
+  assert.match(lib, /function buildPromptParts\(/);
+  assert.match(lib, /Buffer\.byteLength\(prompt, 'utf8'\) > limit/, '予算を UTF-8 のバイト数で見ていない');
+  assert.match(main, /ipcMain\.handle\('prompt:info'/);
 });
 
 test('文字起こしへ渡す文例に、漏れて困る語を入れない', () => {

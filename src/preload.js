@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld('koeApp', {
   testApi: () => ipcRenderer.invoke('app:test'),
   testSum: () => ipcRenderer.invoke('app:test-sum'),
   vadStatus: () => ipcRenderer.invoke('app:vad-status'),
+  promptInfo: () => ipcRenderer.invoke('prompt:info'),
   pickFile: (kind) => ipcRenderer.invoke('dialog:pick', kind),
   openDataDir: () => ipcRenderer.invoke('app:open-data-dir'),
   openSoundSettings: () => ipcRenderer.invoke('app:open-sound-settings'),
