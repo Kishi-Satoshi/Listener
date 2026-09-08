@@ -694,6 +694,11 @@
     const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
     return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(x).padStart(2,'0')}` : `${m}:${String(x).padStart(2,'0')}`;
   }
+  // 検索の正規化。全角／半角・大文字小文字・句読点や空白の違いで取りこぼさないよう、
+  // 両辺を同じ形に畳んでから含有を見る。main 側（cite.js の searchFold）と同じ規則。
+  // 規則を変えるときは両方を直す（一覧の検索と画面内の絞り込みで当たり方が食い違う）。
+  const fold = (s) => String(s || '').normalize('NFKC')
+    .replace(/[、。「」『』（）()［］\[\]【】・,.!?！？"'`~\-—…:：;；*_\/\s]/g, '').toLowerCase();
   function dueInfo(due, approx) {
     if (!due) return null;
     const today = new Date(); today.setHours(0,0,0,0);
@@ -744,7 +749,8 @@
   async function renderActionView(q) {
     const box = $('plist'); box.textContent = '';
     let acts = await window.koeApp.openActions();
-    if (q) acts = acts.filter((x) => x.text.includes(q) || x.pageTitle.includes(q) || x.assignee.includes(q));
+    const fq = fold(q);
+    if (fq) acts = acts.filter((x) => fold(x.text).includes(fq) || fold(x.pageTitle).includes(fq) || fold(x.assignee).includes(fq));
     if (assigneeFilter) acts = acts.filter((x) => x.assignee === assigneeFilter);
 
     // 担当者での絞り込みチップ
@@ -1536,7 +1542,8 @@
     $('stSaved').innerHTML = saved >= 60 ? `${(saved/60).toFixed(1)}<small>時間</small>` : `${Math.round(saved)}<small>分</small>`;
 
     const q = $('histSearch').value.trim();
-    const list = q ? history.filter((h) => h.text.includes(q)) : history;
+    const fq = fold(q);
+    const list = fq ? history.filter((h) => fold(h.text).includes(fq)) : history;
     const box = $('histList'); box.textContent = '';
     if (!list.length) {
       const d = document.createElement('div'); d.className = 'empty';
