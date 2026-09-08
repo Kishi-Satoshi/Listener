@@ -253,6 +253,7 @@
     background: rgba(var(--srf),.62); border: 1px solid var(--gline); border-radius: 14px; padding: 11px 14px; }
   /* 進捗・打ち切り・マイクの注意は、1行目（状態と時計）の下に折り返して出す */
   .live .desc { flex: none; width: 100%; font-size: 11px; color: var(--muted); }
+  .live .desc.ng { color: var(--danger); }
   .live button.ghost { font-size: 12px; padding: 5px 12px; }
   .rec-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent);
     animation: pulse 1.4s ease-in-out infinite; flex: none; }
@@ -1439,7 +1440,8 @@
           + '<button class="ghost" id="liveSkipBtn" type="button" hidden>文字起こしを打ち切って要約</button>'
           + '<span class="tm" id="liveTm">0:00</span>'
           + '<div class="desc" id="liveEta" hidden></div>'
-          + '<div class="desc" id="liveSkipped" hidden></div>';
+          + '<div class="desc" id="liveSkipped" hidden></div>'
+          + '<div class="desc ng" id="liveMic" hidden></div>';
         $('pBody').insertBefore(live, $('pBody').firstChild);
         $('liveSkipBtn').onclick = skipPending;
       }
@@ -1520,6 +1522,11 @@
     const skippedEl = $('liveSkipped');
     skippedEl.hidden = !(st.skipped > 0);
     if (st.skipped > 0) skippedEl.textContent = `${st.skipped} 区間を打ち切りました`;
+    // 選んだマイクが外れていて、main が既定のマイクに切り替えて録っている。
+    // 会議が終わってから気づくと手遅れなので、記録中に赤で出す。
+    const micEl = $('liveMic');
+    micEl.hidden = !st.micFallback;
+    micEl.textContent = st.micFallback ? '選んだマイクが見つからないため、既定のマイクで録音しています' : '';
   }
   async function skipPending() {
     if (!confirm('残っている文字起こしを打ち切り、いまある分だけで議事録を作ります。\n打ち切った区間の発言は議事録に入りません。よろしいですか？')) return;
