@@ -430,3 +430,53 @@ test('preload に reportMic が無くても、録音は例外なく始まり、�
   assert.ok(/既定のマイク/.test(log.byId.get('status').textContent), 'ピルの代替表示は preload に依らず出る');
 });
 
+/*
+ * #8/#42 背圧。文字起こしが追いつかないとき main が区間を長く（または短く）できるよう、
+ * overlay:segment-ms を受ける。効くのは次の区間から。今の区間を切ると、
+ * 受けた瞬間に短い区間ができて文字起こしの文脈が細切れになる。
+ */
+test('main から区間長を変えると、次の区間から効き、今の区間は切らない', async () => {
+  const { log, clock } = await 議事録を開始({ load: { preloadSrc: 拡張preload() } });
+  assert.strictEqual(log.fire('onSegmentMs', 150000), 1, 'onSegmentMs が結線されていない');
+  clock.進める(10000);
+  log.fire('onTick');
+  assert.strictEqual(log.recorders.length, 1, '区間長を受けた瞬間に今の区間を切っている');
+  clock.進める(FIRST_SEG + GRACE + 1 - 10000);
+  log.fire('onTick');
+  assert.strictEqual(log.recorders.length, 2, '今の区間が元の長さで切られていない');
+  await log.drain();
+  clock.進める(75000 + GRACE + 1);          // 既定の 75 秒なら切られる時刻
+  log.fire('onTick');
+  assert.strictEqual(log.recorders.length, 2, '次の区間が新しい区間長（150秒）ではなく元の 75 秒で切られている');
+  clock.進める(150000 - 75000);
+  log.fire('onTick');
+  assert.strictEqual(log.recorders.length, 3, '新しい区間長（150秒）で切られない');
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '例外');
+});
+
+test('区間長は 20〜300 秒に丸め、数でないものは無視する', async () => {
+  const { log, clock } = await 議事録を開始({ load: { preloadSrc: 拡張preload() } });
+  log.fire('onSegmentMs', 5000);            // 短すぎ → 20 秒
+  clock.進める(FIRST_SEG + GRACE + 1);
+  log.fire('onTick');                       // 最初の区間を切る → 2つ目（20 秒）
+  await log.drain();
+  clock.進める(20000 + GRACE + 1);
+  log.fire('onTick');
+  assert.strictEqual(log.recorders.length, 3, '下限 20 秒に丸められていない');
+  await log.drain();
+  log.fire('onSegmentMs', 'abc');           // 数でない → 無視（直前の 20 秒のまま）
+  log.fire('onSegmentMs', 999999);          // 長すぎ → 300 秒
+  clock.進める(20000 + GRACE + 1);
+  log.fire('onTick');                       // 3つ目（20 秒）を切る → 4つ目（300 秒）
+  assert.strictEqual(log.recorders.length, 4, '数でない値で区間長が壊れた');
+  await log.drain();
+  clock.進める(299000);
+  log.fire('onTick');
+  assert.strictEqual(log.recorders.length, 4, '上限 300 秒より前に切られている');
+  clock.進める(1000 + GRACE + 1);
+  log.fire('onTick');
+  assert.strictEqual(log.recorders.length, 5, '上限 300 秒で切られない');
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '例外');
+});

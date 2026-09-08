@@ -182,6 +182,9 @@
   let segSeq = 0;                // 次に始める区間（または直に送る空の最後）に振る番号。録音をまたいで増え続ける
   let sendNext = 0;              // 次に main へ送る番号
   const sendQueue = new Map();   // 番号 -> { wav, durationMs, isFinal } | null（その番号は送るものが無い）
+  // #8/#42 main からの区間長の上げ下げ（背圧）はこの範囲に丸める。短すぎると文字起こしの
+  // 文脈が細切れになり、長すぎると1区間の変換・認識が時間切れになる（実機で9分の区間が消えた）
+  const SEG_MIN_MS = 20000, SEG_MAX_MS = 300000;
 
   // ---------------- 効果音 ----------------
   let sctx = null;
@@ -918,6 +921,17 @@
   };
   window.koeOverlay.onStart((p) => window.__koeStart(p));
   window.koeOverlay.onTick(() => cutSegmentIfOverdue(recorder));
+  // #8/#42 main が文字起こしの詰まり具合で区間長を上げ下げする（背圧）。効くのは次の区間から。
+  // 今の区間は切らない（受けた瞬間に切ると短い区間ができ、文脈が細切れになる）。
+  // 録音の開始時は onStart の segmentSec で戻るので、main は開始後に送る。
+  // preload がまだ公開していない版でも動くよう、有無を見てから結線する。契約:
+  //   onSegmentMs: (cb) => ipcRenderer.on('overlay:segment-ms', (_e, ms) => cb(ms))
+  if (typeof window.koeOverlay.onSegmentMs === 'function') {
+    window.koeOverlay.onSegmentMs((ms) => {
+      if (typeof ms !== 'number' || !Number.isFinite(ms)) return;   // 数でないものは無視
+      segmentMs = Math.min(SEG_MAX_MS, Math.max(SEG_MIN_MS, Math.round(ms)));
+    });
+  }
   window.koeOverlay.onStop(() => stop());
   window.koeOverlay.onCancel(() => cancel());
   window.koeOverlay.onPhase(({ phase, message, procSec }) => {
