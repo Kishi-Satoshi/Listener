@@ -303,3 +303,92 @@ test('updateBlock: 本文を長くしたら照合対象に戻り、短くした�
   assert.strictEqual(store.getPage(p.id).blocks.find((b) => b.id === 'auto1').citeSkip, true, '短くしたのに対象のまま');
   assert.ok(r.blockId);
 });
+
+// ---------------------------------------------------------------- 検索の畳み込み（#53）
+// 文字起こしは「では、予算案の、作成を」のように読点が挟まり、要約は「ＡＩ」と「AI」が
+// 混ざる。原文どうしの includes では言ったはずの語が見つからないので、畳み込んだ
+// 文字列で当てる。抜粋は元の本文から切る（畳んだ文字列を見せない）。
+test('searchIndex: 読点をまたいで当たり、抜粋は元の本文のまま（句読点が残る）', () => {
+  fresh();
+  const p = store.createPage({ title: '定例', segments: [], blocks: [
+    blk('b1', 'bullet', '前置きが二十文字以上ある長い行です。ここから本題で、では、予算案の、作成を進めます。以上', []),
+  ] });
+  const hits = store.searchIndex('予算案の作成');
+  assert.strictEqual(hits.length, 1);
+  assert.strictEqual(hits[0].id, p.id);
+  assert.ok(hits[0].snippet.includes('では、予算案の、作成を進めます。'), `抜粋が元の本文でない: ${hits[0].snippet}`);
+  assert.ok(hits[0].snippet.startsWith('…'), `当たりの手前が省略されていない: ${hits[0].snippet}`);
+  assert.ok(!hits[0].snippet.includes('前置き'), `抜粋の窓が当たりの位置に無い: ${hits[0].snippet}`);
+});
+
+test('searchIndex: タイトルは全角・半角・大文字小文字の違いを越えて当たる', () => {
+  fresh();
+  const p = store.createPage({ title: 'AI戦略ミーティング', segments: [] });
+  for (const q of ['ai戦略', 'ＡＩ戦略', 'AI 戦略']) {
+    const hits = store.searchIndex(q);
+    assert.deepStrictEqual(hits.map((h) => h.id), [p.id], `「${q}」が当たらない`);
+    assert.strictEqual(hits[0].snippet, undefined, 'タイトル一致に抜粋は付けない');
+  }
+  assert.deepStrictEqual(store.searchIndex('クラウド移行'), [], '無関係な語が当たった');
+  assert.strictEqual(store.searchIndex('、。').length, 1, '記号だけの検索は空の検索と同じ（全件）');
+});
+
+test('searchFullText: 文字起こしも畳み込みで当て、抜粋は区間の原文そのもの', () => {
+  fresh();
+  const p = store.createPage({ title: 't', segments: [
+    { id: 's1', atMs: 0, text: 'では、予算案の、作成を進めます。' },
+    { id: 's2', atMs: 1000, text: 'ＡＩ推進室の件は次回に回します。' },
+    { id: 's3', atMs: 2000, text: 'ﾃﾞｰﾀ移行の手順を確認します。' },
+  ] });
+  let hits = store.searchFullText('予算案の作成');
+  assert.strictEqual(hits.length, 1);
+  assert.strictEqual(hits[0].id, p.id);
+  assert.strictEqual(hits[0].segmentHits, 1);
+  assert.strictEqual(hits[0].snippet, 'では、予算案の、作成を進めます。');
+  hits = store.searchFullText('ai推進室');
+  assert.strictEqual(hits.length, 1);
+  assert.strictEqual(hits[0].snippet, 'ＡＩ推進室の件は次回に回します。');
+  // 半角カナの濁点は結合して比べる（「ﾃﾞｰﾀ」＝「データ」）
+  assert.strictEqual(store.searchFullText('データ移行').length, 1);
+  assert.strictEqual(store.searchFullText('ﾃﾞｰﾀ移行').length, 1);
+  assert.deepStrictEqual(store.searchFullText('クラウド移行'), []);
+  assert.deepStrictEqual(store.searchFullText('、'), []);
+});
+
+test('searchIndex: 半角カナ（結合記号あり）の本文でも抜粋の位置が元の本文に対応する', () => {
+  fresh();
+  store.createPage({ title: 't', segments: [], blocks: [
+    blk('b1', 'bullet', 'これは二十文字を超える長い前置きの文章であって、ﾃﾞｰﾀ移行の手順を確認する。', []),
+  ] });
+  const hits = store.searchIndex('データ移行');
+  assert.strictEqual(hits.length, 1);
+  assert.ok(hits[0].snippet.includes('ﾃﾞｰﾀ移行の手順'), `抜粋が当たりを含まない: ${hits[0].snippet}`);
+  assert.ok(hits[0].snippet.startsWith('…'));
+});
+
+// ---------------------------------------------------------------- 既定の日付はローカルの暦日
+// toISOString() は UTC。日本では朝 9 時前に始めた会議が前日の日付で保存される。
+const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+test('createPage: date を渡さなければローカルの暦日（UTC の日付ではない）', () => {
+  fresh();
+  // UTC と暦日が必ずずれる時間帯へ一時的に移す（UTC 11 時以降は +14、それより前は -11）
+  const tz = process.env.TZ;
+  process.env.TZ = new Date().getUTCHours() >= 11 ? 'Pacific/Kiritimati' : 'Pacific/Pago_Pago';
+  try {
+    const before = new Date();
+    const p = store.createPage({ title: 't', segments: [] });
+    const after = new Date();
+    assert.ok([ymd(before), ymd(after)].includes(p.date), `${p.date} がローカルの暦日でない`);
+    assert.notStrictEqual(p.date, before.toISOString().slice(0, 10), 'UTC の日付が入っている');
+    assert.strictEqual(store.getPage(p.id).date, p.date);
+  } finally {
+    if (tz === undefined) delete process.env.TZ; else process.env.TZ = tz;
+  }
+});
+
+test('createPage: date を渡せばそのまま使う', () => {
+  fresh();
+  const p = store.createPage({ title: 't', segments: [], date: '2020-02-29' });
+  assert.strictEqual(p.date, '2020-02-29');
+});

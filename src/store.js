@@ -13,7 +13,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { isCitable } = require('./cite');
+const { isCitable, searchFold } = require('./cite');
 
 let ROOT = '';
 let index = { version: 2, pages: [] };
@@ -65,6 +65,13 @@ function writeJson(file, data) {
 
 function newId(prefix) {
   return `${prefix}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+}
+
+// ローカルの暦日 YYYY-MM-DD。toISOString() は UTC なので、日本では朝 9 時前に
+// 始めた会議が前日の日付で保存され、一覧の並びと日付の表示が食い違う。
+function localDate(d) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
 function init(userDataPath) {
@@ -226,7 +233,7 @@ function createPage({ title, date, durationSec, memo, blocks, segments, createdA
   const page = {
     id,
     title: title || '',
-    date: date || now.slice(0, 10),
+    date: date || localDate(new Date()),
     durationSec: durationSec || 0,
     memo: memo || '',
     blocks: blocks || [],
@@ -328,19 +335,51 @@ function setTitle(pageId, title) {
 }
 
 // ---------------------------------------------------------------- 検索
+// 検索は畳み込んだ文字列どうしで当てる（#53）。文字起こしは「では、予算案の、作成を」の
+// ように読点が挟まり、要約は「ＡＩ」と「AI」が混ざるので、原文どうしの includes では
+// 言ったはずの語が見つからない。畳み込みは cite.searchFold（normalize とは別物）。
+
+// 本文を畳み込み、畳み込み後の各文字が元の本文のどの範囲から来たかも返す。
+// 一致は畳んだ文字列で探すが、抜粋は元の本文から切りたい（句読点や全角のまま見せる）。
+// 文字ごとに畳むと NFKC が「ｶ」+「ﾞ」→「ガ」のように結合できないので、
+// 結合記号は直前の文字と同じ塊にして畳み、塊の出力を塊の元範囲に対応付ける。
+const JOIN_MARK = /[\u0300-\u036f\u3099-\u309c\uff9e\uff9f\u200d\ufe0f]/;
+function foldWithMap(text) {
+  const s = String(text || '');
+  let folded = '';
+  const from = [];   // folded[i] → 元の塊の開始位置
+  const to = [];     // folded[i] → 元の塊の終了位置（排他）
+  let start = 0;
+  while (start < s.length) {
+    let end = start + (s.codePointAt(start) > 0xffff ? 2 : 1);
+    while (end < s.length && JOIN_MARK.test(s[end])) end++;
+    const f = searchFold(s.slice(start, end));
+    for (let k = 0; k < f.length; k++) { from.push(start); to.push(end); }
+    folded += f;
+    start = end;
+  }
+  return { folded, from, to };
+}
+
 // 一覧（タイトル・要約プレビュー）の絞り込みは同期・即時
 function searchIndex(query) {
-  const q = query.trim();
+  const q = searchFold(query);
   if (!q) return index.pages;
   const out = [];
   for (const p of index.pages) {
-    if (p.title.includes(q)) { out.push(p); continue; }
+    if (searchFold(p.title).includes(q)) { out.push(p); continue; }
     const text = p.searchText || p.preview || '';
-    const at = text.indexOf(q);
-    if (at < 0) continue;
+    // まず丸ごと畳んで当たりだけ見る。打鍵のたびに全ページを走るので、
+    // 外れたページに文字単位の位置対応（下）を作らない。
+    if (!searchFold(text).includes(q)) continue;
+    const { folded, from, to } = foldWithMap(text);
+    const at = folded.indexOf(q);
+    // 元の本文の範囲に戻す。結合の仕方の差で位置が取れない稀な場合は先頭から見せる
+    const s = at >= 0 ? from[at] : 0;
+    const e = at >= 0 ? to[at + q.length - 1] : Math.min(text.length, q.length);
     // どこに当たったかを一覧で見せる（前後を少し添える）
-    const from = Math.max(0, at - 20);
-    out.push({ ...p, snippet: (from > 0 ? '…' : '') + text.slice(from, at + q.length + 40) });
+    const head = Math.max(0, s - 20);
+    out.push({ ...p, snippet: (head > 0 ? '…' : '') + text.slice(head, e + 40) });
   }
   return out;
 }
@@ -349,14 +388,15 @@ function searchIndex(query) {
 // 文字起こし（トランスクリプト）だけを対象に検索する。
 // 要約は編集や言い換えを経ているので、「言ったかどうか」を探す用途では
 // 原文の方が信頼できる。要約やタイトルは通常の検索（searchIndex）が受け持つ。
+// 抜粋は当たった区間の原文そのもの（畳んだ文字列は見せない）。
 function searchFullText(query, limit) {
-  const q = query.trim();
+  const q = searchFold(query);
   if (!q) return [];
   const hits = [];
   for (const entry of index.pages) {
     if (hits.length >= (limit || 50)) break;
     const segments = getTranscript(entry.id);
-    const inSegments = segments.filter((s) => s.text && s.text.includes(q));
+    const inSegments = segments.filter((s) => s.text && searchFold(s.text).includes(q));
     if (inSegments.length === 0) continue;
     hits.push({
       ...entry,

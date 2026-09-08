@@ -26,6 +26,17 @@ function normalize(s) {
     .toLowerCase();
 }
 
+// 検索用の畳み込み（#53）。normalize とは別に持つ。normalize は出典のスコアに効くので、
+// 検索の都合（NFKC・「/」の除去）で触ると、出典の付き方が静かに変わる。
+// NFKC で全角英数・半角カナ・互換文字を寄せ、句読点・括弧・記号・空白を落として小文字にする。
+// 「では、予算案の、作成を」が「予算案の作成」に、「ＡＩ戦略」が「ai戦略」に当たる。
+function searchFold(s) {
+  return String(s || '')
+    .normalize('NFKC')
+    .replace(/[、。「」『』（）()［］\[\]【】・,.!?！？"'`~\-—…:：;；*_\/\s]/g, '')
+    .toLowerCase();
+}
+
 // 照合の対象にする最短の長さ（正規化後の文字数）。
 // これより短い要点は偶然一致が多く、誤リンクは無リンクより有害なので照合しない。
 // 閾値は attachCitations / refreshCitations の両方で使うので、ここ1か所に置く。
@@ -183,4 +194,4 @@ function refreshCitations(blocks, segments, segId) {
 }
 
 module.exports = { attachCitations, refreshCitations, buildIndex, matchOne, bigrams, normalize,
-  isCitable, citeText, MIN_CITE_CHARS };
+  searchFold, isCitable, citeText, MIN_CITE_CHARS };
