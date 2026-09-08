@@ -249,8 +249,11 @@
   .seg .txt:empty::before { content: '（削除済み）'; color: var(--faint); }
 
   /* ---------- 進行中バー ---------- */
-  .live { display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
+  .live { display: flex; align-items: center; gap: 6px 10px; margin-bottom: 10px; flex-wrap: wrap;
     background: rgba(var(--srf),.62); border: 1px solid var(--gline); border-radius: 14px; padding: 11px 14px; }
+  /* 進捗・打ち切り・マイクの注意は、1行目（状態と時計）の下に折り返して出す */
+  .live .desc { flex: none; width: 100%; font-size: 11px; color: var(--muted); }
+  .live button.ghost { font-size: 12px; padding: 5px 12px; }
   .rec-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent);
     animation: pulse 1.4s ease-in-out infinite; flex: none; }
   @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(91,110,225,.4); } 50% { box-shadow: 0 0 0 7px rgba(91,110,225,0); } }
@@ -1430,8 +1433,15 @@
     if (st.active) {
       if (!live) {
         live = document.createElement('div'); live.className = 'live'; live.id = 'liveBar';
-        live.innerHTML = '<span class="rec-dot"></span><span id="liveTitle">議事録を記録中</span><span class="tm" id="liveTm">0:00</span>';
+        // 進捗と打ち切りの要素は最初から作っておき、状態に応じて隠す。
+        // 更新のたびに作り直すと、押そうとした瞬間にボタンが消えて押せない。
+        live.innerHTML = '<span class="rec-dot"></span><span id="liveTitle">議事録を記録中</span>'
+          + '<button class="ghost" id="liveSkipBtn" type="button" hidden>文字起こしを打ち切って要約</button>'
+          + '<span class="tm" id="liveTm">0:00</span>'
+          + '<div class="desc" id="liveEta" hidden></div>'
+          + '<div class="desc" id="liveSkipped" hidden></div>';
         $('pBody').insertBefore(live, $('pBody').firstChild);
+        $('liveSkipBtn').onclick = skipPending;
       }
       // 相手の声も録れているかは、会議が終わってから気づくと手遅れなので
       // 記録中のバーに出す。
@@ -1439,6 +1449,7 @@
       $('liveTitle').textContent = st.finalizing ? '議事録を作成しています…'
         : st.paused ? '一時停止中（録音していません）'
         : st.pending > 0 ? `${recLabel}（${st.pending}区間を文字起こし中）` : recLabel;
+      renderLiveNotes(st);
       if (!mtTimer) mtTimer = setInterval(() => { const e = $('liveTm'); if (e) e.textContent = mtClock(); }, 500);
       // 記録中はライブ文字起こしを表示
       if (!curId) {
@@ -1490,6 +1501,31 @@
       // 記録中のメモ欄は片付ける。この後、作られたページ側の表示に切り替わる
       if (!curId) $('pMemo').textContent = '';
     }
+  }
+
+  // 終了後に残っている文字起こしの進み具合と、それを打ち切る導線。
+  // 長い会議だと終了後の変換に何分もかかり、待つべきか分からず強制終了されていた
+  //（区間ごと失われる）。残りと見込みを出し、諦めるなら要約だけ進められるようにする。
+  function renderLiveNotes(st) {
+    const waiting = Boolean(st.stopping) && st.pending > 0;   // 終了後に、まだ変換していない区間がある
+    const etaKnown = typeof st.etaSec === 'number' && Number.isFinite(st.etaSec);
+    const etaEl = $('liveEta');
+    etaEl.hidden = !waiting;
+    if (waiting) {
+      etaEl.textContent = etaKnown
+        ? `残り ${st.pending} 区間（約 ${Math.max(1, Math.ceil(st.etaSec / 60))} 分）`
+        : `残り ${st.pending} 区間`;
+    }
+    $('liveSkipBtn').hidden = !waiting;
+    const skippedEl = $('liveSkipped');
+    skippedEl.hidden = !(st.skipped > 0);
+    if (st.skipped > 0) skippedEl.textContent = `${st.skipped} 区間を打ち切りました`;
+  }
+  async function skipPending() {
+    if (!confirm('残っている文字起こしを打ち切り、いまある分だけで議事録を作ります。\n打ち切った区間の発言は議事録に入りません。よろしいですか？')) return;
+    const r = await window.koeApp.meetingSkipPending();
+    if (r && r.ok === false && r.error) toast(r.error);
+    setMeetingUi(await window.koeApp.meetingStatus());
   }
 
   $('mtToggleBtn').onclick = async () => {
