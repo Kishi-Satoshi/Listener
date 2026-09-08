@@ -310,15 +310,18 @@ test('updateBlock: 本文を長くしたら照合対象に戻り、短くした�
 // 文字列で当てる。抜粋は元の本文から切る（畳んだ文字列を見せない）。
 test('searchIndex: 読点をまたいで当たり、抜粋は元の本文のまま（句読点が残る）', () => {
   fresh();
-  const p = store.createPage({ title: '定例', segments: [], blocks: [
-    blk('b1', 'bullet', '前置きが二十文字以上ある長い行です。ここから本題で、では、予算案の、作成を進めます。以上', []),
-  ] });
+  // 当たりの前後に窓（前 20 文字・後 40 文字）より長い本文を置き、窓の位置を厳密に見る。
+  // 畳んだ文字列の位置をそのまま使うと、落とした句読点の数だけ窓がずれる。
+  const text = '前置きが二十文字以上ある、長い行です。ここから本題で、では、予算案の、作成を進めます。'
+    + 'そのあとも本文が続き、四十文字を超える長さの締めの文章がここに置かれていて、抜粋の窓の後ろ側もここで切れる。';
+  const p = store.createPage({ title: '定例', segments: [], blocks: [blk('b1', 'bullet', text, [])] });
   const hits = store.searchIndex('予算案の作成');
   assert.strictEqual(hits.length, 1);
   assert.strictEqual(hits[0].id, p.id);
   assert.ok(hits[0].snippet.includes('では、予算案の、作成を進めます。'), `抜粋が元の本文でない: ${hits[0].snippet}`);
-  assert.ok(hits[0].snippet.startsWith('…'), `当たりの手前が省略されていない: ${hits[0].snippet}`);
-  assert.ok(!hits[0].snippet.includes('前置き'), `抜粋の窓が当たりの位置に無い: ${hits[0].snippet}`);
+  const at = text.indexOf('予算案の、作成');
+  assert.strictEqual(hits[0].snippet, `…${text.slice(at - 20, at + '予算案の、作成'.length + 40)}`,
+    '抜粋の窓が元の本文の位置に対応していない');
 });
 
 test('searchIndex: タイトルは全角・半角・大文字小文字の違いを越えて当たる', () => {
