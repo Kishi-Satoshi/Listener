@@ -17,6 +17,7 @@ const {
   saveIfExists, meetingDurationSec, promptTail, registerHotkeys,
   hotkeyFailureMessage, hotkeyStatus, resolveStartupHotkeys, saveHotkeys,
   makeSummaryRunner, tickStep,
+  pasterScript, copyCommand,
 } = require('../src/mainlib');
 const { normalizeSettings } = require('../src/settings');
 
@@ -407,4 +408,51 @@ test('normalizeSettings: 入力を書き換えない', () => {
   const raw = { ...DEF, localPort: 'abc' };
   normalizeSettings(raw, DEF);
   assert.strictEqual(raw.localPort, 'abc');
+});
+
+// ---------------------------------------------------------------- #51 議事録の日付
+const { localDateISO } = require('../src/dates');
+
+test('localDateISO: ローカルの暦日で YYYY-MM-DD を作る（UTC の toISOString で日付を作らない）', () => {
+  // 日本時間の朝（08:30 JST = 前日 23:30 UTC）に始めた会議が、UTC に直すと前日の日付で保存されていた
+  const prevTZ = process.env.TZ;
+  process.env.TZ = 'Asia/Tokyo';
+  try {
+    assert.strictEqual(localDateISO(new Date(2026, 8, 6, 23, 30)), '2026-09-06');
+    const morning = new Date(2026, 8, 6, 8, 30);
+    assert.strictEqual(localDateISO(morning), '2026-09-06');
+    assert.strictEqual(morning.toISOString().slice(0, 10), '2026-09-05', 'この検査は UTC との差を捕まえていない');
+    assert.strictEqual(localDateISO(new Date(2026, 0, 1, 0, 0)), '2026-01-01', '月日を 2 桁に揃えていない');
+  } finally {
+    if (prevTZ === undefined) delete process.env.TZ; else process.env.TZ = prevTZ;
+  }
+});
+
+// ---------------------------------------------------------------- #27 クリップボードの除外書式
+test('pasterScript: 履歴・クラウド同期から除外する書式を付け、PS5.1 で動く書き方で、失敗しても本文を残す', () => {
+  const s = pasterScript();
+  // 3 つの除外書式（Windows のクリップボード履歴 Win+V と、他の PC への同期）
+  for (const f of ['ExcludeClipboardContentFromMonitorProcessing', 'CanIncludeInClipboardHistory', 'CanUploadToCloudClipboard']) {
+    assert.ok(s.includes(`'${f}'`), `除外書式 ${f} が無い`);
+  }
+  // 値は DWORD 0（4 バイト）。byte[] を直接渡すと .NET のシリアライズ形式で包まれるので MemoryStream
+  assert.ok(s.includes('[byte[]](0,0,0,0)'), 'DWORD 0 を渡していない');
+  assert.ok(s.includes('MemoryStream'), 'byte[] を直接渡している（DWORD として読まれない）');
+  assert.ok(s.includes('FromBase64String'), '本文を base64 で受けていない');
+  assert.ok(s.includes('SetDataObject($d, $true)'), 'クリップボードへ置いていない');
+  assert.ok(s.includes("-eq 'paste'"), '従来の貼り付け命令が消えている');
+  // PS5.1: switch / [ValidateSet] を使わず if/elseif で分ける
+  assert.ok(!/\bswitch\b/.test(s) && !/ValidateSet/.test(s), 'PS5.1 で動かない書き方がある');
+  assert.ok(s.includes('elseif'), 'if/elseif で分けていない');
+  // 置き直しに失敗しても、Electron が先に書いた本文は残す
+  assert.match(s, /try \{[\s\S]*SetDataObject[\s\S]*\} catch \{\}/, 'try で包んでいない');
+});
+
+test('copyCommand: 1 行の命令に base64 で本文を載せ、改行を含む本文でも 1 行に収まる', () => {
+  const text = '会議の発言。\n2行目';
+  const cmd = copyCommand(text);
+  assert.match(cmd, /^copy [A-Za-z0-9+/=]+$/);
+  assert.ok(!cmd.includes('\n'));
+  assert.strictEqual(Buffer.from(cmd.slice(5), 'base64').toString('utf8'), text);
+  assert.strictEqual(copyCommand(null), 'copy ', 'null は空文字として扱う');
 });

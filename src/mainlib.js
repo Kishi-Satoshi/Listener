@@ -204,8 +204,43 @@ function tickStep({ state, meeting }, send, stop) {
   return 'send';
 }
 
+// ---------------------------------------------------------------- クリップボード（Windows）
+// 常駐 PowerShell に流す 1 行スクリプト。標準入力の 1 行が 1 命令。
+//   paste          … Ctrl+V を送る（従来どおり）
+//   copy <base64>  … クリップボードを「除外書式付き」で置き直す（#27）
+// 置き直すのは、Windows のクリップボード履歴（Win+V）とクラウド同期（他の PC への
+// 同期）から外すため。会議の発言や議事録が履歴に残り他の PC へ同期されるのは、
+// オフラインで完結するという前提を裏口から破る。
+//   ExcludeClipboardContentFromMonitorProcessing … 監視するアプリ全般に「見るな」
+//   CanIncludeInClipboardHistory / CanUploadToCloudClipboard … DWORD 0 で「入れない・上げない」
+// 値は 4 バイトの MemoryStream で渡す。byte[] を直接 SetData すると .NET の
+// シリアライズ形式（ヘッダ付き）で包まれ、Windows が DWORD として読めない。
+// 本文は base64 で 1 行に載せる（改行や引用符を含んでも命令の境界が壊れない）。
+// PS5.1 で動く書き方にする（switch / [ValidateSet] は使わない）。失敗しても
+// Electron が先に書いた本文は残る（try で包み、除外だけが効かない状態に留める）。
+function pasterScript() {
+  return "$ErrorActionPreference='SilentlyContinue';"
+    + 'Add-Type -AssemblyName System.Windows.Forms;'
+    + 'while($true){ $l=[Console]::In.ReadLine(); if($null -eq $l){break};'
+    + " if($l -eq 'paste'){ [System.Windows.Forms.SendKeys]::SendWait('^v') }"
+    + " elseif($l.StartsWith('copy ')){ try {"
+    + ' $t=[System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($l.Substring(5)));'
+    + ' $d=New-Object System.Windows.Forms.DataObject; $d.SetText($t);'
+    + ' $z={ [System.IO.MemoryStream]::new([byte[]](0,0,0,0)) };'
+    + " $d.SetData('ExcludeClipboardContentFromMonitorProcessing',(& $z));"
+    + " $d.SetData('CanIncludeInClipboardHistory',(& $z));"
+    + " $d.SetData('CanUploadToCloudClipboard',(& $z));"
+    + ' [System.Windows.Forms.Clipboard]::SetDataObject($d, $true) } catch {} } }';
+}
+
+// 常駐 PowerShell へ流す「置き直し」命令（改行なし。呼び出し側が '\n' を足す）
+function copyCommand(text) {
+  return `copy ${Buffer.from(String(text ?? ''), 'utf8').toString('base64')}`;
+}
+
 module.exports = {
   saveIfExists, meetingDurationSec, promptTail,
   registerHotkeys, hotkeyFailureMessage, hotkeyStatus, resolveStartupHotkeys, saveHotkeys,
   makeSummaryRunner, tickStep,
+  pasterScript, copyCommand,
 };

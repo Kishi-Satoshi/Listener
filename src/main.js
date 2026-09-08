@@ -29,9 +29,11 @@ const { markdownToBlocks, dropRedundantEmpty } = minutes;
 // まだ無い版でも動くよう、無ければ素通しにする。
 const dropTemplateEcho = minutes.dropTemplateEcho || ((b) => b);
 const { normalizeSettings } = require('./settings');
+const { localDateISO } = require('./dates');
 const {
   saveIfExists, meetingDurationSec, promptTail,
   registerHotkeys, resolveStartupHotkeys, saveHotkeys, makeSummaryRunner, tickStep,
+  pasterScript, copyCommand,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -535,10 +537,8 @@ async function generateMinutes(plain, memo, onProgress, type) {
 function ensurePaster() {
   if (process.platform !== 'win32') return null;
   if (pasterProc && pasterProc.stdin && pasterProc.stdin.writable) return pasterProc;
-  const script = "$ErrorActionPreference='SilentlyContinue';"
-    + 'Add-Type -AssemblyName System.Windows.Forms;'
-    + 'while($true){ $l=[Console]::In.ReadLine(); if($null -eq $l){break};'
-    + " if($l -eq 'paste'){ [System.Windows.Forms.SendKeys]::SendWait('^v') } }";
+  // 貼り付け（paste）と、除外書式付きの置き直し（copy）を受ける（mainlib.pasterScript）
+  const script = pasterScript();
   try {
     pasterProc = spawn('powershell.exe', ['-NoProfile', '-STA', '-NonInteractive', '-Command', script],
       { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'] });
@@ -565,9 +565,33 @@ function simulatePaste() {
     }
   });
 }
+// クリップボードへ書く唯一の入口（#27）。Electron の clipboard で先に書き（これは
+// 必ず効く）、Windows では常駐 PowerShell に頼んで、クリップボード履歴（Win+V）と
+// クラウド同期から除外する書式を付けて置き直す（書式は mainlib.pasterScript）。
+// 置き直しに失敗しても本文は残る。'paste' と同じ標準入力に順に流すので、
+// 置き直しが貼り付けより後になることはない。
+function copyPrivate(text) {
+  const t = String(text ?? '');
+  clipboard.writeText(t);
+  if (process.platform !== 'win32') return;
+  const p = ensurePaster();
+  if (p && p.stdin && p.stdin.writable) {
+    try { p.stdin.write(`${copyCommand(t)}\n`); } catch (_) { /* noop */ }
+  }
+}
 async function deliverText(text) {
-  clipboard.writeText(text);
-  if (settings.autoPaste) { await new Promise((r) => setTimeout(r, 50)); await simulatePaste(); }
+  // 自動貼り付けのあとは元のクリップボードを戻す（文字列だったときだけ・できる範囲で）。
+  // 音声入力は「いま書いている場所へ入れる」道具なので、貼り付けた本文が
+  // クリップボードに残り続けると、直前にコピーしていたものが失われる。
+  let prev = '';
+  if (settings.autoPaste) { try { prev = clipboard.readText(); } catch (_) { prev = ''; } }
+  copyPrivate(text);
+  if (!settings.autoPaste) return;
+  await new Promise((r) => setTimeout(r, 50));
+  await simulatePaste();
+  // 貼り付け先がクリップボードを読む前に戻すと古い方が貼られる。SendWait は
+  // 処理完了まで待つが、読み取りが遅いアプリに備えて少し置いてから戻す。
+  if (prev && prev !== text) setTimeout(() => copyPrivate(prev), 500);
 }
 
 // ---------------------------------------------------------------- ウィンドウ
@@ -755,6 +779,9 @@ function meetingStatus() {
     paused: Boolean(meeting && meeting.paused),
     pausedMs: meeting ? meeting.pausedMs + (meeting.paused ? Date.now() - meeting.pausedAt : 0) : 0,
     systemAudio: Boolean(meeting && meeting.systemAudio),
+    // 選んだマイクが見つからず既定のマイクで録っている（overlay:mic）。黙って
+    // 別のマイクで録ると、会議が終わってから片側しか入っていないことに気づく
+    micFallback: Boolean(meeting && meeting.micFallback),
   };
 }
 
@@ -772,7 +799,8 @@ function recoverDraftIfAny() {
   const dt = new Date(d.startedAt || Date.now());
   const page = store.createPage({
     title: `${dt.getFullYear()}/${dt.getMonth() + 1}/${dt.getDate()} ${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')} の議事録（復旧）`,
-    date: dt.toISOString().slice(0, 10),
+    // 日付はローカルの暦日（#51。UTC で作ると日本の朝の会議が前日になる）
+    date: localDateISO(dt),
     durationSec: Math.round((d.offsetMs || 0) / 1000),
     memo: d.memo || '',
     blocks: [],
@@ -926,7 +954,7 @@ async function maybeFinalizeMeeting() {
   try {
     page = store.createPage({
       title: fallbackTitle,
-      date: dt.toISOString().slice(0, 10),
+      date: localDateISO(dt),   // ローカルの暦日（#51）
       durationSec, memo: m.memo, blocks: [],
       segments: m.segments,
       createdAt: dt.toISOString(),
@@ -1336,7 +1364,7 @@ function setupIpc() {
   ipcMain.handle('meeting:status', () => meetingStatus());
   ipcMain.handle('meeting:set-memo', (_e, memo) => { if (meeting) { meeting.memo = String(memo || ''); writeDraft(); } return true; });
 
-  ipcMain.handle('clipboard:copy', (_e, t) => { clipboard.writeText(String(t ?? '')); return true; });
+  ipcMain.handle('clipboard:copy', (_e, t) => { copyPrivate(String(t ?? '')); return true; });
   ipcMain.handle('app:test', async () => {
     if (!engineValid(whisperEng)) return { ok: false, error: 'whisper-server.exe またはモデルファイルのパスが正しくありません' };
     const ok = await ensureEngineReady(whisperEng);
@@ -1416,6 +1444,12 @@ function setupIpc() {
       meeting.paused = false;
       meeting.pausedMs += Date.now() - meeting.pausedAt;
     }
+    sendToMainWin('meeting:update', meetingStatus());
+  });
+  // 録音側が実際にどのマイクを掴んだか。設定のマイクが抜かれている・名前が
+  // 変わっている等で要求と合わなかったときだけ「代替中」にする（#56）。
+  ipcMain.on('overlay:mic', (_e, info) => {
+    if (meeting) meeting.micFallback = !!(info && info.requested && !info.matched);
     sendToMainWin('meeting:update', meetingStatus());
   });
   ipcMain.on('overlay:source', (_e, { systemAudio, wanted }) => {

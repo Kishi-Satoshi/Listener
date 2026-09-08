@@ -813,3 +813,39 @@ test('#18 テンプレートの写しを落とす結線（minutes.dropTemplateEc
   const gen = fnBody(code(main), 'async function generateMinutes', '\nfunction ensurePaster');
   assert.strictEqual((gen.match(/\$\{minutesTemplate\(type\)\}/g) || []).length, 2, 'プロンプト側がテンプレート関数を使っていない');
 });
+
+// ---------------------------------------------------------------- 第2段（D: 小さな直し）
+test('#51 議事録の日付はローカルの暦日で作る（UTC の toISOString で日付を作らない）', () => {
+  // 計算は src/dates.js の localDateISO（main.test.js で実行）。ここは結線だけ見る
+  const m = code(main);
+  assert.ok(!m.includes('toISOString().slice(0, 10)'), 'UTC の日付が残っている');
+  assert.match(m, /require\('\.\/dates'\)/, 'dates.js を読み込んでいない');
+  assert.strictEqual((m.match(/date: localDateISO\(dt\)/g) || []).length, 2, '復旧と保存の両方で使っていない');
+});
+
+test('#56 マイクの代替（要求したマイクが無く既定で録っている）を main が受けて画面へ渡す', () => {
+  assert.ok(preload.includes("  reportMic: (info) => ipcRenderer.send('overlay:mic', info),"), 'preload の reportMic が無い');
+  const m = code(main);
+  assert.match(m, /ipcMain\.on\('overlay:mic'/, 'main に受け口が無い');
+  const st = fnBody(m, 'function meetingStatus()', '\n}');
+  assert.ok(st.includes('micFallback'), 'meetingStatus に micFallback が無い');
+  const on = fnBody(m, "ipcMain.on('overlay:mic'", '\n  });');
+  assert.ok(on.includes('meeting.micFallback = !!(info && info.requested && !info.matched)'), '要求したのに合わなかった、を代替としていない');
+  assert.ok(on.includes("sendToMainWin('meeting:update', meetingStatus())"), '画面へ知らせていない');
+});
+
+test('#27 クリップボードへ書くのは copyPrivate だけ（履歴・クラウド同期から除外する）', () => {
+  // 除外書式そのものは mainlib.pasterScript（main.test.js で検査）。ここは
+  // 「書く入口が 1 つで、貼り付けもコピーもそこを通る」ことを見る
+  const m = code(main);
+  assert.strictEqual((m.match(/clipboard\.writeText\(/g) || []).length, 1, 'clipboard.writeText が copyPrivate 以外にもある');
+  const fn = fnBody(m, 'function copyPrivate(', '\n}');
+  assert.ok(fn.includes('clipboard.writeText('), 'copyPrivate が Electron で先に書いていない（PowerShell が無いと何も残らない）');
+  assert.ok(fn.includes('copyCommand('), '常駐 PowerShell に置き直しを頼んでいない');
+  assert.ok(fn.indexOf('clipboard.writeText(') < fn.indexOf('copyCommand('), '置き直しが Electron の書き込みより先にある');
+  const deliver = fnBody(m, 'async function deliverText(', '\n}');
+  assert.ok(deliver.includes('copyPrivate('), '自動貼り付けが copyPrivate を通っていない');
+  assert.ok(deliver.includes('clipboard.readText()'), '貼り付け後に戻す元の中身を読んでいない');
+  assert.match(m, /ipcMain\.handle\('clipboard:copy', \(_e, t\) => \{ copyPrivate\(/, '画面のコピーが copyPrivate を通っていない');
+  assert.ok(fnBody(m, 'function ensurePaster()', '\n}').includes('pasterScript()'), '常駐 PowerShell のスクリプトを mainlib から取っていない');
+});
