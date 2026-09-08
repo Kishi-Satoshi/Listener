@@ -74,6 +74,11 @@
     box-shadow: inset 0 1px 0 rgba(var(--srf),.6), var(--shadow-soft); }
   button.ghost:hover { background: rgba(var(--srf),.82); color: var(--ink); }
   button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* 一覧の行は div。Tab で辿れるようにしても、既定では今どこにいるか見えない */
+  .pitem:focus-visible, .actrow .src:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* 記録中に止めた欄。触れないことが見た目で分かるようにする */
+  button.ghost:disabled { opacity: .5; cursor: default; }
+  input:disabled, select:disabled, textarea:disabled { opacity: .55; cursor: not-allowed; }
 
   input[type="text"], select, textarea {
     background: rgba(var(--srf),.62); border: 1px solid rgba(var(--srf),.78);
@@ -386,7 +391,7 @@
             <button class="chip" id="fltActions">アクション</button>
             <button class="chip" id="fltFull">文字起こし検索</button>
           </div>
-          <div class="plist" id="plist"></div>
+          <div class="plist" id="plist" role="listbox" aria-label="議事録の一覧"></div>
         </aside>
 
         <div class="page" id="pageWrap">
@@ -711,6 +716,21 @@
     return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
   }
 
+  // 一覧の行（div）をキーボードでも扱えるようにする。Tab で辿れ（tabIndex）、
+  // 読み上げには選択肢として伝わり（role / aria-selected）、Enter か Space で開く。
+  // マウスの onclick は今までどおり。
+  function asOption(el, selected, open) {
+    el.tabIndex = 0;
+    el.setAttribute('role', 'option');
+    el.setAttribute('aria-selected', selected ? 'true' : 'false');
+    el.onclick = open;
+    el.onkeydown = (ev) => {
+      if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      ev.preventDefault();   // Space で一覧がスクロールしないように
+      open();
+    };
+  }
+
   // ================= 議事録: 一覧 =================
   async function refreshList() {
     const q = $('searchBox').value.trim();
@@ -791,7 +811,7 @@
     if (meta.childNodes.length) body.appendChild(meta);
     const src = document.createElement('div'); src.className = 'src';
     src.textContent = `${x.date} ${x.pageTitle}`;
-    src.onclick = () => openPage(x.pageId);
+    asOption(src, x.pageId === curId, () => openPage(x.pageId));
     body.appendChild(src);
     el.append(cb, body);
     return el;
@@ -828,7 +848,7 @@
         const sn = document.createElement('div'); sn.className = 'snip'; sn.textContent = p.snippet;
         el.appendChild(sn);
       }
-      el.onclick = () => openPage(p.id);
+      asOption(el, p.id === curId, () => openPage(p.id));
       box.appendChild(el);
     }
   }
