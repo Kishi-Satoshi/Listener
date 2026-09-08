@@ -484,6 +484,7 @@
             <label for="segmentSec">議事録の文字起こし間隔（秒）</label>
             <input type="text" id="segmentSec" />
             <div class="desc">短いほど早く画面に出ますが、文の切れ目が増えます（既定75秒。最初の1回は20秒）。</div>
+            <div class="desc ng lockNote" hidden>記録中はエンジンの設定を変更できません</div>
           </div>
           <div class="field">
             <label for="pillPos">録音バーの表示位置（表示中はドラッグでも移動できます）</label>
@@ -530,6 +531,7 @@
             <select id="language">
               <option value="ja">日本語</option><option value="en">英語</option><option value="auto">自動判定</option>
             </select>
+            <div class="desc ng lockNote" hidden>記録中はエンジンの設定を変更できません</div>
           </div>
           <label class="check"><input type="checkbox" id="autoPaste" />
             <span>文字起こし後、カーソル位置へ自動貼り付け</span></label>
@@ -559,6 +561,7 @@
         </div>
         <div class="card">
           <h2>文字起こしエンジン（whisper.cpp・オフライン）</h2>
+          <div class="field lockNote" hidden><div class="desc ng">記録中はエンジンの設定を変更できません</div></div>
           <div class="field">
             <label for="localServerExe">whisper-server.exe のパス</label>
             <div class="row">
@@ -606,6 +609,7 @@
         </div>
         <div class="card">
           <h2>要約エンジン（llama.cpp・オフライン）— 議事録の自動要約に使用</h2>
+          <div class="field lockNote" hidden><div class="desc ng">記録中はエンジンの設定を変更できません</div></div>
           <div class="field">
             <label for="sumServerExe">llama-server.exe のパス</label>
             <div class="row">
@@ -1405,6 +1409,18 @@
     if (e.key === 'Enter') { e.preventDefault(); $('pTitle').blur(); }
   };
 
+  // 記録中は main がエンジンに関わる設定の変更を受け付けない（変換の途中でエンジンが
+  // 再起動され、区間が失われる）。画面でも欄を止めて、理由を出す。
+  // 止める欄は main が記録中に前の値を保つキーと同じ。「参照…」も一緒に止める
+  //（押せてもパスを書けない）。
+  const ENGINE_KEYS = ['language', 'localThreads', 'sumThreads', 'useVad', 'suppressNst', 'localServerExe',
+    'localModelPath', 'vadModelPath', 'sumServerExe', 'sumModelPath', 'localPort', 'sumPort', 'segmentSec'];
+  const ENGINE_PICKERS = ['pickExeBtn', 'pickModelBtn', 'pickVadBtn', 'pickSumExeBtn', 'pickSumModelBtn'];
+  function lockEngineFields(locked) {
+    for (const id of [...ENGINE_KEYS, ...ENGINE_PICKERS]) $(id).disabled = locked;
+    for (const n of $('tabSettings').querySelectorAll('.lockNote')) n.hidden = !locked;
+  }
+
   // ---------------- 録音セッション ----------------
   function mtClock() {
     if (!mtStartedAt) return '0:00';
@@ -1427,6 +1443,7 @@
       renderList(); renderPage();
     }
     mtWasActive = Boolean(st.active);
+    lockEngineFields(Boolean(st.active));
     $('mtToggleBtn').textContent = st.finalizing ? '作成中…' : st.active ? '■ 終了して作成' : '● 記録開始';
     $('mtToggleBtn').disabled = Boolean(st.finalizing);
     $('mtDiscardBtn').style.display = st.active && !st.finalizing ? '' : 'none';
@@ -1799,6 +1816,17 @@
   // その空の値でディスク上の設定を上書きしてしまう。
   let settingsLoaded = false;
 
+  // 設定のキー → 入力欄。ほとんどは id がキーと同じで、違うものだけここに書く。
+  // main が採らなかった値を欄へ戻すときに使う（save の applied）。
+  const FIELD_IDS = { micId: 'micSelect', theme: 'themeSel' };
+  function setField(k, v) {
+    const el = $(FIELD_IDS[k] || k);
+    if (!el) return;
+    if (el.getAttribute('type') === 'checkbox') el.checked = Boolean(v);
+    else if (k === 'dictionary') el.value = (Array.isArray(v) ? v : [v]).join('\n');
+    else el.value = v;
+  }
+
   async function save(silent) {
     if (!settingsLoaded) {
       console.error('設定を読み込めていないため保存を中止しました');
@@ -1836,11 +1864,15 @@
     const m = $('saveMsg');
     if (r.ok) {
       settings = { ...settings, ...next };
-      // 登録できなかったホットキーは main が前の値に戻している。画面も同じ値に揃える。
-      // 揃えないと、以後の無関係な保存のたびに同じキーで失敗と警告を繰り返す。
-      if (r.applied) {
-        for (const k of ['hotkey', 'meetingHotkey']) {
-          if (typeof r.applied[k] === 'string' && r.applied[k]) { settings[k] = r.applied[k]; $(k).value = r.applied[k]; }
+      // main が採らなかった値（登録できなかったホットキー、記録中に変えられないエンジン設定）は
+      // applied に「実際に残った値」が入って返る。画面も同じ値に揃える。揃えないと、以後の
+      // 無関係な保存のたびに同じ値を送って同じ警告を繰り返す。
+      // 画面に欄の無いキーは触らない（送っていないものを戻す先が無い）。
+      if (r.applied && typeof r.applied === 'object') {
+        for (const [k, v] of Object.entries(r.applied)) {
+          if (v === undefined || v === null || !(k in next)) continue;
+          settings[k] = v;
+          setField(k, v);
         }
       }
       if (!silent) { m.textContent = '保存しました'; m.className = 'save-msg ok'; }
