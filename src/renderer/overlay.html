@@ -173,6 +173,8 @@
   let rafId = null;
   let micId = '';
   let soundOn = true;
+  // #56 選んだマイクが繋がっておらず、既定のマイクで代替して録っている
+  let micFallback = false;
   // #13 区間の送信順。切った区間の変換を待たずに次の区間を始めるので、複数の区間が
   // 同時に変換中になる。短い後の区間が先に変換し終えても、main には番号順に届ける
   // （main は届いた順に atMs を積み、直前の区間の末尾を次の文脈に使う）。
@@ -259,6 +261,10 @@
   // 「相手の声も」の表示が消えることがない。
   function recordingLabel() {
     if (paused) return '一時停止中';
+    // 選んだマイクが無く既定のマイクで録っているときは、それを最優先で出す（#56）。
+    // 相手の声の有無より、違うマイクで録っていることの方が録り直しに直結する。
+    // ピルは狭いので短く（全角14文字）。詳しい事情はメイン画面側（overlay:mic）が出す。
+    if (micFallback) return mode === 'meeting' ? '記録中（既定のマイクで代替）' : '聞き取り中（既定のマイク）';
     if (mode !== 'meeting') return '聞き取り中…';
     if (!sysWanted) return '議事録を記録中';
     return sysOn ? '記録中（相手の声も）' : '記録中（マイクのみ）';
@@ -363,6 +369,27 @@
     return s;
   }
 
+  // #56 選んだマイクで開けたかを見る。deviceId は { ideal } で渡しているので、選んだ機器が
+  // 抜けていると Chromium は黙って既定のマイクで開く。実際に開いたトラックの deviceId を
+  // 選んだ id と比べ、違えば「代替中」と扱ってピル（recordingLabel）と main（overlay:mic）に
+  // 伝える。機器名（ラベル）は送らない。getSettings が無い／deviceId を返さない実装では
+  // 判定できないので、合っていると扱う（誤警告を出さない）。
+  function checkMicChoice() {
+    let got = '';
+    try {
+      const t = micStream && micStream.getAudioTracks ? micStream.getAudioTracks()[0] : null;
+      const s = t && typeof t.getSettings === 'function' ? t.getSettings() : null;
+      if (s && typeof s.deviceId === 'string') got = s.deviceId;
+    } catch (_) { got = ''; }
+    const requested = Boolean(micId);
+    // 'default' を選んでいるときは、実機の id が返っても既定で録れているので代替ではない
+    micFallback = requested && micId !== 'default' && got !== '' && got !== micId;
+    // preload がまだ公開していない版でも録音は止めない
+    if (typeof window.koeOverlay.reportMic === 'function') {
+      window.koeOverlay.reportMic({ requested, matched: !micFallback });
+    }
+  }
+
   async function openStream() {
     // 相手の声を先に取る。ユーザー操作とみなされる有効時間が短いため、
     // マイクのデバイスオープンを待ってからでは間に合わないことがある。
@@ -381,6 +408,7 @@
     if (micId) audio.deviceId = { ideal: micId };
     // マイクは必須。ここが失敗したら start() が握って中止する。
     micStream = await navigator.mediaDevices.getUserMedia({ audio });
+    checkMicChoice();   // 開き直すたびに見る（一時停止→再開の間に機器が抜き差しされる）
 
     audioCtx = new AudioContext();
     audioCtx.resume().catch(() => {});
@@ -500,6 +528,7 @@
     paused = false; pausedAt = 0; pausedMs = 0;
     segClosing = null;    // 前回の締めが残っていると、一時停止中の終了が何も送らなくなる
     session++;            // 前の録音の区間（まだ変換待ち）が、この録音のマイクや区間に触らないための印
+    micFallback = false;  // openStream が開いたトラックを見て決め直す
     pill.classList.remove('paused');
     shownLabel = '';
     firstSegDone = false;

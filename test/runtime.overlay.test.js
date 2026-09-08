@@ -364,3 +364,69 @@ test('先に切った区間の変換が後から終わっても、区間は切�
   assert.deepStrictEqual(log.called('sendSegment').map((c) => c.args[2]), [false, false, true], '最後の印が最後の区間だけに1回付いていない');
 });
 
+/*
+ * preload はこの作業木ではまだ reportMic / onSegmentMs を公開していない。
+ * simrun の偽 IPC は preload から名前を読むので、契約どおりの行を足した preload を渡す
+ * （runtime.app.test.js の preloadWithHotkey と同じ手）。preload が追いついたらそのまま通る。
+ */
+const PRELOAD_SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'preload.js'), 'utf8');
+function 拡張preload() {
+  let s = PRELOAD_SRC;
+  const head = "exposeInMainWorld('koeOverlay', {";
+  assert.ok(s.includes(head), 'preload の koeOverlay が見つからない');
+  if (!/^\s{2}reportMic:/m.test(s)) s = s.replace(head, `${head}\n  reportMic: (info) => ipcRenderer.send('overlay:mic', info),`);
+  if (!/^\s{2}onSegmentMs:/m.test(s)) s = s.replace(head, `${head}\n  onSegmentMs: (cb) => ipcRenderer.on('overlay:segment-ms', (_e, ms) => cb(ms)),`);
+  return s;
+}
+
+/*
+ * #56 選んだマイクが無い。deviceId: { ideal } なので、選んだ機器が抜けていると Chromium は
+ * 黙って既定のマイクで録る。開いたトラックの deviceId を見て、違えば代替中と扱い、
+ * main（overlay:mic）とピルに出す。機器名（ラベル）は送らない。
+ */
+function マイクを(deviceId) {
+  return (log) => {
+    log.window.navigator.mediaDevices.getUserMedia = () => {
+      const s = 偽ストリーム();
+      s.track.getSettings = () => ({ deviceId, channelCount: 1 });
+      return Promise.resolve(s);
+    };
+  };
+}
+
+test('選んだマイクが無く既定のマイクで開いたときは、代替中を main とピルに伝える', async () => {
+  const { log } = await 議事録を開始({ load: { preloadSrc: 拡張preload() }, setup: マイクを('other'), start: { micId: 'chosen' } });
+  assert.deepStrictEqual(log.called('reportMic').map((c) => c.args[0]), [{ requested: true, matched: false }],
+    '選んだマイクと違うマイクで開いたことが main に伝わっていない（機器名を送ってもいけない）');
+  const label = log.byId.get('status').textContent;
+  assert.ok(/既定のマイク/.test(label), `ピルに代替中と出ない: ${label}`);
+  assert.ok(label.length <= 15, `ピルの文言が長すぎる（全角15文字ほどが限度）: ${label}`);
+  // 開き直すたびに1回。一時停止→再開でマイクを開き直したら、また報告する
+  log.byId.get('pauseBtn').click();
+  await log.drain();
+  log.byId.get('pauseBtn').click();
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '一時停止・再開で例外');
+  assert.strictEqual(log.called('reportMic').length, 2, 'マイクを開き直したのに報告し直していない');
+  assert.ok(/既定のマイク/.test(log.byId.get('status').textContent), '再開後のピルに代替中と出ない');
+});
+
+test('選んだマイクで開けたとき・マイクを選んでいないときは、合っていると伝え、ピルは通常の文言', async () => {
+  const 合致 = await 議事録を開始({ load: { preloadSrc: 拡張preload() }, setup: マイクを('chosen'), start: { micId: 'chosen' } });
+  assert.deepStrictEqual(合致.log.called('reportMic').map((c) => c.args[0]), [{ requested: true, matched: true }]);
+  assert.ok(!/既定のマイク/.test(合致.log.byId.get('status').textContent), '合っているのに代替中と出る');
+  const 未選択 = await 議事録を開始({ load: { preloadSrc: 拡張preload() }, setup: マイクを('default'), start: { micId: '' } });
+  assert.deepStrictEqual(未選択.log.called('reportMic').map((c) => c.args[0]), [{ requested: false, matched: true }]);
+  assert.ok(!/既定のマイク/.test(未選択.log.byId.get('status').textContent), '選んでいないのに代替中と出る');
+  // getSettings が無い／deviceId を返さない実装では判定できないので、合っていると扱う（誤警告を出さない）
+  const 不明 = await 議事録を開始({ load: { preloadSrc: 拡張preload() }, setup: (l) => { マイクを数える(l); }, start: { micId: 'chosen' } });
+  assert.deepStrictEqual(不明.log.called('reportMic').map((c) => c.args[0]), [{ requested: true, matched: true }]);
+  assert.ok(!/既定のマイク/.test(不明.log.byId.get('status').textContent), '判定できないのに代替中と出る');
+});
+
+test('preload に reportMic が無くても、録音は例外なく始まり、ピルの代替表示は出る', async () => {
+  const { log } = await 議事録を開始({ setup: マイクを('other'), start: { micId: 'chosen' } });
+  assert.deepStrictEqual(log.errors.map(fmt), []);
+  assert.ok(/既定のマイク/.test(log.byId.get('status').textContent), 'ピルの代替表示は preload に依らず出る');
+});
+
