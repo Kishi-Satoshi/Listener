@@ -337,11 +337,13 @@ test('音声入力の WAV 変換に失敗すると、エラーを1回だけ伝�
  * 変換は裏で続ける。送る順は区間の番号で守る（短い後の区間が先に変換し終えても
  * 先に届かない。main は届いた順に atMs を積む）。
  */
-/** overlay の Date.now() をテストが進める時計に差し替える（with(window) 経由で引かれる） */
-function 時計(log, t0 = 1_700_000_000_000) {
-  let t = t0;
-  log.window.Date = { now: () => t };
-  return { now: () => t, 進める(ms) { t += ms; return t; } };
+/**
+ * overlay の Date.now() を進める（simrun の偽の時計 log.clock）。ここの 進める は時限
+ * （setTimeout）を発火させない＝画面が隠れて setTimeout が間引かれた状態。区切りの見張り
+ * （onTick）を検査するための時計。時限まで進めるときは log.clock.advance(ms) を使う。
+ */
+function 時計(log) {
+  return { now: () => log.clock.now, 進める(ms) { return log.clock.jump(ms); } };
 }
 /** WAV 変換を呼ばれた順に個別に止める。戻り値の配列の要素を呼ぶと、その変換だけ進む */
 function 変換を個別に待たせる(log) {
@@ -364,6 +366,60 @@ async function 議事録を開始(opt = {}) {
   assert.strictEqual(log.recorders.length, 1, '最初の区間の recorder が始まっていない（検査が空振り）');
   return { log, clock };
 }
+
+/*
+ * #37 区間長そのもの。最初の区間は FIRST_SEG_MS（20 秒）、以後は設定の segmentSec 秒。
+ * これまで時計を進めるテストは区切りの「見張り」（onTick）だけを通していて、setTimeout の
+ * 期限で自動に切れる本線に時間軸が無かった。segmentSec * 1000 の * 1000 を消しても
+ * 全件が緑だった（最初の 20 秒だけ残り、以後が 75 ミリ秒ごとに細切れになる壊れ方）。
+ */
+/** 区間が「最初 FIRST_SEG → 以後 segMs」の長さで、時限が来ると自動に切れて順に届くことを見る */
+async function 時限で切れる区間を見る(segmentSec) {
+  const segMs = segmentSec * 1000;
+  const { log } = await 議事録を開始({ start: { segmentSec } });
+  const 届いた = () => log.called('sendSegment').map((c) => [c.args[1], c.args[2]]);
+  await log.clock.advance(FIRST_SEG - 1);
+  assert.strictEqual(log.recorders.length, 1, `最初の区間が ${FIRST_SEG} ms より前に切られている`);
+  await log.clock.advance(1);
+  assert.strictEqual(log.recorders.length, 2, `最初の区間が ${FIRST_SEG} ms で切られない（setTimeout の期限で自動に切れていない）`);
+  assert.strictEqual(log.recorders[1].state, 'recording', '2 つ目の区間が録っていない');
+  await log.drain();
+  assert.deepStrictEqual(届いた(), [[FIRST_SEG, false]], '最初の区間が 20 秒の長さで途中の印で届いていない');
+  await log.clock.advance(segMs - 1);
+  assert.strictEqual(log.recorders.length, 2, `2 つ目の区間が設定の ${segmentSec} 秒より前に切られている（segmentSec の単位が壊れている疑い）`);
+  await log.clock.advance(1);
+  assert.strictEqual(log.recorders.length, 3, `2 つ目の区間が設定の ${segmentSec} 秒で切られない`);
+  await log.drain();
+  await log.clock.advance(segMs);
+  assert.strictEqual(log.recorders.length, 4, `3 つ目の区間が設定の ${segmentSec} 秒で切られない`);
+  await log.drain();
+  assert.deepStrictEqual(届いた(), [[FIRST_SEG, false], [segMs, false], [segMs, false]],
+    `区間が ${FIRST_SEG} → ${segMs} → ${segMs} ms の長さで順に届いていない`);
+  log.fire('onStop');
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '例外');
+  assert.deepStrictEqual(log.called('sendSegment').map((c) => c.args[2]), [false, false, false, true], '最後の印が最後の区間だけに付いていない');
+  assert.strictEqual(log.recorders.length, 4, '終了で区間が余計に始まっている');
+  return log;
+}
+
+test('区間は最初 20 秒（FIRST_SEG_MS）、以後は設定の 75 秒で、setTimeout の期限が来ると自動に切れて順に届く', async () => {
+  await 時限で切れる区間を見る(75);
+});
+
+test('設定の segmentSec が 120 なら、2 つ目からの区間は 120 秒で切れる（75 秒の決め打ちではない）', async () => {
+  await 時限で切れる区間を見る(120);
+});
+
+test('偽の時計は、進めた時間のぶんだけ Date.now と経過表示が進む（時間軸の検査そのものが空振りしていない）', async () => {
+  const { log } = await 議事録を開始();
+  const t0 = log.clock.now;
+  assert.ok(log.clock.pending().some((t) => t.at === t0 + FIRST_SEG && !t.every), '最初の区間の時限（20 秒）が登録されていない');
+  assert.ok(log.clock.pending().some((t) => t.every === 250), '経過表示の setInterval（250ms）が登録されていない');
+  await log.clock.advance(61_500);
+  assert.strictEqual(log.clock.now - t0, 61_500, '時計が進んでいない');
+  assert.strictEqual(log.byId.get('timer').textContent, '1:01', '経過表示が偽の時計に追従していない');
+});
 
 test('区切りの見張りで区間を切ると、変換を待たずに次の区間が始まる', async () => {
   let 変換を進める;

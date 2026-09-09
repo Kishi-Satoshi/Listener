@@ -162,7 +162,26 @@ async function load(htmlPath, opt = {}) {
 
   /* ---- 画面まわりの最小スタブ ---- */
   const noop = () => {};
-  const timers = new Set();
+  /*
+   * 偽の時計と時限（#37）。setTimeout / setInterval は記録するだけで、進めなければ発火しない
+   * （以前と同じ）。log.clock.advance(ms) が期限の来たものを順に発火し、Date.now もこの
+   * 時計に追従する。log.clock.jump(ms) は発火させずに時刻だけ進める＝画面が隠れて
+   * setTimeout が間引かれた状態（区切りの見張り onTick はそのために在る）。
+   */
+  const clockState = { now: opt.now === undefined ? Date.now() : opt.now };
+  const timerQ = new Map();   // id -> { fn, args, at, every }
+  let timerSeq = 0;
+  const addTimer = (fn, ms, every, args) => {
+    const id = ++timerSeq;
+    const delay = Math.max(0, Number(ms) || 0);
+    timerQ.set(id, { fn, args, at: clockState.now + delay, every: every ? Math.max(1, delay) : 0 });
+    return id;
+  };
+  // Date.now だけを偽の時計に向けた Date。new Date() も追従し、それ以外は本物のまま
+  class FakeDate extends Date {
+    constructor(...a) { super(...(a.length ? a : [clockState.now])); }
+    static now() { return clockState.now; }
+  }
   const rafQ = [];
   let rafId = 0;
   let rafLeft = opt.frames === undefined ? 4 : opt.frames;   // 描画ループは有限回だけ回す
@@ -250,9 +269,11 @@ async function load(htmlPath, opt = {}) {
 
   const window = Object.assign(win, {
     document,
-    setTimeout: (fn, ms) => { const id = setTimeout(noop, 0); timers.add(id); return id; },
-    clearTimeout: (id) => { clearTimeout(id); timers.delete(id); },
-    setInterval: () => 0, clearInterval: noop,
+    setTimeout: (fn, ms, ...args) => addTimer(fn, ms, false, args),
+    clearTimeout: (id) => { timerQ.delete(id); },
+    setInterval: (fn, ms, ...args) => addTimer(fn, ms, true, args),
+    clearInterval: (id) => { timerQ.delete(id); },
+    Date: FakeDate,
     requestAnimationFrame: (fn) => { if (rafLeft > 0) { rafLeft--; rafQ.push(fn); } return ++rafId; },
     cancelAnimationFrame: () => { rafQ.length = 0; },
     addEventListener: noop, removeEventListener: noop,
@@ -286,14 +307,14 @@ async function load(htmlPath, opt = {}) {
   if (!scripts.length) throw new Error(`${htmlPath}: 実行できる <script> が無い（検査が空振りしている）`);
   const names = ['window','document','navigator','console','setTimeout','clearTimeout','setInterval','clearInterval',
     'requestAnimationFrame','cancelAnimationFrame','AudioContext','webkitAudioContext','MediaRecorder','Blob','Option',
-    'alert','confirm','prompt','getComputedStyle','matchMedia','self','location'];
+    'alert','confirm','prompt','getComputedStyle','matchMedia','self','location','Date'];
   for (const s of scripts) {
     try {
       const fn = new Function(...names, `with (window) {\n${s._raw}\n}\n//# sourceURL=${mark}`);
       fn(window, document, window.navigator, console2, window.setTimeout, window.clearTimeout, window.setInterval,
         window.clearInterval, window.requestAnimationFrame, window.cancelAnimationFrame, window.AudioContext,
         window.webkitAudioContext, window.MediaRecorder, window.Blob, window.Option, window.alert, window.confirm,
-        window.prompt, window.getComputedStyle, window.matchMedia, window, window.location);
+        window.prompt, window.getComputedStyle, window.matchMedia, window, window.location, window.Date);
     } catch (e) { log.errors.push(e); }
   }
   for (let i = 0; i < 60; i++) {
@@ -301,7 +322,29 @@ async function load(htmlPath, opt = {}) {
     const fn = rafQ.shift();
     if (fn) { try { fn(i); } catch (e) { log.errors.push(e); } }
   }
-  for (const id of timers) clearTimeout(id);
+
+  /** 偽の時計。now / advance(ms): 期限の来た時限を順に発火して進める / jump(ms): 発火させずに進める */
+  log.clock = {
+    get now() { return clockState.now; },
+    async advance(ms) {
+      const target = clockState.now + Math.max(0, Number(ms) || 0);
+      for (let fired = 0; ; fired++) {
+        let next = null;
+        for (const [id, t] of timerQ) if (t.at <= target && (!next || t.at < next.t.at)) next = { id, t };   // 同時刻は登録順
+        if (!next) break;
+        if (fired >= 100000) { log.errors.push(new Error(`時限が止まらない（advance(${ms}) の間に発火が 10 万回を超えた）`)); break; }
+        clockState.now = Math.max(clockState.now, next.t.at);
+        if (next.t.every) next.t.at += next.t.every; else timerQ.delete(next.id);
+        try { next.t.fn(...next.t.args); } catch (e) { log.errors.push(e); }
+        await new Promise((r) => setImmediate(r));   // 実機と同じく、時限の間で非同期（onstop など）が進む
+      }
+      clockState.now = target;
+      return clockState.now;
+    },
+    jump(ms) { clockState.now += Math.max(0, Number(ms) || 0); return clockState.now; },
+    /** まだ発火していない時限（期限の昇順） */
+    pending: () => [...timerQ.entries()].map(([id, t]) => ({ id, at: t.at, every: t.every })).sort((a, b) => a.at - b.at || a.id - b.id),
+  };
 
   log.window = window;
   log.document = document;
