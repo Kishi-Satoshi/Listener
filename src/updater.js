@@ -7,6 +7,9 @@
  *    ネットワーク環境で更新のたびに失敗しかねないため。
  *  - 適用前に必ず現行の src/ をバックアップする。
  *    展開途中で落ちるとアプリが起動しなくなるので、戻せる状態を残す。
+ *  - zip の package.json の engines.electron を、src/ を差し替える前に確かめる（#34）。
+ *    exe（Electron 本体）は更新 zip では入れ替わらない。新しい src/ が今の Electron で
+ *    動かなければ、当てた瞬間に起動しなくなり、復旧口（更新画面）ごと消える。
  *  - オフライン運用が前提なので、繋がらない時は静かに諦める。
  */
 'use strict';
@@ -47,15 +50,45 @@ function log(userDataPath, line) {
   } catch (_) { /* noop */ }
 }
 
+/** '1.2.3' / 'v1.2.3' / '1.2.3-beta.1' を数の配列にする（プレリリースは切り捨て） */
+const versionParts = (v) => String(v).trim().replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
+
 /** '1.2.3' 同士を比較。a が新しければ 1 */
 function cmpVersion(a, b) {
-  const pa = String(a).replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
-  const pb = String(b).replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pa = versionParts(a);
+  const pb = versionParts(b);
   for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
     const x = pa[i] || 0; const y = pb[i] || 0;
     if (x !== y) return x > y ? 1 : -1;
   }
   return 0;
+}
+
+/**
+ * version が range を満たすか（#34 互換ゲート用の小さな判定。semver は入れない）。
+ * 支えるのは `>=x.y.z`、`^x.y.z`、`x.y.z`、空（= 制約なし）だけ。
+ * それ以外の書き方は「満たさない」と返す。黙って通すと門が無いのと同じになるため。
+ * `^` は同じメジャーの範囲（0.x はマイナーまで、0.0.x はパッチまで固定）。
+ */
+function satisfiesRange(version, range) {
+  const r = String(range == null ? '' : range).trim();
+  if (!r) return true;
+  const m = r.match(/^(>=|\^)?\s*v?(\d+)\.(\d+)\.(\d+)$/);
+  if (!m) return false;
+  const v = String(version == null ? '' : version).trim();
+  if (!/^v?\d+\.\d+\.\d+/.test(v)) return false;
+  const base = `${m[2]}.${m[3]}.${m[4]}`;
+  const c = cmpVersion(v, base);
+  if (m[1] === '>=') return c >= 0;
+  if (m[1] === '^') {
+    if (c < 0) return false;
+    const [major, minor] = versionParts(v);
+    const [bMajor, bMinor] = versionParts(base);
+    if (bMajor > 0) return major === bMajor;
+    if (bMinor > 0) return major === 0 && minor === bMinor;
+    return c === 0;
+  }
+  return c === 0;
 }
 
 /**
@@ -157,13 +190,22 @@ function rmrf(p) {
 /**
  * 更新を適用する。appRoot は package.json のあるフォルダ。
  * 失敗時はバックアップから自動で復旧する。
+ *
+ * opts.electronVersion … 今動いている Electron の版。省略時は process.versions.electron。
+ *   取れないとき（Electron の外: テスト・解析）は engines の検査をしない。
  */
-async function apply(url, appRoot, userDataPath, onProgress) {
+async function apply(url, appRoot, userDataPath, onProgress, opts) {
   // 一時フォルダの作成も try の中で行う。ここで投げると呼び出し側は
   // { ok:false } ではなく例外を受け取り、画面のボタンが押せないまま残る。
   let work = '';
   const srcDir = path.join(appRoot, 'src');
   const backup = path.join(appRoot, `src.backup-${Date.now()}`);
+  const electronVersion = (opts && Object.prototype.hasOwnProperty.call(opts, 'electronVersion'))
+    ? opts.electronVersion
+    : process.versions.electron;
+  // Windows PowerShell 5.1 の Set-Content -Encoding UTF8 は BOM を付ける。
+  // BOM が残ったままだと JSON.parse が投げ、version が永久に上がらない。
+  const readJson = (f) => JSON.parse(fs.readFileSync(f, 'utf8').replace(/^\uFEFF/, ''));
 
   try {
     work = fs.mkdtempSync(path.join(os.tmpdir(), 'listener-up-'));
@@ -190,6 +232,24 @@ async function apply(url, appRoot, userDataPath, onProgress) {
       if (!fs.existsSync(path.join(newSrc, must))) throw new Error(`更新ファイルが不完全です（${must} がありません）`);
     }
 
+    // 新しい package.json を先に読む（engines の検査と、後の version 更新に使う）。
+    // 読めなくても更新自体は止めない（version の更新が飛ぶだけ。従来どおり記録は残す）。
+    const newPkg = path.join(path.dirname(newSrc), 'package.json');
+    let nxt = null;
+    if (fs.existsSync(newPkg)) {
+      try { nxt = readJson(newPkg); } catch (e) {
+        log(userDataPath, `package.json in update unreadable: ${e.message}`);
+      }
+    }
+
+    // 互換ゲート（#34）: 新しい src/ が必要とする Electron を、差し替える前に確かめる。
+    // exe は更新 zip で入れ替わらないので、合わない zip を当てると次の起動で落ち、
+    // 更新画面（復旧口）ごと消える。Electron の版が取れないときは検査しない。
+    const range = nxt && nxt.engines && nxt.engines.electron;
+    if (electronVersion && range && !satisfiesRange(electronVersion, range)) {
+      throw new Error(`更新 ${nxt.version || '?'} には Electron ${String(range).trim()} が必要です（今は ${electronVersion}）。インストーラーで入れ直してください`);
+    }
+
     if (onProgress) onProgress('適用しています…');
     if (fs.existsSync(srcDir)) fs.renameSync(srcDir, backup);
     try {
@@ -209,19 +269,12 @@ async function apply(url, appRoot, userDataPath, onProgress) {
       throw e;
     }
 
-    // package.json の version も更新（あれば）
-    const newPkg = path.join(path.dirname(newSrc), 'package.json');
-    if (fs.existsSync(newPkg)) {
+    // package.json の version も更新（あれば。nxt は差し替え前に読んである）
+    if (nxt && nxt.version) {
       try {
-        // Windows PowerShell 5.1 の Set-Content -Encoding UTF8 は BOM を付ける。
-        // BOM が残ったままだと JSON.parse が投げ、version が永久に上がらない。
-        const readJson = (f) => JSON.parse(fs.readFileSync(f, 'utf8').replace(/^\uFEFF/, ''));
         const cur = readJson(path.join(appRoot, 'package.json'));
-        const nxt = readJson(newPkg);
-        if (nxt.version) {
-          cur.version = nxt.version;
-          fs.writeFileSync(path.join(appRoot, 'package.json'), JSON.stringify(cur, null, 2), 'utf8');
-        }
+        cur.version = nxt.version;
+        fs.writeFileSync(path.join(appRoot, 'package.json'), JSON.stringify(cur, null, 2), 'utf8');
       } catch (e) {
         // version の更新は必須ではないが、黙って落とすと「更新しても版が上がらない」
         // という分かりにくい状態になるため記録は残す
@@ -244,4 +297,4 @@ async function apply(url, appRoot, userDataPath, onProgress) {
   }
 }
 
-module.exports = { check, apply, cmpVersion, REPO };
+module.exports = { check, apply, cmpVersion, satisfiesRange, REPO };

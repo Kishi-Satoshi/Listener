@@ -16,6 +16,15 @@
 #  3. release/v0.8.1 という名前のブランチを push する
 #       タグの push を通さないプロキシ環境のための逃げ道。
 #       公開できたらこのブランチは自動で消す。
+#
+# 公開の順序（#33）:
+#   release ジョブは zip と ps1 を添付した「draft」を作るだけで、公開しない。
+#   installer ジョブ（Windows）が exe を添付できてから draft を解いて latest にする。
+#   先に latest にすると、installer が失敗したとき exe の無いリリースが latest の
+#   まま残り、配布先は setup.exe を落とせないのに誰も気付けない。
+#   draft の間は releases/latest に出ないので、アプリの更新確認には前の版が
+#   出続ける（新しい版が見えない）。installer が失敗したら draft のまま残るので、
+#   Actions の要約（赤い見出し）を見て再実行するか、Releases で draft を確かめること。
 name: release
 
 on:
@@ -41,8 +50,11 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # draft の作成と添付
     outputs:
       tag: ${{ steps.ver.outputs.tag }}
+      cleanup: ${{ steps.ver.outputs.cleanup }} # 公開後に消す一時ブランチ（無ければ空）
     steps:
       - uses: actions/checkout@v4
         with:
@@ -80,6 +92,7 @@ jobs:
           echo "TAG=$TAG" >> "$GITHUB_ENV"
           echo "CLEANUP=$CLEANUP" >> "$GITHUB_ENV"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "cleanup=$CLEANUP" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG / package.json=$VER"
 
       # 追加のnpm依存は無いので install は不要（テストは Node 同梱のランナー）
@@ -135,8 +148,10 @@ jobs:
           echo '--- リリース本文 ---'
           cat "$RUNNER_TEMP/notes.md"
 
-      # 作り直しでも落ちないようにする（本文の直しや添付のやり直しができる）
-      - name: リリースを公開
+      # ここでは公開しない（draft のまま）。公開は installer ジョブが exe を
+      # 添付できてから行う（draft を解いて latest にする）。--latest もここでは付けない。
+      # 作り直しでも落ちないようにする（本文の直しや添付のやり直しができる）。
+      - name: リリースを draft で作る（zip と ps1 を添付）
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -148,22 +163,22 @@ jobs:
           # 動かない（エンジンが要る）。渡した相手がリポジトリを触らずに
           # 揃えられるよう、リリースページから直接落とせるようにしておく。
           SETUP="get-installer.ps1 setup-local-engine.ps1 setup-summarizer.ps1"
+          # gh はタグ名で draft も見つける（公開済みでなくても view/edit/upload が効く）
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "既存のリリースを更新します: $TAG"
+            echo "既存のリリースを更新します: $TAG（installer が exe を確かめるまで draft に戻す）"
+            # zip を差し替えた状態が exe の確認前に見えないよう、公開済みでも draft に戻す。
+            # installer ジョブの最後で必ず公開（draft 解除・latest）に戻す。
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --latest
+              --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --draft
             gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$ZIP" $SETUP
           else
-            # タグが無ければ gh がこのコミットに作る。
-            # --latest を外すとアプリ側の releases/latest から外れるので必ず付ける。
+            # タグが無ければ、公開（draft 解除）のときに gh/GitHub が --target のコミットに作る。
+            # 一時ブランチはタグができるまで消せないので、削除は公開後（installer ジョブ）で行う。
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" --title "$TAG" \
-              --notes-file "$RUNNER_TEMP/notes.md" --latest "$ZIP" $SETUP
+              --notes-file "$RUNNER_TEMP/notes.md" --draft "$ZIP" $SETUP
           fi
-
-      - name: 一時ブランチを片付ける
-        if: success() && env.CLEANUP != ''
-        run: git push origin --delete "$CLEANUP"
+          echo "draft を作りました: $TAG（exe を添付できたら installer ジョブが公開します）"
 
   # インストーラーは Windows ランナーで作る。
   # electron-builder が取ってくる winCodeSign には macOS 用のシンボリックリンクが
@@ -172,10 +187,16 @@ jobs:
   # ここで作って Release に添付する。配布先はこれを落として入れるだけでよい。
   #
   # 更新は軽量zip（数百KB）で配るので、この exe を落とすのは初回だけ。
+  #
+  # このジョブが release を公開する（draft を解いて latest にする）。
+  # exe を添付できるまで公開しないので、失敗すれば draft のまま残る。
   installer:
     needs: release
     runs-on: windows-latest
+    permissions:
+      contents: write # exe の添付・draft の解除・一時ブランチの削除に必要
     steps:
+      # 履歴は要らない（ビルドと、最後の一時ブランチ削除だけ）。既定の浅い取得でよい。
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -220,3 +241,47 @@ jobs:
         run: |
           ls -l dist/*.exe
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" dist/*-setup.exe
+
+      # exe が揃ったので公開する。「既に添付されている」経路（作り直さない）でも
+      # release ジョブが draft に戻しているので、ここで必ず解く。
+      # ここで初めて releases/latest に出る。アプリの更新確認はここから新しい版を見る。
+      - name: 公開する（draft を解いて latest にする）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        shell: bash
+        run: |
+          # 念のため exe の添付をもう一度見る（grep -q は pipefail と組むと早閉じで誤るので読み切る）
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' | grep -- '-setup\.exe$' >/dev/null \
+            || { echo "::error::$TAG に setup.exe が添付されていません。公開しません（draft のまま）"; exit 1; }
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          echo "公開しました: $TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      # ここまでのどこかで失敗したら、release は draft のまま残っている。
+      # draft は releases/latest に出ないので、配布先には前の版が見え続ける。
+      # 見落とすと「更新が来ない」だけの静かな故障になるので、要約に赤く出す。
+      - name: 失敗を要約に出す（draft のまま）
+        if: failure()
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        shell: bash
+        run: |
+          echo "::error::$TAG は公開されていません（draft のまま）。installer ジョブを再実行するか、Releases の draft を確かめてください"
+          {
+            echo "## ❌ 公開されていません（draft のまま）"
+            echo ""
+            echo "- リリース \`$TAG\` は draft のまま残っています。\`releases/latest\` には出ないので、配布先には前の版が見え続けます。"
+            echo "- このワークフローを再実行するか、Releases ページで draft を確かめてください。"
+            echo "- 一時ブランチ \`release/v*\` を使った場合、そのブランチは消していません。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 一時ブランチ release/v* は「公開できた後」に消す。
+      # draft の間はタグが無いので、先に消すとコミットが宙に浮く。
+      # 削除にコミット履歴は要らない（checkout は浅いまま。資格情報だけ使う）。
+      - name: 一時ブランチを片付ける
+        if: success() && needs.release.outputs.cleanup != ''
+        env:
+          CLEANUP: ${{ needs.release.outputs.cleanup }}
+        shell: bash
+        run: git push origin --delete "$CLEANUP"

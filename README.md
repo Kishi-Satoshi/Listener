@@ -231,6 +231,13 @@ git push origin v0.8.1
 [設定] → [アップデート] に表示されます。
 タグと `package.json` のバージョンが食い違うとワークフローが止まります。
 
+Release はまず **draft** として作られ（zip と ps1 を添付）、Windows ランナーで
+`Listener-<版>-setup.exe` を添付できてから公開（latest）になります。
+exe の添付に失敗すると draft のまま残り、Actions の要約に赤い見出し
+「公開されていません（draft のまま）」が出ます。draft の間は `releases/latest` に
+出ないので、各PCの更新確認には前の版が出続けます（新しい版が見えないだけで、壊れはしません）。
+そのときはワークフローを再実行するか、Releases ページで draft を確かめてください。
+
 タグを push できない環境（プロキシが `refs/tags` を拒否する等）では、
 Actions 画面の **Run workflow**、または `release/v0.8.1` という名前の
 ブランチを push しても同じ結果になります（そのブランチは公開後に自動で消えます）。
@@ -245,6 +252,12 @@ powershell -ExecutionPolicy Bypass -File .\make-release.ps1 -Version 0.8.1
 
 適用前に現行の `src/` を `src.backup-*` として退避するので、
 展開に失敗しても起動できなくなることはありません（1世代だけ残します）。
+
+更新 zip では exe（Electron 本体）は入れ替わりません。zip の `package.json` の
+`engines.electron`（例: `>=31.3.0`）を `src/` を差し替える**前に**確かめ、今の Electron が
+満たさなければ「更新 x.y.z には Electron >=… が必要です。インストーラーで入れ直してください」
+で止めます（何も書き換えません）。Electron を上げる版を出すときは `devDependencies.electron`
+と `engines.electron` を一緒に上げ、インストーラーで入れ直してもらう前提で案内してください。
 
 ## デグレを止める仕組み
 
