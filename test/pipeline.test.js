@@ -208,3 +208,76 @@ test('表で出た数値行に出典が付く', () => {
   assert.strictEqual(citeStat.total, 2);
   assert.strictEqual(citeStat.linked, 2);
 });
+
+// ---------------------------------------------------------------- 文字起こしのやり直し（#4）
+// 旧世代（s6 が誤認識）から作った要約は、その誤認識の文言で書かれている。新世代（直った
+// 文字起こし）に対して出典を付け直しても、その要点は同じ id（s6）を指し、他の要点は
+// 新世代だけで付けた結果と 1 文字も変わらない。
+test('やり直した文字起こしに対しても、旧文言の要点が同じ区間を指し、他の要点は動かない', () => {
+  const { attachCitationsAcross } = require('../src/cite');
+  const BROKEN = '再曜の往復は今月八名でした。位置面接まで済んだのが参名です。';
+  const oldGen = STANDUP_SEGMENTS.map((s) => (s.id === 's6' ? { ...s, text: BROKEN } : s));
+  // 旧世代から作った要約: 採用の行だけ誤認識の文言を写している
+  const md = STANDUP_SUMMARY_MD.replace('- 今月の応募は8名、一次面接まで進んだのが3名、内定は0名。', '- 再曜の往復は今月八名。');
+  assert.notStrictEqual(md, STANDUP_SUMMARY_MD, '置換対象の行が要約に無い');
+
+  const plain = runPipeline(md, STANDUP_SEGMENTS, BASE);   // 新世代だけで付けた結果
+  const blocks = dropRedundantEmpty(markdownToBlocks(md));
+  enrichActionBlocks(blocks, BASE);
+  const stat = attachCitationsAcross(blocks, STANDUP_SEGMENTS, oldGen);
+
+  const find = (bs) => bs.find((b) => b.type === 'bullet' && b.text.includes('再曜の往復'));
+  assert.deepStrictEqual(find(plain.blocks).cites, [], '前提が崩れた（新世代だけで旧文言の要点に出典が付いている）');
+  assert.deepStrictEqual(find(blocks).cites, ['s6'], `旧文言の要点が s6 を指さない: ${JSON.stringify(find(blocks).cites)}`);
+  for (const b of blocks) {
+    if (b === find(blocks)) continue;
+    const same = plain.blocks.find((x) => x.text === b.text && x.type === b.type);
+    assert.ok(same, `比較対象の行が見つからない: ${b.text}`);
+    assert.deepStrictEqual(b.cites || [], same.cites || [], `旧世代の混入で無関係な要点「${b.text}」の出典が動いた`);
+  }
+  const ids = new Set(STANDUP_SEGMENTS.map((s) => s.id));
+  for (const b of blocks) for (const c of b.cites || []) assert.ok(ids.has(c), `存在しない id ${c}`);
+  assert.strictEqual(stat.total, plain.citeStat.total);
+  assert.strictEqual(stat.linked, plain.citeStat.linked + 1);
+});
+
+// ---------------------------------------------------------------- 複数の発言をまとめた要点（#2）
+// モデルは 2〜3 の発言を 1 行にまとめることがある。要点1行の被覆率では各発言が 1/3 しか
+// 覆えず出典が 1 つ（か 0）になっていた。節ごとに照合して全ての発言を指す。
+// 節が 1 つの行は要点1行の照合（matchOne）と 1 文字も変わらない。
+test('3つの発言をまとめた要点に3つ全ての出典が付き、節が1つの要点は要点1行の照合と同じ', () => {
+  const { matchOne, buildIndex, splitClauses, citeText } = require('../src/cite');
+  const line = '- 結合テストは完了したが、在庫連携のバッチは目標未達で、リリース日は11月15日で確定した';
+  const md = STANDUP_SUMMARY_MD.replace('## 決定事項\n', `## 決定事項\n${line}\n`);
+  assert.notStrictEqual(md, STANDUP_SUMMARY_MD, '差し込む見出しが要約に無い');
+  const plain = runPipeline(STANDUP_SUMMARY_MD, STANDUP_SEGMENTS, BASE);
+  const { blocks, citeStat } = runPipeline(md, STANDUP_SEGMENTS, BASE);
+
+  const merged = blocks.find((b) => b.type === 'bullet' && b.text.startsWith('結合テストは完了したが'));
+  assert.ok(merged, '差し込んだ要点が見つからない');
+  assert.strictEqual(splitClauses(merged.text).length, 3);
+  for (const id of ['s2', 's3']) assert.ok(merged.cites.includes(id), `${id} が無い: ${JSON.stringify(merged.cites)}`);
+  assert.ok(merged.cites.some((c) => c === 's9' || c === 's10'), `リリース日の発言が無い: ${JSON.stringify(merged.cites)}`);
+  assert.ok(merged.cites.length <= 4);
+  // 要点1行の照合ではこの行に 3 つは付かなかった（付くならこの機能は要らない）
+  const idx = buildIndex(STANDUP_SEGMENTS);
+  assert.ok(matchOne(merged.text, idx).length < 3, '前提が崩れた（要点1行の照合で3つに届いている）');
+
+  // 他の行: 節が1つなら matchOne と同じ。全ての行で、差し込みの前後で出典が動かない
+  for (const b of blocks) {
+    if ((b.type !== 'bullet' && b.type !== 'todo') || b === merged) continue;
+    const same = plain.blocks.find((x) => x.type === b.type && x.text === b.text);
+    assert.ok(same, `比較対象の行が見つからない: ${b.text}`);
+    assert.deepStrictEqual(b.cites, same.cites, `差し込みで無関係な要点「${b.text}」の出典が動いた`);
+    if (splitClauses(b.text).length === 1) {
+      assert.deepStrictEqual(b.cites, matchOne(citeText(b), idx).map((h) => h.id), `節が1つの行が matchOne と違う: ${b.text}`);
+    }
+  }
+  for (const text of STANDUP_UNGROUNDED) {
+    assert.deepStrictEqual(blocks.find((x) => x.text === text).cites, [], `根拠の無い行に出典が付いた: ${text}`);
+  }
+  const ids = new Set(STANDUP_SEGMENTS.map((s) => s.id));
+  for (const b of blocks) for (const c of b.cites || []) assert.ok(ids.has(c), `存在しない id ${c}`);
+  assert.strictEqual(citeStat.total, plain.citeStat.total + 1);
+  assert.strictEqual(citeStat.linked, plain.citeStat.linked + 1);
+});
