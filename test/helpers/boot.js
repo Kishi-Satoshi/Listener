@@ -91,13 +91,16 @@ function boot(file, opts = {}) {
 
   const scripts = tree.nodes.filter((n) => n.tag === 'script' && n.text && !n.attrs.src);
   const keys = Object.keys(sandbox);
-  for (const s of scripts) {
+  // 各 <script> に sourceURL の印（app.html#1 など）を付ける。非同期に落ちた例外（unhandledRejection）の
+  // スタックにこの印が残るので、world.js がどの画面の何本目かを見分けられる（#39）
+  const mark = path.basename(file);
+  scripts.forEach((s, n) => {
     try {
       // eslint-disable-next-line no-new-func
-      const fn = new Function(...keys, s.text);
+      const fn = new Function(...keys, `${s.text}\n//# sourceURL=${mark}#${n + 1}`);
       fn(...keys.map((k) => sandbox[k]));
     } catch (e) { errors.push(`${file} の <script>(${s.line}行) で例外: ${e && e.message}`); }
-  }
+  });
   // マイクロタスクを消化する（await の続きで落ちるものを拾う）
   const drain = async () => { for (let i = 0; i < 50; i++) await Promise.resolve(); };
 

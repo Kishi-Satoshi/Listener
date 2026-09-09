@@ -56,10 +56,21 @@ function world() {
   const run = {};
   for (const k of Object.keys(screens)) {
     const un = [];
-    const onUn = (e) => un.push(String((e && e.message) || e));
+    // boot.js が各 <script> に付ける印（app.html#1 など）。印のある例外はその画面にだけ記録し、
+    // 印の無い例外（Error でない値など）は画面を特定できないので全画面に記録する（#39）
+    const mark = `${path.basename(screens[k].rel)}#`;
+    let interacted = false;   // 起動後にテストが操作した後の例外は「起動時の例外」ではない
+    const onUn = (e) => {
+      if (interacted) return;
+      const st = String((e && e.stack) || '');
+      if (/\.html#\d+/.test(st) && !st.includes(mark)) return;
+      const at = (st.match(/([\w.-]+\.html#\d+):(\d+)/) || [])[0];
+      un.push(`${String((e && e.message) || e)}${at ? `（${at} 行）` : ''}`);
+    };
     process.on('unhandledRejection', onUn);
     const r = boot(screens[k].rel, { replies: REPLIES });
     r.unhandled = un;
+    for (const fn of ['fire', 'fireAll']) { const orig = r[fn]; r[fn] = (...a) => { interacted = true; return orig.apply(r, a); }; }
     r._off = () => process.removeListener('unhandledRejection', onUn);
     run[k] = r;
   }

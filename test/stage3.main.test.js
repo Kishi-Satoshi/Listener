@@ -168,9 +168,9 @@ test('#29 フォルダ選択（pickFile(\'folder\)）と pages:actionView の結
   assert.match(pick, /return res\.canceled \? '' : \(res\.filePaths\[0\] \|\| ''\);/, 'フォルダ選択の戻り値がパスか \'\' になっていない');
   assert.match(m, /ipcMain\.handle\('pages:actionView', \(_e, \{ q, assignee \} = \{\}\) => store\.actionView\(\{ q, assignee \}\)\)/);
   assert.ok(preload.includes("  pagesActionView: ({ q, assignee }) => ipcRenderer.invoke('pages:actionView', { q, assignee }),"), 'preload の pagesActionView が無い（書式込み）');
-  // 既存の openActions / assigneeList は残す（app が使わなくなったら統合時に外す）
-  assert.ok(preload.includes("  openActions: () => ipcRenderer.invoke('pages:openActions'),"));
-  assert.ok(preload.includes("  assigneeList: () => ipcRenderer.invoke('pages:assignees'),"));
+  // app が使わなくなったので、統合で openActions / assigneeList は preload と main から外した
+  assert.ok(!preload.includes('openActions:') && !preload.includes('assigneeList:'), '使われない openActions / assigneeList が preload に残っている');
+  assert.ok(!m.includes("'pages:openActions'") && !m.includes("'pages:assignees'"), '使われない handle が main に残っている');
   assert.match(m, /ipcMain\.handle\('pages:searchFull', \(_e, q\) => store\.searchFullText\(q \|\| '', 60\)\)/, 'pages:searchFull は store の戻り値をそのまま返す');
 });
 
@@ -315,4 +315,81 @@ test('#58 トレイに「エンジンを停止（メモリを解放）」があ�
   assert.match(m, /function engineChanged\(\) \{ if \(!quitting\) updateTray\(\); \}/);
   assert.ok(fnBody(m, 'function stopEngine(eng)', '\n}').includes('engineChanged()'), '停止でトレイを更新していない');
   assert.strictEqual((fnBody(m, 'function startEngine(eng)', '\nfunction stopEngine').match(/engineChanged\(\)/g) || []).length, 2, '起動と exit でトレイを更新していない');
+});
+
+// ---------------------------------------------------------------- #54 貼り付け先の確認（判断）
+const { pasterScript, parsePasterLine } = require('../src/mainlib');
+
+test('pasterScript: fg（前面ウィンドウの HWND）と paste <hwnd>（同じなら貼る）の命令がある。P/Invoke は user32 の 1 つだけ', () => {
+  const s = pasterScript();
+  assert.ok(s.includes("-eq 'fg'"), 'fg の命令が無い');
+  assert.ok(s.includes("StartsWith('paste ')"), 'paste <hwnd> の命令が無い');
+  assert.ok(s.includes("-eq 'paste'"), '従来の paste（確認なし）が消えている');
+  assert.ok(s.includes("StartsWith('copy ')"), 'copy が消えている');
+  // P/Invoke: Add-Type -TypeDefinition で user32 の GetForegroundWindow を 1 つだけ
+  assert.strictEqual((s.match(/Add-Type -TypeDefinition/g) || []).length, 1);
+  assert.strictEqual((s.match(/DllImport/g) || []).length, 1, 'P/Invoke が 1 つでない');
+  assert.ok(s.includes('user32.dll') && s.includes('GetForegroundWindow()'), 'user32 の GetForegroundWindow でない');
+  // -Command の引数として渡すので、引用符の扱いで壊れないよう二重引用符は使わず、1 行に収める
+  assert.ok(!s.includes('"'), '二重引用符がある（powershell.exe -Command の引数で壊れうる）');
+  assert.ok(!s.includes('\n'), '改行がある');
+  // HWND は 10 進で標準出力に 1 行。応答は ok / mismatch / fail
+  assert.ok(s.includes('[Console]::Out.WriteLine([string][long]'), 'HWND を 10 進の文字列で出していない');
+  for (const r of ["'ok'", "'mismatch'", "'fail'"]) assert.ok(s.includes(`[Console]::Out.WriteLine(${r})`), `応答 ${r} を標準出力に出していない`);
+  // 前面が違えば何もしない（SendWait しない）。fg が取れなければ 0
+  const branch = s.slice(s.indexOf("StartsWith('paste ')"), s.indexOf("StartsWith('copy ')"));
+  assert.ok(branch.indexOf('-eq $l.Substring(6)') < branch.indexOf("SendWait('^v')"), '前面を確かめる前に貼っている');
+  assert.ok(branch.includes("else { [Console]::Out.WriteLine('mismatch') }"), '違うときに mismatch を返していない');
+  assert.ok(s.includes("catch { [Console]::Out.WriteLine('0') }"), 'fg が取れないときに 0 を返していない');
+  // PS5.1 で動く書き方（既存の検査と同じ）
+  assert.ok(!/\bswitch\b/.test(s) && !/ValidateSet/.test(s));
+});
+
+test('parsePasterLine: HWND（10 進）・ok・mismatch・fail を読み、それ以外は null。0 は「控えられなかった」', () => {
+  assert.deepStrictEqual(parsePasterLine('1970442'), { kind: 'hwnd', value: '1970442' });
+  assert.deepStrictEqual(parsePasterLine('1970442\r'), { kind: 'hwnd', value: '1970442' }, 'CRLF の \\r を落としていない');
+  assert.deepStrictEqual(parsePasterLine('0'), { kind: 'hwnd', value: '' }, 'HWND 0（前面なし）を控えている');
+  assert.deepStrictEqual(parsePasterLine('ok'), { kind: 'ok' });
+  assert.deepStrictEqual(parsePasterLine('mismatch\r'), { kind: 'mismatch' });
+  assert.deepStrictEqual(parsePasterLine(' fail '), { kind: 'fail' });
+  assert.strictEqual(parsePasterLine(''), null);
+  assert.strictEqual(parsePasterLine('Exception calling ...'), null);
+  assert.strictEqual(parsePasterLine('12ab'), null);
+  assert.strictEqual(parsePasterLine(null), null);
+});
+
+// ---------------------------------------------------------------- #54 貼り付け先の確認（結線）
+test('#54 常駐 PowerShell の標準出力を行ごとに読み、命令ごとの応答を待てる', () => {
+  const m = code(main);
+  const ens = fnBody(m, 'function ensurePaster()', '\n}');
+  assert.ok(ens.includes("stdio: ['pipe', 'pipe', 'ignore']"), '標準出力を pipe にしていない');
+  assert.ok(ens.includes("p.stdout.on('data'"), '標準出力を読んでいない');
+  assert.ok(ens.includes('parsePasterLine(line)'), '行の読み方を mainlib.parsePasterLine で行っていない');
+  assert.ok(ens.includes('pasterWaiters.shift()'), '応答を待っている順（FIFO）に渡していない');
+  assert.ok(ens.includes('w.resolve(null)'), 'PowerShell が居なくなったとき待っている人を解放していない');
+  const ask = fnBody(m, 'function askPaster(cmd, timeoutMs)', '\n}');
+  assert.ok(ask.includes('pasterWaiters.push(w)') && ask.includes('setTimeout(() => w.resolve(null), timeoutMs)'), '時間切れで null にしていない');
+  assert.ok(ask.includes('p.stdin.write(`${cmd}\\n`)'), '命令を 1 行で送っていない');
+  assert.match(m, /const FG_REPLY_MS = 300;/);
+  assert.match(m, /const PASTE_REPLY_MS = 1500;/);
+});
+
+test('#54 録音開始で前面ウィンドウを控え、貼り付けは控えた HWND 付きで送る。違えば貼らずに知らせる', () => {
+  const m = code(main);
+  const start = fnBody(m, 'function startRecording()', '\n}');
+  assert.ok(start.includes("dictationFg = askPaster('fg', FG_REPLY_MS).then((r) => (r && r.kind === 'hwnd' ? r.value : ''))"), '録音開始で fg を送って控えていない');
+  const paste = fnBody(m, 'function simulatePaste(hwnd)', '\n}');
+  assert.ok(paste.includes("askPaster(hwnd ? `paste ${hwnd}` : 'paste', PASTE_REPLY_MS)"), '控えた HWND があるとき paste <hwnd> で送っていない');
+  assert.ok(paste.includes("resolve(r && r.kind !== 'hwnd' ? r.kind : 'unknown')"), "応答を 'ok'|'mismatch'|'fail'|'unknown' に直していない");
+  assert.ok(paste.includes("resolve(err ? 'fail' : 'ok')"), '常駐が居ないときの一回きりの貼り付けが結果を返していない');
+  assert.strictEqual((paste.match(/resolve\('unknown'\)/g) || []).length, 2, 'Windows 以外は unknown（従来どおり貼れたものとして扱う）');
+  const deliver = fnBody(m, 'async function deliverText(', '\n}');
+  assert.ok(deliver.includes('const hwnd = await dictationFg;'), '控えた HWND を使っていない');
+  assert.ok(deliver.includes('const result = await simulatePaste(hwnd);'));
+  assert.ok(deliver.includes("if (result === 'mismatch') { sendToMainWin('app:notice', '貼り付け先が変わったため、クリップボードに残しました（Ctrl+V で貼り付けられます）'); return result; }"), 'mismatch の知らせ方が違う');
+  assert.ok(deliver.includes("if (result === 'fail') { sendToMainWin('app:notice', '自動貼り付けに失敗しました。クリップボードに残しています'); return result; }"), 'fail の知らせ方が違う');
+  // 貼れなかったときはクリップボードを戻さない（本文が残っていることが救い）
+  assert.ok(deliver.indexOf("result === 'fail'") < deliver.indexOf('restoreAfterPaste(prev, text)'), '貼れなかったのに元のクリップボードを戻している');
+  // 既存の契約: 書く入口は copyPrivate だけ（repo.test.js #27 が見る）。ここでは deliverText が先に置くことだけ
+  assert.ok(deliver.indexOf('await copyPrivate(text)') < deliver.indexOf('simulatePaste(hwnd)'));
 });

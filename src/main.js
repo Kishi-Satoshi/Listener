@@ -38,7 +38,7 @@ const { localDateISO } = require('./dates');
 const {
   saveIfExists, meetingDurationSec, promptTail,
   registerHotkeys, resolveStartupHotkeys, saveHotkeys, makeSummaryRunner, tickStep,
-  pasterScript, copyCommand,
+  pasterScript, copyCommand, parsePasterLine,
   engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs, nextSegmentMs, EtaTracker,
@@ -154,6 +154,12 @@ function updatePowerBlock() {
   }
 }
 let pasterProc = null;
+// 常駐 PowerShell の応答を待っている人（送った順に受け取る。mainlib.parsePasterLine）
+const pasterWaiters = [];
+// 音声入力を始めたときの前面ウィンドウ（HWND）。貼り付け先が変わっていれば貼らない（#54）
+let dictationFg = Promise.resolve('');
+const FG_REPLY_MS = 300;      // fg の応答待ち。常駐が起動中なら間に合わず ''（従来どおり確認なしで貼る）
+const PASTE_REPLY_MS = 1500;  // paste の応答待ち。無応答なら貼れたものとして扱う（unknown）
 let programmaticMove = false;
 let recoveredPageId = null;
 
@@ -748,15 +754,46 @@ async function generateMinutes(plain, memo, onProgress, type) {
 function ensurePaster() {
   if (process.platform !== 'win32') return null;
   if (pasterProc && pasterProc.stdin && pasterProc.stdin.writable) return pasterProc;
-  // 貼り付け（paste）と、除外書式付きの置き直し（copy）を受ける（mainlib.pasterScript）
+  // 貼り付け（paste / paste <hwnd>）、前面の問い合わせ（fg）、除外書式付きの置き直し（copy）を
+  // 受ける（mainlib.pasterScript）。応答は標準出力に 1 行ずつ、命令を送った順に返る
   const script = pasterScript();
   try {
-    pasterProc = spawn('powershell.exe', ['-NoProfile', '-STA', '-NonInteractive', '-Command', script],
-      { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'] });
-    pasterProc.on('exit', () => { pasterProc = null; });
-    pasterProc.on('error', () => { pasterProc = null; });
+    const p = spawn('powershell.exe', ['-NoProfile', '-STA', '-NonInteractive', '-Command', script],
+      { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+    pasterProc = p;
+    let buf = '';
+    p.stdout.on('data', (d) => {
+      buf += d.toString();
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        const r = parsePasterLine(line);
+        if (!r) continue;   // エラー文などは応答ではない
+        const w = pasterWaiters.shift();
+        if (w) w.resolve(r);
+      }
+    });
+    const gone = () => {
+      if (pasterProc === p) pasterProc = null;
+      while (pasterWaiters.length) { const w = pasterWaiters.shift(); w.resolve(null); }
+    };
+    p.on('exit', gone);
+    p.on('error', gone);
   } catch (_) { pasterProc = null; }
   return pasterProc;
+}
+// 常駐 PowerShell に命令を 1 行送り、応答（parsePasterLine の結果）を待つ。常駐が居ない・
+// 時間切れ・居なくなった、は null
+function askPaster(cmd, timeoutMs) {
+  const p = ensurePaster();
+  if (!p || !p.stdin || !p.stdin.writable) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let done = false;
+    const w = { resolve: (r) => { if (done) return; done = true; const i = pasterWaiters.indexOf(w); if (i >= 0) pasterWaiters.splice(i, 1); resolve(r); } };
+    pasterWaiters.push(w);
+    setTimeout(() => w.resolve(null), timeoutMs);
+    try { p.stdin.write(`${cmd}\n`); } catch (_) { w.resolve(null); }
+  });
 }
 // トレイの「終了」も、閉じるボタンと同じく記録中・要約中は確かめる（mainlib.closeConfirm）。
 // トレイからは会議の状態が見えないので、閉じるボタンより間違えやすい
@@ -775,18 +812,23 @@ function quitFromTray() {
 function stopPaster() {
   if (pasterProc) { try { pasterProc.stdin.end(); pasterProc.kill(); } catch (_) { /* noop */ } pasterProc = null; }
 }
-function simulatePaste() {
+// Ctrl+V を送る。戻り値は 'ok' | 'mismatch'（前面が hwnd と違うので貼らなかった）| 'fail' |
+// 'unknown'（確かめる手段が無い。従来どおり貼れたものとして扱う）
+function simulatePaste(hwnd) {
   return new Promise((resolve) => {
     if (process.platform === 'win32') {
       const p = ensurePaster();
-      if (p && p.stdin.writable) { p.stdin.write('paste\n'); setTimeout(resolve, 30); return; }
+      if (p && p.stdin.writable) {
+        askPaster(hwnd ? `paste ${hwnd}` : 'paste', PASTE_REPLY_MS).then((r) => resolve(r && r.kind !== 'hwnd' ? r.kind : 'unknown'));
+        return;
+      }
       execFile('powershell.exe', ['-NoProfile', '-STA', '-NonInteractive', '-Command',
         "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')"],
-      { windowsHide: true }, () => resolve());
+      { windowsHide: true }, (err) => resolve(err ? 'fail' : 'ok'));
     } else if (process.platform === 'darwin') {
-      execFile('osascript', ['-e', 'tell application "System Events" to keystroke "v" using command down'], () => resolve());
+      execFile('osascript', ['-e', 'tell application "System Events" to keystroke "v" using command down'], () => resolve('unknown'));
     } else {
-      execFile('xdotool', ['key', '--clearmodifiers', 'ctrl+v'], () => resolve());
+      execFile('xdotool', ['key', '--clearmodifiers', 'ctrl+v'], () => resolve('unknown'));
     }
   });
 }
@@ -829,8 +871,14 @@ async function deliverText(text) {
   await copyPrivate(text);
   if (!settings.autoPaste) return;
   await new Promise((r) => setTimeout(r, 50));
-  await simulatePaste();
+  // 貼り付け先は録音を始めたときの前面ウィンドウ（#54）。文字起こしの間に通知や Teams が
+  // 前へ出ていると、そこへ口述が流れ込む。違えば貼らずクリップボードに残す
+  const hwnd = await dictationFg;
+  const result = await simulatePaste(hwnd);
+  if (result === 'mismatch') { sendToMainWin('app:notice', '貼り付け先が変わったため、クリップボードに残しました（Ctrl+V で貼り付けられます）'); return result; }
+  if (result === 'fail') { sendToMainWin('app:notice', '自動貼り付けに失敗しました。クリップボードに残しています'); return result; }
   if (restoreAfterPaste(prev, text)) setTimeout(() => { copyPrivate(prev).catch(() => {}); }, RESTORE_DELAY_MS);
+  return result;
 }
 
 // ---------------------------------------------------------------- ウィンドウ
@@ -937,6 +985,8 @@ function startRecording() {
   }
   ensureEngineReady(whisperEng);
   state = 'recording';
+  // いま前にある窓が貼り付け先。オーバーレイを出す前に控える（#54）
+  dictationFg = askPaster('fg', FG_REPLY_MS).then((r) => (r && r.kind === 'hwnd' ? r.value : ''));
   positionOverlay();
   overlayWin.showInactive();
   sendToOverlay('overlay:start', { mode: 'dictation', micId: settings.micId || '', sound: Boolean(settings.soundFeedback) });
@@ -1840,8 +1890,6 @@ function setupIpc() {
 
   ipcMain.handle('pages:search', (_e, q) => store.searchIndex(q || ''));
   ipcMain.handle('pages:searchFull', (_e, q) => store.searchFullText(q || '', 60));
-  ipcMain.handle('pages:openActions', () => store.openActions());
-  ipcMain.handle('pages:assignees', () => store.assigneeList());
   // アクション一覧（絞り込み込み）。store.actionView の戻り値 { actions, people, total } をそのまま返す
   ipcMain.handle('pages:actionView', (_e, { q, assignee } = {}) => store.actionView({ q, assignee }));
   // データ保存先（#29）。isDefault は「既定の場所 <userData>/data のまま」

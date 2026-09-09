@@ -454,7 +454,10 @@ test('データ保存先: 「要約を再生成」の最中も止め、終われ
 });
 
 test('データ保存先: dataDirGet / dataDirMove の無い古い preload と組んでも、設定画面は生きて押しても落ちない', async () => {
-  const l = await load(APP);
+  // preload は追いついたので、古い preload はここで作る（当該の行を落とす）
+  const old = fs.readFileSync(path.join(__dirname, '..', 'src', 'preload.js'), 'utf8').replace(/^\s{2}(dataDirGet|dataDirMove):.*\n/gm, '');
+  assert.ok(!/dataDirMove/.test(old), '前提: 古い preload に dataDirMove が残っている');
+  const l = await load(APP, { preloadSrc: old });
   assert.deepStrictEqual(l.errors.map(fmt), []);
   assert.deepStrictEqual(l.consoleErrors, []);
   移動ボタン(l).dispatchEvent({ type: 'click' });

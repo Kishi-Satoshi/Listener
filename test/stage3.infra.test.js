@@ -129,3 +129,63 @@ test('#38 pre-commit を実際に走らせる: ゲート→テストの順、落
   assert.deepStrictEqual(skip.calls, ['node'], 'LISTENER_SKIP_TESTS=1 なのに npm test が走っている');
   assert.match(skip.out, /npm test を飛ばして commit する/);
 });
+
+// ---------------------------------------------------------------- #39 非同期の例外の印 / #40 台帳の一本化
+test('#39 boot.js は各 <script> に sourceURL の印を付け、world.js は印で画面を見分け、RUN-07 がそれを見る', () => {
+  const boot = fs.readFileSync(path.join(ROOT, 'test', 'helpers', 'boot.js'), 'utf8');
+  assert.ok(boot.includes('//# sourceURL=${mark}#${n + 1}'), 'boot.js が sourceURL の印を付けていない');
+  const world = fs.readFileSync(path.join(ROOT, 'test', 'helpers', 'world.js'), 'utf8');
+  assert.ok(world.includes("const mark = `${path.basename(screens[k].rel)}#`;") && world.includes('!st.includes(mark)) return;'), 'world.js が印で画面を見分けていない');
+  const inv = require('../test/invariants');
+  const run07 = inv.INVARIANTS.find((x) => x.id === 'RUN-07');
+  assert.ok(run07, 'RUN-07 が無い');
+  // 計器が無ければ空振りとして赤になる
+  assert.deepStrictEqual(run07.check({ run: { app: {} } }).length, 1);
+  // 印の付いた非同期の例外は、その画面の名前で報告される
+  const v = run07.check({ run: { app: { unhandled: ['x is not a function（app.html#1:12 行）'] }, overlay: { unhandled: [] } } });
+  assert.strictEqual(v.length, 1); assert.match(v[0], /^app: /); assert.match(v[0], /app\.html#1/);
+});
+
+test('#39 本物の画面で、起動時の非同期の例外が RUN-07 に画面の名前で出る（app.html に仕込んで確かめ、元に戻す）', () => {
+  const file = path.join(ROOT, 'src', 'renderer', 'app.html');
+  const orig = fs.readFileSync(file, 'utf8');
+  const i = orig.lastIndexOf('</script>');
+  assert.ok(i > 0);
+  const mutated = `${orig.slice(0, i)}\n(async () => { throw new Error('起動時の非同期の例外（検査用）'); })();\n${orig.slice(i)}`;
+  const { execFileSync } = require('node:child_process');
+  fs.writeFileSync(file, mutated, 'utf8');
+  let out = '';
+  try {
+    out = execFileSync(process.execPath, ['-e', `
+      const w = require(${JSON.stringify(path.join(ROOT, 'test', 'helpers', 'world.js'))}).world();
+      setTimeout(() => {
+        const inv = require(${JSON.stringify(path.join(ROOT, 'test', 'invariants.js'))}).INVARIANTS.find((x) => x.id === 'RUN-07');
+        console.log(JSON.stringify(inv.check(w)));
+      }, 50);`], { cwd: ROOT, encoding: 'utf8' });
+  } finally { fs.writeFileSync(file, orig, 'utf8'); }
+  const v = JSON.parse(out.trim().split('\n').pop());
+  assert.strictEqual(v.length, 1, `app だけが1件になっていない: ${JSON.stringify(v)}`);
+  assert.match(v[0], /^app: .*起動時の非同期の例外（検査用）/);
+  assert.match(v[0], /app\.html#\d+/, '何本目のスクリプトかの印が無い');
+});
+
+test('#40 地雷台帳は tools/lib/mines.js の1本で、invariants.js はそれを使う（roundedCorners は true だけ・filter は blur|drop-shadow・opacity あり）', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'test', 'invariants.js'), 'utf8');
+  assert.ok(src.includes("require('../tools/lib/mines')"), 'invariants.js が台帳を require していない');
+  assert.ok(!/\{ key: 'backgroundThrottling', ng:/.test(src) && !/\{ prop: 'box-shadow', ng:/.test(src), 'invariants.js に自前の表が残っている（2重化）');
+  const MINES = require('../tools/lib/mines');
+  const inv = require('../test/invariants');
+  assert.strictEqual(inv.TRANSPARENT_WINDOW_MINES.length, MINES.windowOpts.length - 1, 'transparent 以外の全行が invariants に写っていない');
+  assert.strictEqual(inv.TRANSPARENT_CSS_MINES.length, MINES.css.length);
+  const rc = MINES.windowOpts.find((m) => m.key === 'roundedCorners');
+  assert.strictEqual(rc.bad('true'), true); assert.strictEqual(rc.bad('false'), false, 'roundedCorners:false を踏んだ扱いにしている');
+  const op = MINES.windowOpts.find((m) => m.key === 'opacity');
+  assert.ok(op && op.bad('0.9'), 'opacity が台帳に無い');
+  const fl = MINES.css.find((m) => m.prop === 'filter');
+  assert.ok(fl.bad('blur(4px)') && fl.bad('drop-shadow(0 0 2px #000)') && !fl.bad('brightness(1.1)'));
+  // ゲートと同じ意味: hasShadow は未指定も踏んだ扱い、他は書いてあるときだけ
+  const hs = inv.TRANSPARENT_WINDOW_MINES.find((m) => m.key === 'hasShadow');
+  assert.strictEqual(hs.ng(undefined), true); assert.strictEqual(hs.ng('false'), false);
+  const bt = inv.TRANSPARENT_WINDOW_MINES.find((m) => m.key === 'backgroundThrottling');
+  assert.strictEqual(bt.ng(undefined), false); assert.strictEqual(bt.ng('false'), true);
+});

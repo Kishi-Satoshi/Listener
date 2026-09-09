@@ -150,3 +150,46 @@ test('#34 package.json の engines.electron が devDependencies.electron と揃�
   const { satisfiesRange } = require('../src/updater');
   assert.strictEqual(satisfiesRange(dev, range), true, '同梱している Electron 自身が engines を満たさない');
 });
+
+// ---------------------------------------------------------------- 文書（#29 / #58）
+/** Markdown の "## 見出し" から次の "## " までを返す（無ければ ''） */
+function section(md, heading) {
+  const i = md.indexOf(`\n${heading}\n`);
+  if (i < 0) return '';
+  const rest = md.slice(i + 1);
+  const j = rest.indexOf('\n## ');
+  return j < 0 ? rest : rest.slice(0, j);
+}
+
+test('#29 README の「データ保存先」に、設定で変えられる・Roaming の注意・元は消さない・segbuf は従来の場所、が書いてある', () => {
+  const sec = section(read('README.md'), '## データ保存先');
+  assert.ok(sec, 'README に「## データ保存先」が無い');
+  // 既存テスト（READMEのデータ保存先が実際の保存先と一致する）が見ている文字列は残す
+  assert.ok(sec.includes('%APPDATA%\\listener'), '既定の保存先 %APPDATA%\\listener が節から消えた');
+  assert.ok(/既定は[^\n]*今まで通り|今まで通り[^\n]*既定/.test(sec), '既定が今まで通りであることが書いていない');
+  assert.ok(/保存先を変更/.test(sec), '設定の「保存先を変更…」で変えられることが書いていない');
+  assert.ok(/Roaming/.test(sec) && /同期/.test(sec), 'Roaming 配下がプロファイル同期で複製されうる注意が無い');
+  assert.ok(/%LOCALAPPDATA%/.test(sec), '%LOCALAPPDATA% 配下へ移せることが書いていない');
+  assert.ok(/元の場所[^\n]*消しません/.test(sec), '移動しても元の場所のデータは消さないことが書いていない');
+  assert.ok(/segbuf[^\n]*従来の場所|従来の場所[^\n]*segbuf/.test(sec), '退避フォルダ segbuf は従来の場所のまま、が書いていない');
+});
+
+test('#29 INSTALL の「データの保存先とバックアップ」に Roaming の注意がある', () => {
+  const sec = section(read('INSTALL.md'), '## データの保存先とバックアップ');
+  assert.ok(sec, 'INSTALL に「## データの保存先とバックアップ」が無い');
+  assert.ok(sec.includes('%APPDATA%\\listener'), '既定の保存先が節から消えた');
+  assert.ok(/Roaming/.test(sec) && /同期/.test(sec), 'Roaming の注意が無い');
+  assert.ok(/保存先を変更/.test(sec) && /%LOCALAPPDATA%/.test(sec), '設定で %LOCALAPPDATA% 配下へ移せることが書いていない');
+  assert.ok(/元の場所[^\n]*消しません/.test(sec), '元の場所のデータは消さないことが書いていない');
+});
+
+test('#58 INSTALL に「常駐メモリの目安」がある（whisper 0.8〜1.2GB・要約時に約 3GB・既定 10 分でアイドル解放・設定名）', () => {
+  const sec = section(read('INSTALL.md'), '## 常駐メモリの目安');
+  assert.ok(sec, 'INSTALL に「## 常駐メモリの目安」が無い');
+  assert.ok(/0\.8\s*[〜~～-]\s*1\.2\s*GB/.test(sec), 'whisper 常駐 0.8〜1.2GB が書いていない');
+  assert.ok(/約\s*3\s*GB/.test(sec) && /要約/.test(sec), '要約時に約 3GB が加わることが書いていない');
+  assert.ok(/使わないエンジンを止めるまで/.test(sec), '設定「使わないエンジンを止めるまで」の名前が無い');
+  assert.ok(/既定[^\n]*10\s*分/.test(sec), '既定 10 分でアイドル解放が書いていない');
+  assert.ok(/0[^\n]*止めない/.test(sec), '0 で止めない、が書いていない');
+  assert.ok(/エンジンを停止（メモリを解放）/.test(sec), 'トレイの「エンジンを停止（メモリを解放）」が書いていない');
+});

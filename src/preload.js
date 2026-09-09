@@ -51,8 +51,6 @@ contextBridge.exposeInMainWorld('koeApp', {
   // ページ（議事録）
   pagesSearch: (q) => ipcRenderer.invoke('pages:search', q),
   pagesSearchFull: (q) => ipcRenderer.invoke('pages:searchFull', q),
-  openActions: () => ipcRenderer.invoke('pages:openActions'),
-  assigneeList: () => ipcRenderer.invoke('pages:assignees'),
   pagesActionView: ({ q, assignee }) => ipcRenderer.invoke('pages:actionView', { q, assignee }),
   dataDirGet: () => ipcRenderer.invoke('data:dir'),
   dataDirMove: (dir) => ipcRenderer.invoke('data:move', dir),

@@ -16,28 +16,15 @@ const C = require('./helpers/css.js');
 //  表1: 透過ウィンドウの地雷台帳
 //  実機で1件踏んだら1行足す。行を足すだけで全ての透過窓・その HTML に効く。
 // ----------------------------------------------------------------------------
-const TRANSPARENT_WINDOW_MINES = [
-  { key: 'backgroundThrottling', ng: (v) => v !== undefined,
-    why: 'Windows の透過ウィンドウで透明が壊れ、ピルの外に不透明の矩形が出る（v0.9.7で発生 / v0.9.11で修正）' },
-  { key: 'hasShadow', ng: (v) => v !== 'false',
-    why: 'ネイティブの影が窓の矩形に落ち、ピルの外に灰色の四角が見える' },
-  { key: 'backgroundColor', ng: (v) => v !== undefined && v !== "'#00000000'",
-    why: '不透明な地色を敷くと透過が無効になる' },
-  { key: 'thickFrame', ng: (v) => v === 'true', why: 'Windows で縁が描かれ矩形が見える' },
-  { key: 'roundedCorners', ng: (v) => v === 'true', why: 'OS 側の角丸合成が透過と噛み合わない' },
-  { key: 'vibrancy', ng: (v) => v !== undefined, why: 'macOS 専用の合成で Windows では矩形が出る' },
-  { key: 'backgroundMaterial', ng: (v) => v !== undefined, why: 'Mica/Acrylic は窓の矩形いっぱいに掛かる' },
-  { key: 'opacity', ng: (v) => v !== undefined, why: '窓全体の不透明度は矩形として合成される' },
-];
-// 透過ウィンドウが読み込む HTML の CSS で禁止する宣言
-const TRANSPARENT_CSS_MINES = [
-  { prop: 'box-shadow', ng: (v) => !/^\s*inset\b/.test(v) && !/^\s*none\s*$/.test(v),
-    why: '外向きの影は透過ウィンドウでは窓の矩形いっぱいに落ちる（v0.10.0で発生 / v0.10.1で修正）。inset なら可' },
-  { prop: 'backdrop-filter', ng: () => true, why: '背後の合成結果が矩形で出る（v0.10.0で発生 / v0.10.1で修正）' },
-  { prop: '-webkit-backdrop-filter', ng: () => true, why: '同上' },
-  { prop: 'filter', ng: (v) => /drop-shadow/.test(v), why: 'drop-shadow は矩形に落ちうる' },
-  { prop: 'mix-blend-mode', ng: (v) => v.trim() !== 'normal', why: '透過の合成順に依存し実機で崩れる' },
-];
+// 台帳の実体は tools/lib/mines.js の1本（#40）。ゲート（tools/risk.js）と同じ表を同じ意味で使う:
+// 窓のオプションは「書いてあるときだけ bad で判定」、hasShadow だけは未指定も踏んだ扱い、
+// transparent 自体は対象外。CSS は宣言があるときだけ判定。
+const MINES = require('../tools/lib/mines');
+const TRANSPARENT_WINDOW_MINES = MINES.windowOpts.filter((m) => m.key !== 'transparent').map((m) => ({
+  key: m.key, why: `${m.why}（${m.seen}）`,
+  ng: (v) => (v === undefined ? m.key === 'hasShadow' : m.bad(String(v))),
+}));
+const TRANSPARENT_CSS_MINES = MINES.css.map((m) => ({ prop: m.prop, why: `${m.why}（${m.seen}）`, ng: (v) => m.bad(v) }));
 
 // ----------------------------------------------------------------------------
 //  表2: 木の包含（「この要素は必ずこの枠の中にいる」）
@@ -175,6 +162,18 @@ const INVARIANTS = [
       for (const [k, r] of Object.entries(w.run)) {
         for (const e of r.errors) v.push(`${k}: ${e}`);
         if (!r.scripts) v.push(`${k}: <script> が1つも見つからない（検査が空振りしている）`);
+      }
+      return v;
+    } },
+
+  { id: 'RUN-07', 分類: '画面を実際に走らせる',
+    表明: '画面の起動で、受け取り手の無い非同期の例外（unhandledRejection）が出ない',
+    由来: '初期化の async 関数の中で落ちると、同期の例外（RUN-01）には掛からず、画面は途中まで結線されたまま黙って止まる。boot.js が各 <script> に sourceURL の印を付け、world.js がどの画面の何本目かを印で見分ける',
+    check(w) {
+      const v = [];
+      for (const [k, r] of Object.entries(w.run)) {
+        if (!Array.isArray(r.unhandled)) { v.push(`${k}: 非同期の例外を記録する計器が無い（検査が空振りしている）`); continue; }
+        for (const e of r.unhandled) v.push(`${k}: 起動時に受け取り手の無い非同期の例外 — ${e}`);
       }
       return v;
     } },

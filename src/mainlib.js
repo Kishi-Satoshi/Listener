@@ -227,11 +227,23 @@ function tickStep({ state, meeting }, send, stop) {
 // 本文は base64 で 1 行に載せる（改行や引用符を含んでも命令の境界が壊れない）。
 // PS5.1 で動く書き方にする（switch / [ValidateSet] は使わない）。失敗しても
 // Electron が先に書いた本文は残る（try で包み、除外だけが効かない状態に留める）。
+//   fg             … 前面ウィンドウの HWND を 10 進で 1 行出す（取れなければ 0）（#54）
+//   paste <hwnd>   … 今の前面が <hwnd> と同じなら Ctrl+V を送って ok、違えば何もせず mismatch
+//                    （録音を始めたときの窓と違う所へ口述を流し込まない）。SendWait が投げたら fail
+// 応答（ok / mismatch / fail / HWND）は標準出力に 1 行ずつ。main は命令を送った順に受け取る。
+// P/Invoke は user32 の GetForegroundWindow 1 つだけ。C# の文字列に要る二重引用符は
+// [char]34 で作る（-Command の引数に二重引用符があると Node の引数の引用で壊れる）。
 function pasterScript() {
   return "$ErrorActionPreference='SilentlyContinue';"
     + 'Add-Type -AssemblyName System.Windows.Forms;'
+    + '$q=[char]34;'
+    + " Add-Type -TypeDefinition ('using System; using System.Runtime.InteropServices; public class KoeFg { [DllImport('+$q+'user32.dll'+$q+')] public static extern IntPtr GetForegroundWindow(); }');"
     + 'while($true){ $l=[Console]::In.ReadLine(); if($null -eq $l){break};'
-    + " if($l -eq 'paste'){ [System.Windows.Forms.SendKeys]::SendWait('^v') }"
+    + " if($l -eq 'fg'){ try { [Console]::Out.WriteLine([string][long][KoeFg]::GetForegroundWindow()) } catch { [Console]::Out.WriteLine('0') } }"
+    + " elseif($l -eq 'paste'){ try { [System.Windows.Forms.SendKeys]::SendWait('^v'); [Console]::Out.WriteLine('ok') } catch { [Console]::Out.WriteLine('fail') } }"
+    + " elseif($l.StartsWith('paste ')){ $h='0'; try { $h=[string][long][KoeFg]::GetForegroundWindow() } catch { $h='0' };"
+    + " if($h -eq $l.Substring(6)){ try { [System.Windows.Forms.SendKeys]::SendWait('^v'); [Console]::Out.WriteLine('ok') } catch { [Console]::Out.WriteLine('fail') } }"
+    + " else { [Console]::Out.WriteLine('mismatch') } }"
     + " elseif($l.StartsWith('copy ')){ try {"
     + ' $t=[System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($l.Substring(5)));'
     + ' $d=New-Object System.Windows.Forms.DataObject; $d.SetText($t);'
@@ -240,6 +252,17 @@ function pasterScript() {
     + " $d.SetData('CanIncludeInClipboardHistory',(& $z));"
     + " $d.SetData('CanUploadToCloudClipboard',(& $z));"
     + ' [System.Windows.Forms.Clipboard]::SetDataObject($d, $true) } catch {} } }';
+}
+
+// 常駐 PowerShell の標準出力の 1 行を読む。HWND（10 進）は { kind:'hwnd', value }（0 は「控えられ
+// なかった」= ''）、ok / mismatch / fail は { kind }、それ以外（エラー文など）は null
+function parsePasterLine(line) {
+  if (typeof line !== 'string') return null;
+  const t = line.trim();
+  if (!t) return null;
+  if (/^\d+$/.test(t)) return { kind: 'hwnd', value: t === '0' ? '' : t };
+  if (t === 'ok' || t === 'mismatch' || t === 'fail') return { kind: t };
+  return null;
 }
 
 // 自動貼り付けのあとに元のクリップボードを戻すか。戻すのは短い1行の文字列だけ。
@@ -634,7 +657,7 @@ module.exports = {
   saveIfExists, meetingDurationSec, promptTail,
   registerHotkeys, hotkeyFailureMessage, hotkeyStatus, resolveStartupHotkeys, saveHotkeys,
   makeSummaryRunner, tickStep,
-  pasterScript, copyCommand, restoreAfterPaste,
+  pasterScript, copyCommand, restoreAfterPaste, parsePasterLine,
   engineFileIssue, engineIssueMessage, portInUseError,
   ENGINE_SETTING_KEYS, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
