@@ -173,6 +173,18 @@
   let rafId = null;
   let micId = '';
   let soundOn = true;
+  // #56 選んだマイクが繋がっておらず、既定のマイクで代替して録っている
+  let micFallback = false;
+  // #13 区間の送信順。切った区間の変換を待たずに次の区間を始めるので、複数の区間が
+  // 同時に変換中になる。短い後の区間が先に変換し終えても、main には番号順に届ける
+  // （main は届いた順に atMs を積み、直前の区間の末尾を次の文脈に使う）。
+  let session = 0;               // start() ごとに増える。前の録音の onstop が今の録音に触らないための印
+  let segSeq = 0;                // 次に始める区間（または直に送る空の最後）に振る番号。録音をまたいで増え続ける
+  let sendNext = 0;              // 次に main へ送る番号
+  const sendQueue = new Map();   // 番号 -> { wav, durationMs, isFinal } | null（その番号は送るものが無い）
+  // #8/#42 main からの区間長の上げ下げ（背圧）はこの範囲に丸める。短すぎると文字起こしの
+  // 文脈が細切れになり、長すぎると1区間の変換・認識が時間切れになる（実機で9分の区間が消えた）
+  const SEG_MIN_MS = 20000, SEG_MAX_MS = 300000;
 
   // ---------------- 効果音 ----------------
   let sctx = null;
@@ -252,6 +264,10 @@
   // 「相手の声も」の表示が消えることがない。
   function recordingLabel() {
     if (paused) return '一時停止中';
+    // 選んだマイクが無く既定のマイクで録っているときは、それを最優先で出す（#56）。
+    // 相手の声の有無より、違うマイクで録っていることの方が録り直しに直結する。
+    // ピルは狭いので短く（全角14文字）。詳しい事情はメイン画面側（overlay:mic）が出す。
+    if (micFallback) return mode === 'meeting' ? '記録中（既定のマイクで代替）' : '聞き取り中（既定のマイク）';
     if (mode !== 'meeting') return '聞き取り中…';
     if (!sysWanted) return '議事録を記録中';
     return sysOn ? '記録中（相手の声も）' : '記録中（マイクのみ）';
@@ -356,6 +372,27 @@
     return s;
   }
 
+  // #56 選んだマイクで開けたかを見る。deviceId は { ideal } で渡しているので、選んだ機器が
+  // 抜けていると Chromium は黙って既定のマイクで開く。実際に開いたトラックの deviceId を
+  // 選んだ id と比べ、違えば「代替中」と扱ってピル（recordingLabel）と main（overlay:mic）に
+  // 伝える。機器名（ラベル）は送らない。getSettings が無い／deviceId を返さない実装では
+  // 判定できないので、合っていると扱う（誤警告を出さない）。
+  function checkMicChoice() {
+    let got = '';
+    try {
+      const t = micStream && micStream.getAudioTracks ? micStream.getAudioTracks()[0] : null;
+      const s = t && typeof t.getSettings === 'function' ? t.getSettings() : null;
+      if (s && typeof s.deviceId === 'string') got = s.deviceId;
+    } catch (_) { got = ''; }
+    const requested = Boolean(micId);
+    // 'default' を選んでいるときは、実機の id が返っても既定で録れているので代替ではない
+    micFallback = requested && micId !== 'default' && got !== '' && got !== micId;
+    // preload がまだ公開していない版でも録音は止めない
+    if (typeof window.koeOverlay.reportMic === 'function') {
+      window.koeOverlay.reportMic({ requested, matched: !micFallback });
+    }
+  }
+
   async function openStream() {
     // 相手の声を先に取る。ユーザー操作とみなされる有効時間が短いため、
     // マイクのデバイスオープンを待ってからでは間に合わないことがある。
@@ -374,6 +411,7 @@
     if (micId) audio.deviceId = { ideal: micId };
     // マイクは必須。ここが失敗したら start() が握って中止する。
     micStream = await navigator.mediaDevices.getUserMedia({ audio });
+    checkMicChoice();   // 開き直すたびに見る（一時停止→再開の間に機器が抜き差しされる）
 
     audioCtx = new AudioContext();
     audioCtx.resume().catch(() => {});
@@ -492,6 +530,8 @@
     micSilentSince = 0;
     paused = false; pausedAt = 0; pausedMs = 0;
     segClosing = null;    // 前回の締めが残っていると、一時停止中の終了が何も送らなくなる
+    session++;            // 前の録音の区間（まだ変換待ち）が、この録音のマイクや区間に触らないための印
+    micFallback = false;  // openStream が開いたトラックを見て決め直す
     pill.classList.remove('paused');
     shownLabel = '';
     firstSegDone = false;
@@ -515,7 +555,7 @@
     if (stopping) {
       cleanup();
       // main は終了処理に入って最後の区間を待っている。空で閉じてやる。
-      if (mode === 'meeting') window.koeOverlay.sendSegment(new Uint8Array(0), 0, true);
+      if (mode === 'meeting') sendSegmentQueued(new Uint8Array(0), 0, true);
       else window.koeOverlay.sendError('録音を開始できませんでした');
       return;
     }
@@ -571,7 +611,35 @@
     // 遅延中の setTimeout を必ず消してから切る。消さないと、そのタイマーが
     // ID を失ったまま生き残り、あとから発火して「次の」区間を途中で切る。
     if (autoStopId) { clearTimeout(autoStopId); autoStopId = null; }
-    rec.stop();
+    rollSegment(rec);
+  }
+
+  // 区間を切り替える。締めた区間の変換と送信は onstop が裏で続けるので、ここでは
+  // 待たずに次の区間を始める（#13: 変換の間に誰も録っていない空白をなくす。空白のぶん
+  // atMs が会議の後半ほど手前へずれるのも直る）。
+  // 上限時間の setTimeout、区切りの見張り（cutSegmentIfOverdue）、onstop の先頭から呼ぶ。
+  function rollSegment(rec) {
+    if (!rec || rec !== recorder) return;       // 既に切り替わっている／解放済み（二重に始めない）
+    if (rec.state === 'recording') rec.stop();  // onstop を同期に呼ぶ実装では、この中で次が始まる
+    if (recorder !== rec || stopping || cancelled || paused) return;
+    startMeetingSegment();
+  }
+
+  // ---- 区間の待ち行列（#13）----
+  // 番号順に main へ渡す。番号が飛んでいる間（前の区間がまだ変換中）は後の区間を溜める。
+  // 番号は必ず埋める（送るものが無ければ null）。埋め忘れると、後の区間が永久に届かない。
+  function settleSeg(seq, item) {
+    sendQueue.set(seq, item);
+    while (sendQueue.has(sendNext)) {
+      const it = sendQueue.get(sendNext);
+      sendQueue.delete(sendNext);
+      sendNext++;
+      if (it) window.koeOverlay.sendSegment(it.wav, it.durationMs, it.isFinal);
+    }
+  }
+  // 区間を持たない送り（空の最後）も番号を取り、それまでに始まった区間の後に届ける
+  function sendSegmentQueued(wav, durationMs, isFinal) {
+    settleSeg(segSeq++, { wav, durationMs, isFinal });
   }
 
   function startMeetingSegment() {
@@ -586,17 +654,32 @@
     const thisSegMs = firstSegDone ? segmentMs : FIRST_SEG_MS;
     firstSegDone = true;
     segDeadline = segStart + thisSegMs;
+    const seq = segSeq++;          // 送る順を決める番号（#13）
+    const mySession = session;
     const rec = newRecorder(segChunks);
     recorder = rec;
+    // 「この区間より後に始まった区間が無い」＝この区間が録音の末尾。マイクの解放・次の
+    // 区間の開始・最後の印は、末尾の区間の onstop だけが受け持つ。切られて変換中の区間は
+    // 変換して番号順に送るだけ（受け持つと、後の区間が録っている最中にマイクを手放したり、
+    // 最後の印を付けて後の区間を main に捨てさせたりする）。
+    const isLast = () => seq === segSeq - 1;
     rec.onstop = async () => {
+      // 録れた長さ。変換の時間は含めない（main はこれを積んで atMs にする）
       const durationMs = Date.now() - startedSeg;
-      // この区間を送り終えるまで立てておく印。一時停止側が先に立てていればそれを継ぐ。
-      // 上限時間で切られた区間は、変換を待つ間 recorder が「止まっている」ように見える。
-      // ここで印を立てておかないと、その間の一時停止→終了で stop() が空の最後を先に送り、
-      // あとから届く本物の区間が最後の印の後になって main に捨てられる（最大75秒が消える）。
-      if (!segClosing) segClosing = newClosing();
-      const closing = segClosing;
-      const done = () => { if (segClosing === closing) { segClosing = null; closing.resolve(); } };
+      let settled = false;
+      const settle = (item) => { if (!settled) { settled = true; settleSeg(seq, item); } };
+      // 前の録音の区間（破棄→すぐ次の録音、の間に onstop や変換が終わった）。今の録音の
+      // マイクや区間には触らず、番号だけ空で埋める（埋めないと後の区間が永久に届かない）。
+      if (mySession !== session) { settle(null); return; }
+      // 上限時間で切られた区間なら、変換を待たずにここで次の区間を始める（#13）。
+      // 見張り（rollSegment）側で既に始めていれば何もしない。
+      rollSegment(rec);
+      // 末尾の区間なら、送り終えるまでの印を立てる。一時停止側が先に立てていればそれを継ぐ。
+      // 印が無いと、一時停止→終了で stop() が空の最後を先に送り、あとから届く本物の区間が
+      // 最後の印の後になって main に捨てられる（最大75秒が消える）。
+      let closing = null;
+      if (isLast()) { if (!segClosing) segClosing = newClosing(); closing = segClosing; }
+      const done = () => { if (closing && segClosing === closing) { segClosing = null; closing.resolve(); } };
       try {
         if (cancelled) { cleanup(); return; }
         const blob = new Blob(segChunks, { type: rec.mimeType || 'audio/webm' });
@@ -604,13 +687,16 @@
         try {
           wav = await blobToWav16k(blob);
         } catch (e) { wav = null; }
+        if (mySession !== session) return;   // 変換の間に次の録音が始まった。finally が番号を空で埋める
         // 変換の途中で「終了」「破棄」が押されていることがある。
         // 区切りの直前に決めた値のままだと、この区間を最後と扱えず次の録音が
         // 始まってしまい、マイクが開いたまま残る。変換後にもう一度見る。
         if (cancelled) { cleanup(); return; }
-        const isFinal = stopping;
-        if (wav) window.koeOverlay.sendSegment(wav, durationMs, isFinal);
-        else if (isFinal) window.koeOverlay.sendSegment(new Uint8Array(0), durationMs, true);
+        // 最後の印は末尾の区間だけ。後の区間が録っていれば、終了の合図はそちらが受ける
+        const isFinal = stopping && isLast();
+        if (wav) settle({ wav, durationMs, isFinal });
+        else if (isFinal) settle({ wav: new Uint8Array(0), durationMs, isFinal: true });
+        if (!isLast()) return;               // 送るだけ。マイクと次の区間は末尾の区間が受け持つ
         if (!isFinal && paused) {
           // 一時停止で締めた区間（変換中に一時停止された区間も同じ）。区間を送り終えて
           // からマイクを解放する（先に解放すると、この onstop が読む recorder が消えている）。
@@ -622,19 +708,19 @@
           // 変換を待つ間に一時停止→再開でストリームが差し替わっていることがある。
           // そのときは再開側がもう次の区間を始めている。ここでも始めると
           // 録音が2本走って区間が混ざる。
-          if (recorder === rec) startMeetingSegment(); // 次のセグメントへ
+          if (recorder === rec) startMeetingSegment(); // 保険。通常は先頭の rollSegment が始めている
         } else {
           stopMeters();
           releaseStream();
         }
       } finally {
-        // どの出口でも印を倒す。倒し忘れると、待っている再開・終了が永久に動かない。
+        // どの出口でも番号を埋め、印を倒す。埋め忘れると後の区間が永久に届かず、
+        // 倒し忘れると待っている再開・終了が永久に動かない。
+        settle(null);
         done();
       }
     };
-    autoStopId = setTimeout(() => {
-      if (recorder && recorder.state === 'recording') recorder.stop();
-    }, thisSegMs);
+    autoStopId = setTimeout(() => rollSegment(rec), thisSegMs);
     rec.start(250);
   }
 
@@ -696,7 +782,7 @@
       // 開き直している間に「終了」が押された。paused を倒した後なので stop() は
       // 何も送っていない。main は最後の区間を待っているので、空で閉じてやる。
       cleanup();
-      if (stopping) window.koeOverlay.sendSegment(new Uint8Array(0), 0, true);
+      if (stopping) sendSegmentQueued(new Uint8Array(0), 0, true);
       return;
     }
     firstSegDone = true;          // 再開後は通常の区間長で刻む
@@ -719,7 +805,8 @@
       // 送り、マイクも解放する。ここでも空の最後を送ると最後の区間が二重に届き、
       // 後から届く本物の区間が main に捨てられる。
       if (segClosing) return;
-      window.koeOverlay.sendSegment(new Uint8Array(0), 0, true);
+      // 切られて変換中の区間が残っていれば、その後に届くよう待ち行列を通す（#13）
+      sendSegmentQueued(new Uint8Array(0), 0, true);
       cleanup();
       return;
     }
@@ -834,6 +921,17 @@
   };
   window.koeOverlay.onStart((p) => window.__koeStart(p));
   window.koeOverlay.onTick(() => cutSegmentIfOverdue(recorder));
+  // #8/#42 main が文字起こしの詰まり具合で区間長を上げ下げする（背圧）。効くのは次の区間から。
+  // 今の区間は切らない（受けた瞬間に切ると短い区間ができ、文脈が細切れになる）。
+  // 録音の開始時は onStart の segmentSec で戻るので、main は開始後に送る。
+  // preload がまだ公開していない版でも動くよう、有無を見てから結線する。契約:
+  //   onSegmentMs: (cb) => ipcRenderer.on('overlay:segment-ms', (_e, ms) => cb(ms))
+  if (typeof window.koeOverlay.onSegmentMs === 'function') {
+    window.koeOverlay.onSegmentMs((ms) => {
+      if (typeof ms !== 'number' || !Number.isFinite(ms)) return;   // 数でないものは無視
+      segmentMs = Math.min(SEG_MAX_MS, Math.max(SEG_MIN_MS, Math.round(ms)));
+    });
+  }
   window.koeOverlay.onStop(() => stop());
   window.koeOverlay.onCancel(() => cancel());
   window.koeOverlay.onPhase(({ phase, message, procSec }) => {
