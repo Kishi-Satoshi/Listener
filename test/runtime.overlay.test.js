@@ -12,7 +12,7 @@ const assert = require('node:assert');
 const path = require('path');
 const fs = require('fs');
 const { parseHTML } = require('./helpers/simdom.js');
-const { load } = require('./helpers/simrun.js');
+const { load, sineBuffer } = require('./helpers/simrun.js');
 const C = require('./helpers/simcss.js');
 
 const OVL = path.join(__dirname, '..', 'src', 'renderer', 'overlay.html');
@@ -58,6 +58,70 @@ test('開始の合図で実際に録音まで進み、停止で音声が渡る',
     '停止しても音声がメインに渡らない（録音が成立していない）');
 });
 
+/*
+ * #36 送られたものが本物の WAV であること。以前の偽の decode は {duration} だけを返し、
+ * レンダリングは全部 0 だったので、0 バイトを送る壊れ方でも上の検査が通っていた。
+ * ここでは overlay.html の blobToWav16k が実際に組み立てたバイト列を読む。
+ */
+/** 16kHz・mono・16bit の WAV として読み、ヘッダの各欄と PCM サンプルを返す */
+function WAVを読む(u8) {
+  assert.ok(u8 instanceof Uint8Array, `送られたものが Uint8Array でない: ${Object.prototype.toString.call(u8)}`);
+  assert.ok(u8.length >= 44, `WAV ヘッダ（44 バイト）より短い: ${u8.length} バイト`);
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const str = (off, n) => String.fromCharCode(...u8.subarray(off, off + n));
+  const h = {
+    riff: str(0, 4), riffSize: dv.getUint32(4, true), wave: str(8, 4), fmt: str(12, 4), fmtSize: dv.getUint32(16, true),
+    format: dv.getUint16(20, true), channels: dv.getUint16(22, true), rate: dv.getUint32(24, true),
+    byteRate: dv.getUint32(28, true), blockAlign: dv.getUint16(32, true), bits: dv.getUint16(34, true),
+    data: str(36, 4), dataSize: dv.getUint32(40, true),
+  };
+  const samples = new Int16Array(Math.floor((u8.length - 44) / 2));
+  for (let i = 0; i < samples.length; i++) samples[i] = dv.getInt16(44 + i * 2, true);
+  return { h, samples };
+}
+function 本物のWAVである(u8, where) {
+  const { h, samples } = WAVを読む(u8);
+  assert.deepStrictEqual(
+    { riff: h.riff, wave: h.wave, fmt: h.fmt, fmtSize: h.fmtSize, format: h.format, channels: h.channels, rate: h.rate, byteRate: h.byteRate, blockAlign: h.blockAlign, bits: h.bits, data: h.data },
+    { riff: 'RIFF', wave: 'WAVE', fmt: 'fmt ', fmtSize: 16, format: 1, channels: 1, rate: 16000, byteRate: 32000, blockAlign: 2, bits: 16, data: 'data' },
+    `${where}: WAV ヘッダが 16kHz・mono・16bit PCM でない`);
+  assert.strictEqual(h.dataSize, u8.length - 44, `${where}: data チャンクの長さがバイト列と合わない`);
+  assert.strictEqual(h.riffSize, u8.length - 8, `${where}: RIFF チャンクの長さがバイト列と合わない`);
+  assert.ok(samples.length >= 1000, `${where}: サンプルが ${samples.length} 個しかない（録れた 1 秒ぶんが変換されていない）`);
+  const peak = samples.reduce((m, s) => Math.max(m, Math.abs(s)), 0);
+  assert.ok(peak > 0, `${where}: 全サンプルが 0（無音）。録った音が WAV に入っていない`);
+  // 偽の音は振幅 0.5 の正弦波。間引いても山は残るので、頂点は 0.5 × 32767 の近くにある
+  assert.ok(peak >= 0.45 * 32767 && peak <= 32767, `${where}: 頂点 ${peak} が録った音（振幅 0.5）と違う`);
+  assert.ok(samples.some((s) => s < 0) && samples.some((s) => s > 0), `${where}: 正負の両側が無い（波形でない）`);
+}
+
+test('議事録で送られる区間は、16kHz・mono・16bit の本物の WAV で、録った音が入っている', async () => {
+  const log = await load(OVL);
+  log.fire('onStart', { mode: 'meeting', segmentSec: 75, sound: false, systemAudio: false });
+  await log.drain();
+  log.fire('onStop');
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '例外');
+  const segs = log.called('sendSegment');
+  assert.strictEqual(segs.length, 1, '最後の区間が 1 回だけ届いていない');
+  assert.strictEqual(segs[0].args[2], true, '最後の印が無い');
+  本物のWAVである(segs[0].args[0], 'sendSegment');
+});
+
+test('音声入力で送られる音声は、16kHz・mono・16bit の本物の WAV で、録った音が入っている', async () => {
+  const log = await load(OVL);
+  log.fire('onStart', { mode: 'dictation', sound: false });
+  await log.drain();
+  log.fire('onStop');
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '例外');
+  const sent = log.called('sendAudio');
+  assert.strictEqual(sent.length, 1, '音声が 1 回だけ届いていない');
+  assert.strictEqual(sent[0].args[1], 'audio/wav', 'MIME が audio/wav でない');
+  本物のWAVである(sent[0].args[0], 'sendAudio');
+  assert.strictEqual(log.called('sendError').length, 0, '変換に成功したのにエラーを伝えている');
+});
+
 test('実際に描いた色は、ピルの地の上で見える', () => {
   const css = 録音.root.querySelectorAll('style').map((s) => s._raw).join('\n');
   const bg = C.firstColor(C.declsFor(C.parse(css), '.pill', { at: '' }).background);
@@ -88,9 +152,13 @@ function 非同期onstopに(log) {
   MR.prototype.start = function () { log.recorders.push(this); start.call(this); };
   MR.prototype.stop = function () {
     this.state = 'inactive';
+    this._flush();                                             // 実機と同じく、録れたデータは onstop より先に届く
     setImmediate(() => { if (this.onstop) this.onstop(); });   // 実機と同じく後で発火
   };
 }
+
+/** decodeAudioData の差し替えが返すもの。simrun の既定と同じ形（getChannelData を持つ非無音の正弦波） */
+const 復号した音 = () => sineBuffer(480);
 
 /** simrun の fakeStream と同じ形で、トラックの stop() 回数を数える（マイクを手放したかの観測） */
 function 偽ストリーム() {
@@ -109,7 +177,7 @@ function マイクを数える(log) {
 function 変換を待たせる(log) {
   let release;
   const gate = new Promise((r) => { release = r; });
-  log.window.AudioContext.prototype.decodeAudioData = () => gate.then(() => ({ duration: 0.01, sampleRate: 48000, numberOfChannels: 1, length: 480 }));
+  log.window.AudioContext.prototype.decodeAudioData = () => gate.then(復号した音);
   return release;
 }
 
@@ -279,7 +347,7 @@ function 時計(log, t0 = 1_700_000_000_000) {
 function 変換を個別に待たせる(log) {
   const gates = [];
   log.window.AudioContext.prototype.decodeAudioData = () => new Promise((r) => {
-    gates.push(() => r({ duration: 0.01, sampleRate: 48000, numberOfChannels: 1, length: 480 }));
+    gates.push(() => r(復号した音()));
   });
   return gates;
 }
