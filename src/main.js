@@ -16,9 +16,14 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { execFile, spawn } = require('child_process');
+const net = require('net');
 
 const store = require('./store');
-const { attachCitations, refreshCitations } = require('./cite');
+const cite = require('./cite');
+const { attachCitations, refreshCitations } = cite;
+// 要約中に文字起こしが編集されていても、出典は「要約の材料にした配列」と「いまの配列」の
+// 両方を見て付ける（cite.attachCitationsAcross。#4）。まだ無い版では従来どおり今の配列だけ。
+const attachAcross = cite.attachCitationsAcross || ((b, f) => attachCitations(b, f.filter((s) => !s.failed)));
 const mtype = require('./meetingType');
 const { enrichActionBlocks } = require('./actions');
 const updater = require('./updater');
@@ -29,9 +34,15 @@ const { markdownToBlocks, dropRedundantEmpty } = minutes;
 // まだ無い版でも動くよう、無ければ素通しにする。
 const dropTemplateEcho = minutes.dropTemplateEcho || ((b) => b);
 const { normalizeSettings } = require('./settings');
+const { localDateISO } = require('./dates');
 const {
   saveIfExists, meetingDurationSec, promptTail,
   registerHotkeys, resolveStartupHotkeys, saveHotkeys, makeSummaryRunner, tickStep,
+  pasterScript, copyCommand,
+  engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
+  extractNotes, truncationMessage, buildPromptParts,
+  publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs, nextSegmentMs, EtaTracker,
+  skipPendingSegments,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -123,7 +134,8 @@ function applyTheme() {
 }
 
 function updatePowerBlock() {
-  const busy = state !== 'idle';
+  // 要約中も忙しい（#52）。省電力で絞られると、数分かかる要約が静かに止まる
+  const busy = state !== 'idle' || isSummarizing();
   if (busy && powerBlockId === null) {
     try { powerBlockId = powerSaveBlocker.start('prevent-app-suspension'); } catch (_) { powerBlockId = null; }
   } else if (!busy && powerBlockId !== null) {
@@ -213,48 +225,36 @@ const BUILTIN_TERMS = [
 
 // whisper.cpp の初期プロンプトは n_text_ctx/2（既定 224 トークン）で切られる。
 // どちら側から切られるかはビルドで変わりうるので、そもそも溢れさせない。
-// 日本語は最悪 1文字 1トークンとみて、文字数で見積もる。
+// 日本語は最悪 1文字 1トークンとみて 200 文字。予算の単位は UTF-8 のバイト数でその 3 倍
+// （日本語 1 文字 = 3 バイト。英数字の語を文字数で数えると実際の 3 倍に見積もられ、辞書が
+// 不当に切られる。詳しくは mainlib.buildPromptParts）。
 const PROMPT_MAX_CHARS = 200;
+const PROMPT_LIMIT_BYTES = PROMPT_MAX_CHARS * 3;
+// 文例。指示文ではなく「この後に続く文章の文例」。モデルは指示に従うのでは
+// なく真似るだけで、実機では文例中の語がそのまま本文へ漏れた
+// （「不具合の報告」が「句読報告」になった）。丸めの誘導は文例自体の
+// 「、」「。」で行い、漏れても会議の発言として無害な語だけで書く。
+// 語の接頭辞も付けない。「用語:」のような不自然な語も文例として漏れうる。
+const PROMPT_SAMPLE = 'お疲れさまです。よろしくお願いします。';
 
-function buildPrompt(extraTail) {
-  const parts = [];
+// 優先順は 文例 → 辞書（先頭行から）→ 既定語彙 → 直前の発言の尻尾。予算を超えたら
+// 後ろから落とす（判断は mainlib.buildPromptParts）。既定語彙は日本語のときだけ
+// （英語や自動判定で日本語の語を渡すと、その語が出力に漏れ、言語の推定も日本語へ引っぱられる）。
+// 戻り値の kept/total は prompt:info で画面へ返す（辞書が予算を超えていると伝えるため。#23）。
+function promptParts(extraTail) {
   const ja = settings.language === 'ja';
-  // ここは指示文ではなく「この後に続く文章の文例」。モデルは指示に従うのでは
-  // なく真似るだけで、実機では文例中の語がそのまま本文へ漏れた
-  // （「不具合の報告」が「句読報告」になった）。丸めの誘導は文例自体の
-  // 「、」「。」で行い、漏れても会議の発言として無害な語だけで書く。
-  if (ja) parts.push('お疲れさまです。よろしくお願いします。');
-  const tail = String(extraTail || '');
-
-  // ユーザーが入れた語は今までどおり全部渡す。ここを予算で切ると、
-  // 辞書を育ててきた利用者の認識精度が黙って落ちる。
-  const terms = [];
-  for (const raw of (Array.isArray(settings.dictionary) ? settings.dictionary : [])) {
-    const w = String(raw || '').trim();
-    if (w && !terms.includes(w)) terms.push(w);
-  }
-
-  // 既定語彙は日本語のときだけ。英語や自動判定で日本語の語を渡すと、
-  // その語がそのまま出力に漏れたり、言語の推定を日本語へ引っぱったりする。
-  // 余った予算に収まる分だけ足す（長い語が1つあっても後続を捨てないよう continue）。
-  if (ja && settings.useBuiltinTerms !== false) {
-    let budget = PROMPT_MAX_CHARS - parts.join(' ').length - tail.length
-      - terms.join('、').length - 6;
-    for (const w of BUILTIN_TERMS) {
-      if (terms.includes(w)) continue;
-      if (budget - (w.length + 1) < 0) continue;
-      terms.push(w); budget -= w.length + 1;
-    }
-  }
-  // 接頭辞は付けない。「用語:」のような不自然な語も文例として漏れうる。
-  if (terms.length) parts.push(`${terms.join('、')}。`);
-  if (tail) parts.push(tail);
-  return parts.join(' ');
+  return buildPromptParts({
+    ja, sample: PROMPT_SAMPLE,
+    dictionary: settings.dictionary,
+    useBuiltinTerms: settings.useBuiltinTerms, builtinTerms: BUILTIN_TERMS,
+    tail: extraTail, limitBytes: PROMPT_LIMIT_BYTES,
+  });
 }
+function buildPrompt(extraTail) { return promptParts(extraTail).prompt; }
 
 // ---------------------------------------------------------------- エンジン管理
 function makeEngine(name) {
-  return { name, proc: null, ready: false, lastError: '', readyPromise: null, sig: '', stderrTail: '', stopping: false };
+  return { name, proc: null, ready: false, lastError: '', readyPromise: null, startPromise: null, sig: '', stderrTail: '', stopping: false };
 }
 const whisperEng = makeEngine('文字起こしエンジン');
 const sumEng = makeEngine('要約エンジン');
@@ -302,7 +302,29 @@ const engineExe = (e) => (e === whisperEng ? settings.localServerExe : settings.
 const engineModel = (e) => (e === whisperEng ? settings.localModelPath : settings.sumModelPath);
 const enginePort = (e) => (e === whisperEng ? settings.localPort : settings.sumPort);
 const engineConfigured = (e) => Boolean(engineExe(e) && engineModel(e));
-const engineValid = (e) => engineConfigured(e) && fs.existsSync(engineExe(e)) && fs.existsSync(engineModel(e));
+// 実行ファイルとモデルは「あるか」だけでなく中身まで見る（#32。判断は mainlib.engineFileIssue）。
+// 存在だけを見ると、OneDrive のプレースホルダ（大きさはあるが実体がこの PC に無い）や
+// 途中で切れたダウンロードを「ある」と誤認し、起動して落ちるまで原因が分からない。
+// 下限はどの配布物でも下回らない大きさ（exe は数 MB、whisper は tiny でも 75MB、
+// 要約の gguf は最小のものでも数百 MB）。
+const ENGINE_MIN_BYTES = { exe: 100_000, whisper: 50_000_000, gguf: 300_000_000 };
+const fileSize = (f) => { try { return fs.statSync(f).size; } catch (_) { return 0; } };
+// 問題があれば利用者向けの一文、無ければ ''
+function engineCheck(eng) {
+  if (!engineConfigured(eng)) return `${eng.name}の実行ファイルまたはモデルが見つかりません`;
+  const stat = (f) => fs.statSync(f);
+  const exe = engineFileIssue(engineExe(eng), ENGINE_MIN_BYTES.exe, stat);
+  if (exe !== 'ok') return `${eng.name}の${engineIssueMessage(exe, 'exe', fileSize(engineExe(eng)))}`;
+  const model = engineFileIssue(engineModel(eng), eng === whisperEng ? ENGINE_MIN_BYTES.whisper : ENGINE_MIN_BYTES.gguf, stat);
+  if (model !== 'ok') return `${eng.name}の${engineIssueMessage(model, 'model', fileSize(engineModel(eng)))}`;
+  return '';
+}
+const engineValid = (e) => !engineCheck(e);
+// 未設定なのか、設定はあるが中身に問題があるのかを分けて伝える
+function whisperProblem() {
+  if (!engineConfigured(whisperEng)) return '文字起こしエンジンが未設定です。設定タブでパスを指定してください。';
+  return engineCheck(whisperEng);
+}
 
 function engineSignature(eng) {
   return [engineExe(eng), engineModel(eng), enginePort(eng),
@@ -311,30 +333,75 @@ function engineSignature(eng) {
     eng === whisperEng ? `${settings.useVad ? resolveVadModel() : ''}|${settings.suppressNst}` : ''].join('|');
 }
 
-function startEngine(eng) {
-  if (eng.proc) return;
-  if (!engineValid(eng)) { eng.lastError = `${eng.name}の実行ファイルまたはモデルが見つかりません`; return; }
-  eng.lastError = ''; eng.ready = false; eng.stopping = false; eng.stderrTail = '';
-  eng.sig = engineSignature(eng);
-  engineLog(`${eng.name} 起動: ${engineExe(eng)} ${engineSpawnArgs(eng).join(' ')}`);
-  try {
-    eng.proc = spawn(engineExe(eng), engineSpawnArgs(eng), { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
-  } catch (e) {
-    eng.lastError = `${eng.name}を起動できません: ${e.message}`; engineLog(eng.lastError); eng.proc = null; return;
-  }
-  eng.proc.stderr.on('data', (d) => { eng.stderrTail = (eng.stderrTail + d.toString()).slice(-1500); });
-  eng.proc.on('error', (e) => {
-    eng.lastError = `${eng.name}を起動できません: ${e.message}`; engineLog(eng.lastError);
-    eng.proc = null; eng.ready = false;
+// 127.0.0.1:port を一瞬だけ listen して空きを見る（#28/#31）。EADDRINUSE だけを「使用中」
+// とし、それ以外（権限など）はエンジン自身の起動に任せる。直前に止めた自分のエンジンが
+// まだ手放していないことがあるので、短い間隔で数回まで見直してから「使用中」と決める。
+function portInUse(port, tries = 5) {
+  const probe = () => new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.once('error', (e) => resolve(Boolean(e && e.code === 'EADDRINUSE')));
+    srv.listen({ host: '127.0.0.1', port, exclusive: true }, () => srv.close(() => resolve(false)));
   });
-  eng.proc.on('exit', (code) => {
-    if (!quitting && !eng.stopping) {
-      const tail = eng.stderrTail.split('\n').filter(Boolean).slice(-3).join(' / ');
-      eng.lastError = `${eng.name}が終了しました (code ${code})${tail ? `: ${tail}` : ''}`.trim();
-      engineLog(eng.lastError);
+  return (async () => {
+    for (let i = 0; i < tries; i++) {
+      if (!(await probe())) return false;
+      await new Promise((r) => setTimeout(r, 200));
     }
-    eng.proc = null; eng.ready = false; eng.readyPromise = null;
-  });
+    return true;
+  })();
+}
+
+// 起動は非同期（ポートの空きを見てから spawn する）。戻り値の Promise は spawn まで
+// （準備完了までではない。それは ensureEngineReady）。同時に二度呼ばれても spawn は
+// 一度だけ（startPromise で束ねる）。
+function startEngine(eng) {
+  if (eng.proc) return Promise.resolve();
+  if (eng.startPromise) return eng.startPromise;
+  eng.startPromise = (async () => {
+    const issue = engineCheck(eng);
+    if (issue) { eng.lastError = issue; return; }
+    eng.lastError = ''; eng.ready = false; eng.stopping = false; eng.stderrTail = '';
+    // 塞がっているポートで spawn すると、エンジンはモデルを読み終えてから bind に失敗して
+    // 落ちる。それまで「起動中」に見え、/health は塞いでいる別のプロセスに当たって
+    // 「準備完了」と誤認することさえある。先に見て、塞がっていれば起動しない。
+    const port = enginePort(eng);
+    if (await portInUse(port)) {
+      eng.lastError = portInUseError(port); engineLog(`${eng.name}: ${eng.lastError}`); return;
+    }
+    // 待っている間に終了が始まっていたら起動しない（孤児プロセスになる）
+    if (quitting) return;
+    if (eng.proc) return;
+    eng.sig = engineSignature(eng);
+    engineLog(`${eng.name} 起動: ${engineExe(eng)} ${engineSpawnArgs(eng).join(' ')}`);
+    let p;
+    try {
+      p = spawn(engineExe(eng), engineSpawnArgs(eng), { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch (e) {
+      eng.lastError = `${eng.name}を起動できません: ${e.message}`; engineLog(eng.lastError); return;
+    }
+    eng.proc = p;
+    // 以下のハンドラは「自分が起動したプロセス」のときだけ状態を触る（#57）。
+    // 再起動のあとに古いプロセスの exit が届き、新しいプロセスを null にしていた。
+    p.stderr.on('data', (d) => {
+      if (eng.proc !== p) return;
+      eng.stderrTail = (eng.stderrTail + d.toString()).slice(-1500);
+    });
+    p.on('error', (e) => {
+      if (eng.proc !== p) return;
+      eng.lastError = `${eng.name}を起動できません: ${e.message}`; engineLog(eng.lastError);
+      eng.proc = null; eng.ready = false;
+    });
+    p.on('exit', (code) => {
+      if (eng.proc !== p) return;
+      if (!quitting && !eng.stopping) {
+        const tail = eng.stderrTail.split('\n').filter(Boolean).slice(-3).join(' / ');
+        eng.lastError = `${eng.name}が終了しました (code ${code})${tail ? `: ${tail}` : ''}`.trim();
+        engineLog(eng.lastError);
+      }
+      eng.proc = null; eng.ready = false; eng.readyPromise = null;
+    });
+  })().finally(() => { eng.startPromise = null; });
+  return eng.startPromise;
 }
 
 function stopEngine(eng) {
@@ -345,9 +412,10 @@ function stopEngine(eng) {
 function ensureEngineReady(eng) {
   if (eng.ready && eng.proc) return Promise.resolve(true);
   if (eng.readyPromise) return eng.readyPromise;
-  eng.readyPromise = (async () => {
-    if (!eng.proc) startEngine(eng);
-    if (!eng.proc) return false;
+  const self = (async () => {
+    if (!eng.proc) await startEngine(eng);
+    let p = eng.proc;
+    if (!p) return false;
     // 「/」は見ない。llama-server はモデル読み込み中でも「/」に 200 を
     // 返すため、準備完了と誤認して直後の推論が 503 になる（実機で発生）。
     // /health は読み込み中 503・完了で 200 を返す。エンドポイントを持たない
@@ -355,9 +423,12 @@ function ensureEngineReady(eng) {
     const url = `http://127.0.0.1:${enginePort(eng)}/health`;
     const deadline = Date.now() + ENGINE_READY_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      if (!eng.proc) return false;
+      // 待っている間に再起動されていたら、新しいプロセスを待ち直す（#57）
+      if (eng.proc !== p) { if (!eng.proc) return false; p = eng.proc; }
       try {
         const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
+        // 応答を待つ間に再起動されていたら、その応答は古い（または他の）プロセスのもの
+        if (eng.proc !== p) continue;
         if (res.ok || res.status === 404) { eng.ready = true; return true; }
       } catch (e) {
         // 接続先の URL 自体が組み立てられない（ポートが不正）なら、90秒待っても
@@ -377,8 +448,9 @@ function ensureEngineReady(eng) {
       eng.lastError = `${eng.name}の起動がタイムアウトしました${tail ? `: ${tail}` : '（モデル読み込み中の可能性）'}`;
     }
     return false;
-  })().finally(() => { eng.readyPromise = null; });
-  return eng.readyPromise;
+  })().finally(() => { if (eng.readyPromise === self) eng.readyPromise = null; });   // 再起動後の新しい待ちを消さない
+  eng.readyPromise = self;
+  return self;
 }
 
 function restartEnginesIfNeeded() {
@@ -503,7 +575,7 @@ async function generateMinutes(plain, memo, onProgress, type) {
       { role: 'system', content: sys },
       { role: 'user', content: `${memoBlock}【会議の文字起こし】\n${plain}\n\n上記から、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${minutesTemplate(type)}` },
     ], SUM_MAX_TOKENS);
-    return { md: one.text, truncated: one.truncated };
+    return { md: one.text, truncated: one.truncated, truncatedParts: [], finalTruncated: one.truncated };
   }
 
   const chunks = [];
@@ -513,32 +585,41 @@ async function generateMinutes(plain, memo, onProgress, type) {
     chunks.push(plain.slice(i, i + CHUNK + 200));
   }
   const notes = [];
-  let truncated = false;
+  const truncatedParts = [];   // 半分にしても上限で切れたパート番号（1 始まり）
+  const extract = async (text, i) => {
+    const r = await llmChatP([
+      { role: 'system', content: sys },
+      { role: 'user', content: `以下は長い会議の文字起こしの一部（${i + 1}/${chunks.length}）です。重要な発言・決定・依頼・課題・数字を漏らさず、簡潔な箇条書きで抽出してください。文体は常体（だ・である調、体言止め）。\n\n${text}` },
+    ], NOTE_MAX_TOKENS);
+    return r;
+  };
   for (let i = 0; i < chunks.length; i++) {
     if (onProgress) onProgress(`要約中… (${i + 1}/${chunks.length})`);
-    const part = await llmChatP([
-      { role: 'system', content: sys },
-      { role: 'user', content: `以下は長い会議の文字起こしの一部（${i + 1}/${chunks.length}）です。重要な発言・決定・依頼・課題・数字を漏らさず、簡潔な箇条書きで抽出してください。文体は常体（だ・である調、体言止め）。\n\n${chunks[i]}` },
-    ], NOTE_MAX_TOKENS);
-    if (part.truncated) truncated = true;
-    notes.push(`--- パート${i + 1} ---\n${part.text}`);
+    // 上限で切れたら半分に割って両方をやり直す（一度だけ。mainlib.extractNotes）。
+    // 切れたままだと中盤の議題が黙って欠ける（#16）。それでも切れたら本文は残し、
+    // 要点メモに注記を添え、パート番号を控える（summaryError で名指しする）。
+    const part = await extractNotes((t) => extract(t, i), chunks[i]);
+    let text = part.text;
+    if (part.truncated) {
+      truncatedParts.push(i + 1);
+      text += `\n（※パート${i + 1}の抽出は途中で切れています）`;
+    }
+    notes.push(`--- パート${i + 1} ---\n${text}`);
   }
   if (onProgress) onProgress('議事録をまとめています…');
   const final = await llmChatP([
     { role: 'system', content: sys },
     { role: 'user', content: `${memoBlock}【会議の要点メモ（時系列）】\n${notes.join('\n\n')}\n\n上記の要点メモを統合し、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${minutesTemplate(type)}` },
   ], SUM_MAX_TOKENS);
-  return { md: final.text, truncated: truncated || final.truncated };
+  return { md: final.text, truncated: truncatedParts.length > 0 || final.truncated, truncatedParts, finalTruncated: final.truncated };
 }
 
 // ---------------------------------------------------------------- 貼り付け
 function ensurePaster() {
   if (process.platform !== 'win32') return null;
   if (pasterProc && pasterProc.stdin && pasterProc.stdin.writable) return pasterProc;
-  const script = "$ErrorActionPreference='SilentlyContinue';"
-    + 'Add-Type -AssemblyName System.Windows.Forms;'
-    + 'while($true){ $l=[Console]::In.ReadLine(); if($null -eq $l){break};'
-    + " if($l -eq 'paste'){ [System.Windows.Forms.SendKeys]::SendWait('^v') } }";
+  // 貼り付け（paste）と、除外書式付きの置き直し（copy）を受ける（mainlib.pasterScript）
+  const script = pasterScript();
   try {
     pasterProc = spawn('powershell.exe', ['-NoProfile', '-STA', '-NonInteractive', '-Command', script],
       { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'] });
@@ -565,9 +646,33 @@ function simulatePaste() {
     }
   });
 }
+// クリップボードへ書く唯一の入口（#27）。Electron の clipboard で先に書き（これは
+// 必ず効く）、Windows では常駐 PowerShell に頼んで、クリップボード履歴（Win+V）と
+// クラウド同期から除外する書式を付けて置き直す（書式は mainlib.pasterScript）。
+// 置き直しに失敗しても本文は残る。'paste' と同じ標準入力に順に流すので、
+// 置き直しが貼り付けより後になることはない。
+function copyPrivate(text) {
+  const t = String(text ?? '');
+  clipboard.writeText(t);
+  if (process.platform !== 'win32') return;
+  const p = ensurePaster();
+  if (p && p.stdin && p.stdin.writable) {
+    try { p.stdin.write(`${copyCommand(t)}\n`); } catch (_) { /* noop */ }
+  }
+}
 async function deliverText(text) {
-  clipboard.writeText(text);
-  if (settings.autoPaste) { await new Promise((r) => setTimeout(r, 50)); await simulatePaste(); }
+  // 自動貼り付けのあとは元のクリップボードを戻す（文字列だったときだけ・できる範囲で）。
+  // 音声入力は「いま書いている場所へ入れる」道具なので、貼り付けた本文が
+  // クリップボードに残り続けると、直前にコピーしていたものが失われる。
+  let prev = '';
+  if (settings.autoPaste) { try { prev = clipboard.readText(); } catch (_) { prev = ''; } }
+  copyPrivate(text);
+  if (!settings.autoPaste) return;
+  await new Promise((r) => setTimeout(r, 50));
+  await simulatePaste();
+  // 貼り付け先がクリップボードを読む前に戻すと古い方が貼られる。SendWait は
+  // 処理完了まで待つが、読み取りが遅いアプリに備えて少し置いてから戻す。
+  if (prev && prev !== text) setTimeout(() => copyPrivate(prev), 500);
 }
 
 // ---------------------------------------------------------------- ウィンドウ
@@ -648,13 +753,13 @@ function createMainWindow() {
   mainWin.on('close', (e) => {
     if (quitting) return;
     if (settings.stayInTray) { e.preventDefault(); mainWin.hide(); return; }
-    if (state === 'meeting' || state === 'meeting-finalizing') {
-      // 記録中の閉じ間違いで会議を失わせない。draft からの復旧はあるが、
-      // 要約前の状態に戻るので、一度は確認を挟む。
+    // 記録中・要約中の閉じ間違いで会議や要約を失わせない（文は mainlib.closeConfirm）。
+    // draft からの復旧はあるが要約前の状態に戻るので、一度は確認を挟む。
+    const confirm = closeConfirm(state === 'meeting' || state === 'meeting-finalizing', isSummarizing());
+    if (confirm) {
       const r = dialog.showMessageBoxSync(mainWin, {
         type: 'warning', buttons: ['終了する', 'キャンセル'], defaultId: 1, cancelId: 1,
-        message: '議事録を記録中です',
-        detail: '終了すると録音が止まります。ここまでの文字起こしは、次回起動時に復旧できます。',
+        message: confirm.message, detail: confirm.detail,
       });
       if (r !== 0) { e.preventDefault(); return; }
     }
@@ -666,9 +771,10 @@ function createMainWindow() {
 // ---------------------------------------------------------------- 音声入力
 function startRecording() {
   if (state !== 'idle') return;
-  if (!engineValid(whisperEng)) {
+  const problem = whisperProblem();
+  if (problem) {
     createMainWindow();
-    sendToMainWin('app:notice', '文字起こしエンジンが未設定です。設定タブでパスを指定してください。');
+    sendToMainWin('app:notice', problem);
     return;
   }
   ensureEngineReady(whisperEng);
@@ -742,6 +848,71 @@ function hideOverlayIfIdle() {
   if (state === 'idle' && overlayWin && !overlayWin.isDestroyed()) overlayWin.hide();
 }
 
+// ---------------------------------------------------------------- 区間の音声の退避（#8/#42）
+// 区間は音声が届いた時点で { id, atMs, durationMs, pending: true, wav, text: '' } として
+// meeting.segments と draft.json に控え、音声そのものを <userData>/data/segbuf/<開始時刻>/<seq>.wav
+// へ退避する。文字起こしが終わったら同じ要素を結果で置き換え、wav を消す。
+// 以前は文字起こしが終わるまで draft に載らず、その間にアプリが落ちると音声ごと消えていた。
+// 残った wav は次回起動時に文字起こしして復旧ページへ差し替える（recoverDraftIfAny）。
+const segbufRoot = () => path.join(app.getPath('userData'), 'data', 'segbuf');
+const segbufDir = (startedAt) => path.join(segbufRoot(), String(startedAt));
+function spoolSegment(dir, seq, buffer) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${seq}.wav`);
+    // 一時ファイルに書いてから置き換える（書き込み中に落ちても半端な wav を復旧しない）
+    fs.writeFileSync(`${file}.tmp`, buffer);
+    fs.renameSync(`${file}.tmp`, file);
+    return file;
+  } catch (e) {
+    engineLog(`音声の退避に失敗: ${e.message}`);   // 退避できなくても文字起こしは続ける
+    return '';
+  }
+}
+function unlinkQuiet(file) { if (file) { try { fs.unlinkSync(file); } catch (_) { /* noop */ } } }
+// 空のときだけ消す（rmdir は中身があれば失敗する）。中身が残っているなら復旧の材料
+function removeDirIfEmpty(dir) { try { fs.rmdirSync(dir); } catch (_) { /* noop */ } }
+// 破棄: 退避した音声は復旧の材料にしない（破棄は利用者の意思）
+function cleanupSegbuf(m) {
+  for (const s of m.segments) if (s.pending) unlinkQuiet(s.wav);
+  removeDirIfEmpty(segbufDir(m.startedAt));
+}
+// 文字起こし待ちの区間を結果で置き換える（id/atMs はそのまま。pending/wav を外し、wav を消す）。
+// patch が null なら区間ごと消す（空・直前の繰り返し。以前は push しなかったのと同じ）
+function settleSegment(m, seg, patch) {
+  unlinkQuiet(seg.wav);
+  if (patch) {
+    delete seg.pending; delete seg.wav;
+    Object.assign(seg, patch);
+  } else {
+    const i = m.segments.indexOf(seg);
+    if (i >= 0) m.segments.splice(i, 1);
+  }
+  writeDraft();
+  sendToMainWin('meeting:update', meetingStatus());
+}
+
+// 文字起こしが追いつかないとき（待ちが 3 区間を超える）は区間を倍に伸ばして送る回数を
+// 減らし、追いついたら（待ち 1 以下）設定の長さに戻す（判断は mainlib.nextSegmentMs。#42）。
+// 変わったときだけオーバーレイへ送る（次の区切りから効く）
+function applyBackpressure(m, delta) {
+  const base = (settings.segmentSec || 75) * 1000;
+  const next = nextSegmentMs(pendingSegs, m.segmentMs || base, base, delta);
+  if (next === m.segmentMs) return;
+  m.segmentMs = next;
+  sendToOverlay('overlay:segment-ms', next);
+}
+
+// 残りの待ち時間（秒）。待ちの区間の長さの合計に、区間ごとの処理時間の比（EMA。
+// mainlib.EtaTracker）を掛ける。進行中の区間で既に経過した分は引く。待ちが無ければ null。
+// 比はアプリの起動中は持ち越す（次の会議の最初の区間から見積もれる）
+const eta = new EtaTracker();
+function etaSecOf(m) {
+  const remain = pendingDurationMs(m.segments);
+  if (remain <= 0) return null;
+  return eta.etaSec(remain, m.inFlightSince ? Date.now() - m.inFlightSince : 0);
+}
+
 // ---------------------------------------------------------------- 議事録
 function meetingStatus() {
   return {
@@ -749,12 +920,18 @@ function meetingStatus() {
     finalizing: state === 'meeting-finalizing',
     startedAt: meeting ? meeting.startedAt : null,
     memo: meeting ? meeting.memo : '',
-    segments: meeting ? meeting.segments : [],
+    segments: meeting ? publicSegments(meeting.segments) : [],   // wav（パス）は外す。待ちは pending: true
     pending: pendingSegs,
     stoppedAt: meeting && meeting.stoppedAt ? meeting.stoppedAt : null,
     paused: Boolean(meeting && meeting.paused),
     pausedMs: meeting ? meeting.pausedMs + (meeting.paused ? Date.now() - meeting.pausedAt : 0) : 0,
     systemAudio: Boolean(meeting && meeting.systemAudio),
+    // 選んだマイクが見つからず既定のマイクで録っている（overlay:mic）。黙って
+    // 別のマイクで録ると、会議が終わってから片側しか入っていないことに気づく
+    micFallback: Boolean(meeting && meeting.micFallback),
+    // 残りの待ち時間の見積もり（秒。材料が無い・待ちが無いときは null）と、打ち切った区間の数
+    etaSec: meeting ? etaSecOf(meeting) : null,
+    skipped: meeting ? meeting.skipped : 0,
   };
 }
 
@@ -766,31 +943,117 @@ function writeDraft() {
   });
 }
 
+// 復旧ページで文字起こし待ちのまま残った音声 { pageId, items: [{ id, wav, durationMs }], dir }。
+// 起動が済んでエンジンが用意できてから順に文字起こしする
+let recoveryQueue = null;
 function recoverDraftIfAny() {
   const d = store.readDraft();
   if (!d || !Array.isArray(d.segments) || d.segments.length === 0) { store.clearDraft(); return; }
   const dt = new Date(d.startedAt || Date.now());
+  // 文字起こしが終わっていなかった区間（pending）は失敗扱いでページに載せ、wav が残っていれば
+  // あとで文字起こしして差し替える（mainlib.recoverSegments）。先にページを作るのは、
+  // エンジンの起動を待たずに復旧した本文を開けるようにするため
+  const rec = recoverSegments(d.segments, (f) => fs.existsSync(f));
   const page = store.createPage({
     title: `${dt.getFullYear()}/${dt.getMonth() + 1}/${dt.getDate()} ${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')} の議事録（復旧）`,
-    date: dt.toISOString().slice(0, 10),
+    // 日付はローカルの暦日（#51。UTC で作ると日本の朝の会議が前日になる）
+    date: localDateISO(dt),
     durationSec: Math.round((d.offsetMs || 0) / 1000),
     memo: d.memo || '',
     blocks: [],
-    segments: d.segments,
+    segments: rec.segments,
     createdAt: new Date(d.startedAt || Date.now()).toISOString(),
     recovered: true,
   });
-  page.summaryError = '録音が中断されたため要約は未生成です。「要約を生成」で作成できます。';
+  page.summaryError = rec.todo.length
+    ? '録音が中断されたため要約は未生成です。残っていた音声の文字起こしを続けています。終わったら「要約を生成」で作成できます。'
+    : '録音が中断されたため要約は未生成です。「要約を生成」で作成できます。';
   store.savePage(page);
   store.clearDraft();
   recoveredPageId = page.id;
+  if (rec.todo.length) recoveryQueue = { pageId: page.id, items: rec.todo, dir: segbufDir(d.startedAt) };
+  else removeDirIfEmpty(segbufDir(d.startedAt));
+}
+
+// 復旧ページの「文字起こし待ち」を、起動が済んでエンジンが用意できてから順に文字起こしし、
+// store.updateSegment で本文を差し替える（failed が外れて要約の材料に戻る）。
+// 失敗した区間は失敗の文を残す。ページが消されていたら残りの wav を捨てて止める。
+// 済んだ wav は消し、空になった退避フォルダも消す。
+async function transcribeRecovered() {
+  const q = recoveryQueue;
+  recoveryQueue = null;
+  if (!q) return;
+  const ready = await ensureEngineReady(whisperEng);
+  let done = 0;
+  for (const item of q.items) {
+    if (!store.getPage(q.pageId)) { unlinkQuiet(item.wav); continue; }   // ページが消された
+    let text = null;
+    let err = ready ? '' : (whisperEng.lastError || '文字起こしエンジンが起動していません');
+    if (!err) {
+      try {
+        text = await transcribeLocal(fs.readFileSync(item.wav), '', item.durationMs);
+        if (settings.removeFillers) text = removeFillersRule(text);
+      } catch (e) { err = e.message; }
+    }
+    if (err) {
+      // 失敗の文を残す（updateSegment は failed を外してしまうので直接書く）
+      const segs = store.getTranscript(q.pageId);
+      const s = segs.find((x) => x.id === item.id);
+      if (s) { s.text = `（この区間の認識に失敗: ${err}）`; s.failed = true; store.saveTranscript(q.pageId, segs); }
+    } else if (text) {
+      store.updateSegment(q.pageId, item.id, { text });
+      done++;
+    } else {
+      removeTranscriptSegment(q.pageId, item.id);   // 無音: 区間ごと消す（記録中と同じ扱い）
+      done++;
+    }
+    // 成否にかかわらず消す。失敗した wav をもう一度試す経路は無く、7 日残しても使われない
+    unlinkQuiet(item.wav);
+  }
+  removeDirIfEmpty(q.dir);
+  const page = store.getPage(q.pageId);
+  if (!page) return;
+  // 「続けています」の文を通常の復旧の文に戻す（別の要約が書いていれば触らない）
+  const latest = saveIfExists(store, q.pageId, (p) => {
+    if (String(p.summaryError || '').includes('文字起こしを続けています')) {
+      p.summaryError = '録音が中断されたため要約は未生成です。「要約を生成」で作成できます。';
+    }
+  });
+  sendToMainWin('pages:updated', store.listPages());
+  sendToMainWin('page:updated', { page: latest || page, segments: store.getTranscript(q.pageId) });
+  sendToMainWin('app:notice', `中断されていた文字起こしの復旧が終わりました（${done}/${q.items.length} 区間）。「要約を生成」で議事録を作成できます。`);
+}
+function removeTranscriptSegment(pageId, segId) {
+  store.saveTranscript(pageId, store.getTranscript(pageId).filter((s) => s.id !== segId));
+}
+
+// 7 日より古い退避フォルダを消す（復旧されずに残った孤児。判断は mainlib.staleSegbufDirs）。
+// 今回復旧中のフォルダ（keepDir）は残す
+function cleanOrphanSegbuf(keepDir) {
+  let names = [];
+  try { names = fs.readdirSync(segbufRoot()); } catch (_) { return; }
+  const entries = names.map((name) => {
+    let mtimeMs = 0;
+    try { mtimeMs = fs.statSync(path.join(segbufRoot(), name)).mtimeMs; } catch (_) { /* noop */ }
+    return { name, mtimeMs };
+  });
+  for (const name of staleSegbufDirs(entries, Date.now())) {
+    const dir = path.join(segbufRoot(), name);
+    if (dir === keepDir) continue;
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* noop */ }
+  }
 }
 
 function startMeeting() {
   if (state !== 'idle') return { ok: false, error: '他の処理を実行中です' };
-  if (!engineValid(whisperEng)) return { ok: false, error: '文字起こしエンジンが未設定です。設定タブでパスを指定してください。' };
+  const problem = whisperProblem();
+  if (problem) return { ok: false, error: problem };
   meeting = { startedAt: Date.now(), memo: '', segments: [], offsetMs: 0, stopping: false, seq: 0,
-    systemAudio: false, paused: false, pausedMs: 0, pausedAt: 0 };
+    systemAudio: false, paused: false, pausedMs: 0, pausedAt: 0,
+    // gen: 打ち切り（meeting:skipPending）で進める世代。進行中の結果を捨てる判断に使う
+    // segmentMs: いま録音側に頼んでいる区間の長さ（背圧で伸縮する）
+    // inFlightSince: 文字起こし中の区間の開始時刻（残り時間の見積もりで経過分を引く）
+    gen: 0, skipped: 0, micFallback: false, segmentMs: (settings.segmentSec || 75) * 1000, inFlightSince: 0 };
   segChain = Promise.resolve(); pendingSegs = 0;
   state = 'meeting';
   writeDraft();
@@ -850,6 +1113,8 @@ function stopMeeting() {
 function discardMeeting() {
   if (state !== 'meeting' && state !== 'meeting-finalizing') return { ok: false };
   sendToOverlay('overlay:cancel', {});
+  const m = meeting;
+  cleanupSegbuf(m);
   meeting = null; store.clearDraft();
   segChain = Promise.resolve(); pendingSegs = 0;
   state = 'idle'; updateTray();
@@ -874,34 +1139,50 @@ function onMeetingSegment(buffer, durationMs, isFinal) {
   const m = meeting;
   const segOffset = m.offsetMs;
   m.offsetMs += durationMs;
+  // 短すぎる端切れ（無音の切れ端）は区間にしない。件数には数え、最後の区間なら締めの引き金にする
+  let seg = null;
+  if (buffer.byteLength >= 4000) {
+    // 音声を先にディスクへ退避し、区間を「文字起こし待ち」として draft に控える（#8/#42）。
+    // 文字起こしは録音より遅れて終わる。その間にアプリが落ちても、wav が残っていれば
+    // 次回起動時に文字起こしして復旧できる
+    seg = { id: `s${++m.seq}`, atMs: segOffset, durationMs, pending: true, wav: '', text: '' };
+    seg.wav = spoolSegment(segbufDir(m.startedAt), m.seq, buffer);
+    m.segments.push(seg);
+    writeDraft();
+  }
+  // 打ち切り（meeting:skipPending）で世代が進んだら、進行中・待ち行列の結果は捨てる
+  const gen = m.gen;
   pendingSegs++;
+  applyBackpressure(m, 1);
   sendToMainWin('meeting:update', meetingStatus());
   segChain = segChain.then(async () => {
-    if (meeting !== m) return;
-    if (buffer.byteLength < 4000) return;
+    if (meeting !== m || m.gen !== gen || !seg) return;
     // 直近の「成功した」区間の末尾。失敗区間のエラー文を渡すと、次の区間が
-    // それを文例として真似る（mainlib.promptTail）。
+    // それを文例として真似る（mainlib.promptTail。待ちの区間は飛ばす）。
     const tail = promptTail(m.segments);
+    const t0 = Date.now();
+    m.inFlightSince = t0;
     let text = '';
     try {
       text = await transcribeLocal(buffer, tail, durationMs);
     } catch (e) {
-      if (meeting !== m) return;
-      m.segments.push({ id: `s${++m.seq}`, atMs: segOffset, text: `（この区間の認識に失敗: ${e.message}）`, failed: true });
-      writeDraft(); sendToMainWin('meeting:update', meetingStatus());
+      if (meeting !== m || m.gen !== gen) return;
+      m.inFlightSince = 0;
+      settleSegment(m, seg, { text: `（この区間の認識に失敗: ${e.message}）`, failed: true });
       return;
     }
-    if (meeting !== m) return;
+    if (meeting !== m || m.gen !== gen) return;
+    m.inFlightSince = 0;
+    eta.record(Date.now() - t0, durationMs);   // 成功した区間だけで学習（失敗は時間の目安にならない）
     if (settings.removeFillers) text = removeFillersRule(text);
-    if (!text) return;
-    const prev = m.segments.length ? m.segments[m.segments.length - 1].text : '';
-    if (prev && text.length > 6 && prev === text) return; // 繰り返しハルシネーション抑制
-    m.segments.push({ id: `s${++m.seq}`, atMs: segOffset, text });
-    writeDraft();
-    sendToMainWin('meeting:update', meetingStatus());
+    // 空・直前と同じ（繰り返しハルシネーション）は区間ごと消す
+    const done = m.segments.filter((s) => !s.pending);
+    const prev = done.length ? done[done.length - 1].text : '';
+    if (!text || (prev && text.length > 6 && prev === text)) { settleSegment(m, seg, null); return; }
+    settleSegment(m, seg, { text });
   }).catch(() => {}).finally(() => {
     // 破棄済みの議事録の区間は、破棄時に数え直した件数を減らさない
-    if (meeting === m) pendingSegs = Math.max(0, pendingSegs - 1);
+    if (meeting === m) { pendingSegs = Math.max(0, pendingSegs - 1); applyBackpressure(m, -1); }
     sendToMainWin('meeting:update', meetingStatus());
     if (meeting === m && (isFinal || (m.stopping && pendingSegs === 0))) {
       maybeFinalizeMeeting().catch((e) => engineLog(`finalize failed: ${e.message}`));
@@ -926,12 +1207,13 @@ async function maybeFinalizeMeeting() {
   try {
     page = store.createPage({
       title: fallbackTitle,
-      date: dt.toISOString().slice(0, 10),
+      date: localDateISO(dt),   // ローカルの暦日（#51）
       durationSec, memo: m.memo, blocks: [],
-      segments: m.segments,
+      segments: settledSegments(m.segments),   // 待ちの区間（本文なし）と wav のパスは載せない
       createdAt: dt.toISOString(),
     });
     store.clearDraft();
+    removeDirIfEmpty(segbufDir(m.startedAt));   // 全区間が片付いていれば空
   } catch (e) {
     // 保存に失敗しても draft.json は消さない（次回起動時に復旧できる）
     engineLog(`議事録の保存に失敗: ${e.message}`);
@@ -956,7 +1238,10 @@ async function maybeFinalizeMeeting() {
 // 実行して固定）。走行中に「要約を生成」を連打されると、同じ文字起こしに対して
 // 要約が二重に走り、後から終わった方が前の結果（とその間の編集）を上書きしていた。
 // 走行中なら同じ Promise を返す。
-const runSummary = makeSummaryRunner(doRunSummary);
+const runSummary = makeSummaryRunner(doRunSummary, () => updateTray());
+// 要約が走っている間はアプリを「忙しい」として扱う（#52）: 省電力を止めない・終了前に
+// 確かめる・更新と再起動を拒む。件数は mainlib.makeSummaryRunner が持つ。
+const isSummarizing = () => runSummary.running().length > 0;
 
 // 要約の生成 → ブロック化 → 出典付与 → 保存
 async function doRunSummary(pageId) {
@@ -975,7 +1260,8 @@ async function doRunSummary(pageId) {
   const page = store.getPage(pageId);
   if (!page) { clearUi(); return { ok: false, error: 'ページが見つかりません' }; }
   let segments = store.getTranscript(pageId);   // 出典付与の直前に読み直して差し替える（下記）
-  const usable = segments.filter((s) => !s.failed);
+  const segmentsAtStart = segments;   // 要約の材料にした配列。出典付けで今の配列と突き合わせる（#4）
+  const usable = segments.filter((s) => !s.failed && !s.pending);
   const plain = usable.map((s) => s.text).join('\n');
 
   if (!plain.trim()) {
@@ -1019,7 +1305,7 @@ async function doRunSummary(pageId) {
     message: `要約エンジンで議事録を作成中…（${mtype.getLabel(page.meetingType)}として要約します）`,
   });
   try {
-    const { md, truncated } = await generateMinutes(
+    const { md, truncatedParts, finalTruncated } = await generateMinutes(
       plain, page.memo,
       (msg) => sendToMainWin('meeting:progress', { message: msg }),
       page.meetingType,
@@ -1036,7 +1322,8 @@ async function doRunSummary(pageId) {
     // 出典は読み込み時の配列ではなく、いまディスクにある文字起こしに対して付ける。
     // 画面へ返す segments も同じもの（古い配列を返すと、編集した行が画面上で戻る）。
     const fresh = store.getTranscript(pageId);
-    const stat = attachCitations(blocks, fresh.filter((s) => !s.failed));
+    // 要約の材料にした配列（入口）と今の配列の両方を渡す（#4。cite.attachCitationsAcross）
+    const stat = attachAcross(blocks, fresh, segmentsAtStart);
     segments = fresh;
 
     // 同じ理由で、タイトルやメモも読み込み時のページを丸ごと書き戻さず、
@@ -1048,9 +1335,8 @@ async function doRunSummary(pageId) {
       saved.autoType = page.autoType;
       saved.citeStat = stat;
       saved.actionStat = actStat;
-      saved.summaryError = truncated
-        ? '要約が長さの上限で打ち切られた可能性があります。末尾の議題が欠けていないか確認してください。'
-        : '';
+      // 切れたパートと最終統合の打ち切りを名指しする（mainlib.truncationMessage。無ければ ''）
+      saved.summaryError = truncationMessage(truncatedParts, finalTruncated);
     });
     if (!latest) return gone();
     clearUi();
@@ -1058,6 +1344,7 @@ async function doRunSummary(pageId) {
     sendToMainWin('page:updated', { page: latest, segments });
     return { ok: true, page: latest, stat };
   } catch (e) {
+    if (quitting) return { ok: false, error: e.message };   // 終了中: before-quit が書いた「中断」の文を上書きしない
     const latest = saveIfExists(store, pageId, (saved) => { saved.summaryError = e.message; });
     if (!latest) return gone();
     clearUi();
@@ -1140,6 +1427,10 @@ async function checkUpdateFromTray() {
     detail: String(r.notes || '').slice(0, 800),
   });
   if (pick !== 0) return;
+  if (isSummarizing()) {   // 確認の間に要約が始まっていることがある（#52）
+    dialog.showMessageBox({ type: 'info', message: '要約を作成中です', detail: '終わってから更新してください' });
+    return;
+  }
   const res = await updater.apply(r.url, target.root, app.getPath('userData'), () => {});
   if (!res.ok) {
     dialog.showMessageBox({ type: 'error', message: '更新に失敗しました', detail: res.error || '' });
@@ -1175,7 +1466,7 @@ function updateTray() {
   // つまずくと、設定タブの「更新を確認」ボタンごと動かなくなり、
   // アプリ内更新で直すこともできなくなる（実機で起きた）。
   // 復旧の手段が、壊れうるものに依存していてはいけない。
-  items.push({ label: '更新を確認', enabled: state === 'idle', click: checkUpdateFromTray });
+  items.push({ label: '更新を確認', enabled: state === 'idle' && !isSummarizing(), click: checkUpdateFromTray });
   items.push({ type: 'separator' });
   items.push({ label: '終了', click: () => { quitting = true; app.quit(); } });
   // 既定で代替している／登録できていないキーがあれば、その旨を添える
@@ -1240,6 +1531,11 @@ function setupIpc() {
     const prevAutoLaunch = settings.autoLaunch;
     const prevPillPos = settings.pillPos;
     const merged = normalizeSettings({ ...settings, ...next }, DEFAULT_SETTINGS);
+    // 記録中はエンジンに関わる設定を前の値に留める（#57。判断は mainlib.guardEngineSettings）。
+    // 保存のたびにエンジンが再起動すると、文字起こし中の区間が失われる。留めた値は
+    // applied で画面へ戻し、warning で伝える。
+    const guard = guardEngineSettings(settings, merged, Boolean(meeting));
+    Object.assign(merged, guard.settings);
 
     // ホットキーは変えた側だけ登録し直し、失敗した側だけ前の値に戻して、他の設定は
     // 保存する（判断は mainlib.saveHotkeys。main.test.js で実行して固定）。
@@ -1258,16 +1554,20 @@ function setupIpc() {
       hotkeyNote = hk.note;
       warning = hk.warning;
     }
+    if (guard.warning) warning = warning ? `${warning}。${guard.warning}` : guard.warning;
     if (merged.pillPos !== prevPillPos) merged.pillCustom = null;
     settings = merged;
     persistSettings();
     applyTheme();
-    restartEnginesIfNeeded();
+    if (!guard.kept.length) restartEnginesIfNeeded();
     if (settings.autoLaunch !== prevAutoLaunch) {
       try { app.setLoginItemSettings({ openAtLogin: settings.autoLaunch }); } catch (_) { /* noop */ }
     }
     updateTray();
     const applied = { hotkey: settings.hotkey, meetingHotkey: settings.meetingHotkey };
+    // 画面が送った値と違う値で残ったキーは全部載せる（記録中に留めたエンジン設定・
+    // 正規化で丸めた値も）。画面はこれを欄に戻す（mainlib.keptDifferent）
+    Object.assign(applied, keptDifferent(next, settings));
     return warning ? { ok: true, applied, warning } : { ok: true, applied };
   });
   ipcMain.handle('hotkey:state', () => hotkeyState);
@@ -1335,10 +1635,28 @@ function setupIpc() {
   ipcMain.handle('meeting:discard', () => discardMeeting());
   ipcMain.handle('meeting:status', () => meetingStatus());
   ipcMain.handle('meeting:set-memo', (_e, memo) => { if (meeting) { meeting.memo = String(memo || ''); writeDraft(); } return true; });
+  // 終了後の文字起こし待ちを打ち切る（#42）。記録中（終了前）は打ち切れない。待ちの区間は
+  // 「（文字起こしを打ち切り）」の失敗扱いでページに残し、wav は消す（mainlib.skipPendingSegments）。
+  // 進行中・待ち行列の結果は世代（gen）で無効にし、待ち件数を 0 にして締める
+  ipcMain.handle('meeting:skipPending', () => {
+    if (!meeting || !meeting.stopping) return { ok: false, error: '記録を終了したあとにだけ打ち切れます' };
+    const m = meeting;
+    m.gen++;
+    const r = skipPendingSegments(m.segments);
+    for (const f of r.wavs) unlinkQuiet(f);
+    m.skipped += r.count;
+    m.inFlightSince = 0;
+    pendingSegs = 0;
+    writeDraft();
+    sendToMainWin('meeting:update', meetingStatus());
+    maybeFinalizeMeeting().catch((e) => engineLog(`finalize failed: ${e.message}`));
+    return { ok: true, skipped: r.count };
+  });
 
-  ipcMain.handle('clipboard:copy', (_e, t) => { clipboard.writeText(String(t ?? '')); return true; });
+  ipcMain.handle('clipboard:copy', (_e, t) => { copyPrivate(String(t ?? '')); return true; });
   ipcMain.handle('app:test', async () => {
-    if (!engineValid(whisperEng)) return { ok: false, error: 'whisper-server.exe またはモデルファイルのパスが正しくありません' };
+    const problem = engineCheck(whisperEng);   // 原因を名指しする（#32）
+    if (problem) return { ok: false, error: problem };
     const ok = await ensureEngineReady(whisperEng);
     if (!ok) return { ok: false, error: whisperEng.lastError || '起動に失敗しました' };
     const vad = settings.useVad ? resolveVadModel() : '';
@@ -1347,10 +1665,17 @@ function setupIpc() {
     return { ok: true, info: `文字起こしエンジンは起動済みです（${notes.join(' / ')}）` };
   });
   ipcMain.handle('app:test-sum', async () => {
-    if (!engineValid(sumEng)) return { ok: false, error: 'llama-server.exe またはモデルファイルのパスが正しくありません' };
+    const problem = engineCheck(sumEng);
+    if (problem) return { ok: false, error: problem };
     const ok = await ensureEngineReady(sumEng);
     return ok ? { ok: true, info: '要約エンジンは起動済みです（オフライン動作可）' }
       : { ok: false, error: sumEng.lastError || '起動に失敗しました' };
+  });
+  // 辞書が初期プロンプトの予算に収まっているか（#23）。kept: 収まった語数、total: 辞書の語数。
+  // 尻尾（直前の発言）は付けずに数える（辞書そのものの収まり具合を見せるため）
+  ipcMain.handle('prompt:info', () => {
+    const r = promptParts('');
+    return { ok: true, kept: r.kept, total: r.total, over: r.over };
   });
   ipcMain.handle('app:vad-status', () => {
     const p = resolveVadModel();
@@ -1377,12 +1702,14 @@ function setupIpc() {
     return { ...r, applyable: updateTarget().ok };
   });
   ipcMain.handle('update:apply', async (_e, url) => {
+    if (isSummarizing()) return { ok: false, error: '要約を作成中です。終わってから更新してください' };
     const t = updateTarget();
     if (!t.ok) return { ok: false, error: t.error };
     return updater.apply(url, t.root, app.getPath('userData'),
       (msg) => sendToMainWin('update:progress', { message: msg }));
   });
   ipcMain.handle('app:restart', () => {
+    if (isSummarizing()) return { ok: false, error: '要約を作成中です。終わってから再起動してください' };
     quitting = true;
     stopEngine(whisperEng); stopEngine(sumEng); stopPaster();
     app.relaunch();
@@ -1418,6 +1745,12 @@ function setupIpc() {
     }
     sendToMainWin('meeting:update', meetingStatus());
   });
+  // 録音側が実際にどのマイクを掴んだか。設定のマイクが抜かれている・名前が
+  // 変わっている等で要求と合わなかったときだけ「代替中」にする（#56）。
+  ipcMain.on('overlay:mic', (_e, info) => {
+    if (meeting) meeting.micFallback = !!(info && info.requested && !info.matched);
+    sendToMainWin('meeting:update', meetingStatus());
+  });
   ipcMain.on('overlay:source', (_e, { systemAudio, wanted }) => {
     if (!meeting) return;
     meeting.systemAudio = Boolean(systemAudio);
@@ -1447,6 +1780,7 @@ if (!gotLock) {
   app.whenReady().then(() => {
     loadStores();
     recoverDraftIfAny();
+    cleanOrphanSegbuf(recoveryQueue ? recoveryQueue.dir : '');   // 復旧の後で（復旧中のフォルダは残す）
     applyTheme();
     setupIpc();
     // 相手の声（パソコンから出ている音）を録るための受け口。
@@ -1477,6 +1811,8 @@ if (!gotLock) {
     }
     createTray();
     if (engineValid(whisperEng)) startEngine(whisperEng);
+    // 復旧ページに文字起こし待ちの音声が残っていれば、エンジンの用意を待って順に片付ける
+    transcribeRecovered().catch((e) => engineLog(`復旧の文字起こしに失敗: ${e.message}`));
     ensurePaster();
     createMainWindow();
     app.on('activate', () => createMainWindow());
@@ -1488,6 +1824,16 @@ if (!gotLock) {
     }, 8000);
   });
   app.on('window-all-closed', () => { /* トレイ常駐 */ });
-  app.on('before-quit', () => { quitting = true; stopEngine(whisperEng); stopEngine(sumEng); stopPaster(); });
+  app.on('before-quit', () => {
+    quitting = true;
+    // 要約の途中で終了するなら、そのページに「中断された」と書いておく（#52。同期・できる範囲で）。
+    // 書かないと、次に開いたときに要約が空のまま何も言わないページになる。
+    for (const id of runSummary.running()) {
+      try {
+        saveIfExists(store, id, (p) => { p.summaryError = '要約が中断されました。「要約を生成」で作り直せます'; });
+      } catch (_) { /* noop */ }
+    }
+    stopEngine(whisperEng); stopEngine(sumEng); stopPaster();
+  });
   app.on('will-quit', () => { globalShortcut.unregisterAll(); stopEngine(whisperEng); stopEngine(sumEng); stopPaster(); });
 }

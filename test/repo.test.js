@@ -726,7 +726,7 @@ test('#46 要約完了時に手元の古い page で書き戻さない（削除�
 test('#10 同じページの要約は同時に一つだけ走る', () => {
   // 排他の判断は mainlib.makeSummaryRunner（実行して検査するのは main.test.js）。
   // ここは main.js がそれを通しているか（結線）だけを見る。
-  assert.match(main, /const runSummary = makeSummaryRunner\(doRunSummary\)/, '排他を mainlib.makeSummaryRunner で作っていない');
+  assert.match(main, /const runSummary = makeSummaryRunner\(doRunSummary(, \(\) => updateTray\(\))?\)/, '排他を mainlib.makeSummaryRunner で作っていない');
   assert.ok(!/new Map\(\)[^\n]*\n[^\n]*function runSummary/.test(code(main)) && !/const summarizing = new Map\(\)/.test(code(main)),
     '排他を main.js に手書きしている（mainlib を通していない）');
   assert.match(main, /ipcMain\.handle\('page:summarize', \(_e, id\) => runSummary\(id\)\)/);
@@ -812,4 +812,230 @@ test('#18 テンプレートの写しを落とす結線（minutes.dropTemplateEc
   // プロンプトに入れている書式と同じ文字列を渡す（別々に組み立てるとずれる）
   const gen = fnBody(code(main), 'async function generateMinutes', '\nfunction ensurePaster');
   assert.strictEqual((gen.match(/\$\{minutesTemplate\(type\)\}/g) || []).length, 2, 'プロンプト側がテンプレート関数を使っていない');
+});
+
+// ---------------------------------------------------------------- 第2段（D: 小さな直し）
+test('#51 議事録の日付はローカルの暦日で作る（UTC の toISOString で日付を作らない）', () => {
+  // 計算は src/dates.js の localDateISO（main.test.js で実行）。ここは結線だけ見る
+  const m = code(main);
+  assert.ok(!m.includes('toISOString().slice(0, 10)'), 'UTC の日付が残っている');
+  assert.match(m, /require\('\.\/dates'\)/, 'dates.js を読み込んでいない');
+  assert.strictEqual((m.match(/date: localDateISO\(dt\)/g) || []).length, 2, '復旧と保存の両方で使っていない');
+});
+
+test('#56 マイクの代替（要求したマイクが無く既定で録っている）を main が受けて画面へ渡す', () => {
+  assert.ok(preload.includes("  reportMic: (info) => ipcRenderer.send('overlay:mic', info),"), 'preload の reportMic が無い');
+  const m = code(main);
+  assert.match(m, /ipcMain\.on\('overlay:mic'/, 'main に受け口が無い');
+  const st = fnBody(m, 'function meetingStatus()', '\n}');
+  assert.ok(st.includes('micFallback'), 'meetingStatus に micFallback が無い');
+  const on = fnBody(m, "ipcMain.on('overlay:mic'", '\n  });');
+  assert.ok(on.includes('meeting.micFallback = !!(info && info.requested && !info.matched)'), '要求したのに合わなかった、を代替としていない');
+  assert.ok(on.includes("sendToMainWin('meeting:update', meetingStatus())"), '画面へ知らせていない');
+});
+
+test('#27 クリップボードへ書くのは copyPrivate だけ（履歴・クラウド同期から除外する）', () => {
+  // 除外書式そのものは mainlib.pasterScript（main.test.js で検査）。ここは
+  // 「書く入口が 1 つで、貼り付けもコピーもそこを通る」ことを見る
+  const m = code(main);
+  assert.strictEqual((m.match(/clipboard\.writeText\(/g) || []).length, 1, 'clipboard.writeText が copyPrivate 以外にもある');
+  const fn = fnBody(m, 'function copyPrivate(', '\n}');
+  assert.ok(fn.includes('clipboard.writeText('), 'copyPrivate が Electron で先に書いていない（PowerShell が無いと何も残らない）');
+  assert.ok(fn.includes('copyCommand('), '常駐 PowerShell に置き直しを頼んでいない');
+  assert.ok(fn.indexOf('clipboard.writeText(') < fn.indexOf('copyCommand('), '置き直しが Electron の書き込みより先にある');
+  const deliver = fnBody(m, 'async function deliverText(', '\n}');
+  assert.ok(deliver.includes('copyPrivate('), '自動貼り付けが copyPrivate を通っていない');
+  assert.ok(deliver.includes('clipboard.readText()'), '貼り付け後に戻す元の中身を読んでいない');
+  assert.match(m, /ipcMain\.handle\('clipboard:copy', \(_e, t\) => \{ copyPrivate\(/, '画面のコピーが copyPrivate を通っていない');
+  assert.ok(fnBody(m, 'function ensurePaster()', '\n}').includes('pasterScript()'), '常駐 PowerShell のスクリプトを mainlib から取っていない');
+});
+
+// ---------------------------------------------------------------- 第2段（B: エンジン）
+test('#28/#31 起動前にポートの空きを見て、塞がっていれば spawn しない', () => {
+  const m = code(main);
+  assert.match(m, /require\('net'\)/, 'net を使っていない');
+  const fn = fnBody(m, 'function startEngine(eng)', '\nfunction stopEngine');
+  assert.ok(fn.includes('await portInUse('), 'ポートの空きを見ていない');
+  assert.ok(fn.indexOf('await portInUse(') < fn.indexOf('spawn('), 'spawn の後でポートを見ている');
+  assert.ok(fn.includes('eng.lastError = portInUseError(port)'), '塞がっているときの文を mainlib から取っていない');
+  assert.ok(fn.includes('if (quitting) return;'), '終了中に待ち明けで起動してしまう（孤児プロセスになる）');
+  // 同時に二度呼ばれても spawn は一度だけ
+  assert.ok(fn.includes('if (eng.startPromise) return eng.startPromise;'), '起動中の二重呼び出しを束ねていない');
+  const probe = fnBody(m, 'function portInUse(port', '\n}');
+  assert.ok(probe.includes("host: '127.0.0.1'") && probe.includes('exclusive: true'), 'listen の条件が違う');
+  assert.ok(probe.includes("'EADDRINUSE'"), 'EADDRINUSE 以外を使用中と誤認する');
+});
+
+test('#57(1) エンジンのハンドラは自分が起動したプロセスのときだけ状態を触る', () => {
+  const fn = fnBody(code(main), 'function startEngine(eng)', '\nfunction stopEngine');
+  assert.match(fn, /p = spawn\(engineExe\(eng\)/, 'spawn の戻りをローカルに持っていない');
+  assert.ok((fn.match(/if \(eng\.proc !== p\) return;/g) || []).length >= 3, 'exit / error / stderr の全部で自分のプロセスか見ていない');
+  // /health の応答が返るまでの間に再起動されていたら、その応答で準備完了にしない
+  const ready = fnBody(code(main), 'function ensureEngineReady', '\nfunction restartEnginesIfNeeded');
+  assert.ok(ready.includes('await startEngine(eng)'), '非同期になった起動を待っていない');
+  const afterFetch = ready.slice(ready.indexOf('await fetch(url'));
+  assert.match(afterFetch, /^[^\n]*\n\s*if \(eng\.proc !== p\) continue;/, 'fetch の直後に自分のプロセスか見ていない');
+});
+
+test('#32 エンジンの実行ファイルとモデルは存在だけでなく中身の有無と大きさを見る', () => {
+  const m = code(main);
+  assert.match(m, /const engineValid = \(e\) => !engineCheck\(e\)/, 'engineValid が engineCheck を通っていない');
+  const chk = fnBody(m, 'function engineCheck(eng)', '\n}');
+  assert.strictEqual((chk.match(/engineFileIssue\(/g) || []).length, 2, '実行ファイルとモデルの両方を見ていない');
+  assert.ok(chk.includes('engineIssueMessage('), '原因を名指しする文を mainlib から取っていない');
+  assert.match(m, /exe: 100_000/); assert.match(m, /whisper: 50_000_000/); assert.match(m, /gguf: 300_000_000/);
+  // 設定画面の「テスト」も原因を名指しする
+  assert.ok(!m.includes('またはモデルファイルのパスが正しくありません'), 'テストの失敗が原因を名指ししていない');
+});
+
+test('#57(2) 記録中はエンジンに関わる設定を変えず、留めた値を applied で画面へ戻す', () => {
+  const save = fnBody(code(main), "ipcMain.handle('settings:save'", '\n  });');
+  assert.ok(save.includes('guardEngineSettings(settings, merged, Boolean(meeting))'), 'mainlib.guardEngineSettings を通していない');
+  assert.ok(save.includes('if (!guard.kept.length) restartEnginesIfNeeded();'), '留めたのにエンジンを再起動している');
+  assert.ok(save.includes('Object.assign(applied, keptDifferent(next, settings))'), '留めた値を applied に載せていない');
+  assert.ok(save.includes('guard.warning'), '警告を画面へ返していない');
+});
+
+test('#52 要約中はアプリを「忙しい」として扱う', () => {
+  const m = code(main);
+  assert.match(m, /const isSummarizing = \(\) => runSummary\.running\(\)\.length > 0/);
+  assert.match(m, /const runSummary = makeSummaryRunner\(doRunSummary, \(\) => updateTray\(\)\)/, '件数の増減でトレイ・省電力を更新していない');
+  assert.ok(fnBody(m, 'function updatePowerBlock()', '\n}').includes("state !== 'idle' || isSummarizing()"), '省電力の抑止が要約中に外れる');
+  const close = fnBody(m, "mainWin.on('close'", '\n  });');
+  assert.ok(close.includes('closeConfirm(') && close.includes('isSummarizing()'), '閉じる確認が要約中を見ていない');
+  assert.match(m, /label: '更新を確認', enabled: state === 'idle' && !isSummarizing\(\)/, 'トレイの更新が要約中に押せる');
+  assert.ok(fnBody(m, "ipcMain.handle('app:restart'", '\n  });').includes('要約を作成中です'), '再起動を拒んでいない');
+  assert.ok(fnBody(m, "ipcMain.handle('update:apply'", '\n  });').includes('要約を作成中です'), '更新の適用を拒んでいない');
+  assert.ok(fnBody(m, 'async function checkUpdateFromTray()', '\nfunction updateTray').includes('要約を作成中です'), 'トレイからの更新を拒んでいない');
+  const bq = fnBody(m, "app.on('before-quit'", '\n  });');
+  assert.ok(bq.includes('runSummary.running()') && bq.includes('要約が中断されました。「要約を生成」で作り直せます'), '終了時に中断をページへ書いていない');
+  // 終了中に要約の失敗を書き戻すと、上の「中断」の文を上書きする
+  assert.match(fnBody(m, 'async function doRunSummary', '\nlet hotkeyState'), /catch \(e\) \{\n\s*if \(quitting\) return/);
+});
+
+// ---------------------------------------------------------------- 第2段（C: 要約とプロンプト）
+test('#16 分割要約が切れたら半分に割ってやり直し、それでも切れたパートを名指しする', () => {
+  // やり直しの判断は mainlib.extractNotes、文は mainlib.truncationMessage（main.test.js で実行）
+  const gen = fnBody(code(main), 'async function generateMinutes', '\nfunction ensurePaster');
+  assert.ok(gen.includes('await extractNotes('), 'やり直しを mainlib.extractNotes で行っていない');
+  assert.ok(gen.includes('truncatedParts.push(i + 1)'), '切れたパート番号を記録していない');
+  assert.ok(gen.includes('（※パート${i + 1}の抽出は途中で切れています）'), '要点メモに注記していない');
+  assert.match(gen, /return \{ md: one\.text, truncated: one\.truncated, truncatedParts: \[\], finalTruncated: one\.truncated \}/);
+  assert.match(gen, /truncatedParts, finalTruncated: final\.truncated \}/);
+  const run = fnBody(code(main), 'async function doRunSummary', '\nlet hotkeyState');
+  assert.ok(run.includes('saved.summaryError = truncationMessage(truncatedParts, finalTruncated)'), '文を mainlib.truncationMessage から取っていない');
+  assert.ok(!code(main).includes('要約が長さの上限で打ち切られた可能性があります'), '文が main.js に手書きのまま残っている');
+});
+
+test('#23 初期プロンプトは予算（UTF-8 バイト）に収め、辞書の収まり具合を画面へ返せる', () => {
+  // 予算の判断は mainlib.buildPromptParts（main.test.js で実行）。ここは結線だけ見る
+  const m = code(main);
+  assert.match(m, /const PROMPT_LIMIT_BYTES = PROMPT_MAX_CHARS \* 3/, '予算が文字数 × 3 バイトになっていない');
+  const pp = fnBody(m, 'function promptParts(', '\n}');
+  assert.ok(pp.includes('buildPromptParts({'), 'mainlib.buildPromptParts を通していない');
+  for (const k of ['ja,', 'sample: PROMPT_SAMPLE', 'dictionary: settings.dictionary', 'useBuiltinTerms: settings.useBuiltinTerms',
+    'builtinTerms: BUILTIN_TERMS', 'tail: extraTail', 'limitBytes: PROMPT_LIMIT_BYTES']) {
+    assert.ok(pp.includes(k), `${k} を渡していない`);
+  }
+  assert.match(m, /function buildPrompt\(extraTail\) \{ return promptParts\(extraTail\)\.prompt; \}/);
+  const info = fnBody(m, "ipcMain.handle('prompt:info'", '\n  });');
+  assert.ok(info.includes("promptParts('')"), '尻尾なしで数えていない');
+  assert.ok(info.includes('kept: r.kept') && info.includes('total: r.total') && info.includes('over: r.over'), '{ ok, kept, total, over } の形で返していない');
+  assert.ok(preload.includes("  promptInfo: () => ipcRenderer.invoke('prompt:info'),"), 'preload の promptInfo が無い');
+});
+
+test('#4 出典は要約の材料にした配列と今の配列の両方から付ける（cite 側が無ければ従来どおり）', () => {
+  assert.match(main, /const attachAcross = cite\.attachCitationsAcross \|\| \(\(b, f\) => attachCitations\(b, f\.filter\(\(s\) => !s\.failed\)\)\)/,
+    'cite.attachCitationsAcross への切り替え（無ければ素通し）が無い');
+  const run = fnBody(code(main), 'async function doRunSummary', '\nlet hotkeyState');
+  assert.ok(run.includes('const segmentsAtStart = segments;'), '入口で読んだ配列を取っておいていない');
+  assert.ok(run.includes('const stat = attachAcross(blocks, fresh, segmentsAtStart);'), '両方の配列を渡していない');
+});
+
+// ---------------------------------------------------------------- 第2段（A: 音声の退避・復旧・背圧・進捗・打ち切り）
+test('#8/#42(1) 区間の音声は文字起こしの前にディスクへ退避し、draft に「待ち」として控える', () => {
+  const m = code(main);
+  assert.match(m, /path\.join\(app\.getPath\('userData'\), 'data', 'segbuf'\)/, '退避先が <userData>/data/segbuf ではない');
+  const spool = fnBody(m, 'function spoolSegment(', '\n}');
+  assert.ok(spool.includes('mkdirSync') && spool.includes('renameSync'), '一時ファイル経由で書いていない');
+  const on = fnBody(m, 'function onMeetingSegment(', '\nasync function maybeFinalizeMeeting');
+  assert.ok(on.includes('pending: true'), '区間を「待ち」として控えていない');
+  assert.ok(on.includes('spoolSegment('), '音声を退避していない');
+  assert.ok(on.indexOf('spoolSegment(') < on.indexOf('segChain = segChain.then'), '文字起こしの列に入れる前に退避していない');
+  assert.ok(on.indexOf('writeDraft()') < on.indexOf('segChain = segChain.then'), '列に入れる前に draft へ書いていない');
+  assert.ok((on.match(/settleSegment\(m, seg/g) || []).length >= 3, '成功・失敗・空 の全部で同じ要素を置き換えていない');
+  const settle = fnBody(m, 'function settleSegment(', '\n}');
+  assert.ok(settle.includes('unlinkQuiet(seg.wav)') && settle.includes('delete seg.pending') && settle.includes('delete seg.wav'),
+    '置き換え時に wav を消し pending/wav を外していない');
+  // 画面・保存・要約は「待ち」の区間とパスを見ない
+  assert.ok(fnBody(m, 'function meetingStatus()', '\n}').includes('publicSegments(meeting.segments)'), '画面へパスが漏れる');
+  assert.ok(fnBody(m, 'async function maybeFinalizeMeeting', '\nconst runSummary').includes('segments: settledSegments(m.segments)'), '保存に待ちの区間が混ざる');
+  assert.match(fnBody(m, 'async function doRunSummary', '\nlet hotkeyState'), /const usable = segments\.filter\(\(s\) => !s\.failed && !s\.pending\)/);
+  assert.ok(fnBody(m, 'function discardMeeting()', '\n}').includes('cleanupSegbuf(m)'), '破棄で退避した音声を消していない');
+  // 復旧: 待ちの区間は draft からページに載せるとき失敗扱いにする（判断は mainlib.recoverSegments）
+  assert.ok(fnBody(m, 'function recoverDraftIfAny()', '\n}').includes('recoverSegments(d.segments'), '復旧で待ちの区間を直していない');
+});
+
+test('#8/#42(2) 復旧ページの「文字起こし待ち」は起動後に文字起こしして差し替え、古い退避フォルダは消す', () => {
+  const m = code(main);
+  const fn = fnBody(m, 'async function transcribeRecovered()', '\n}');
+  assert.ok(fn.includes('await ensureEngineReady(whisperEng)'), 'エンジンの用意を待っていない');
+  assert.ok(fn.includes('store.updateSegment(q.pageId, item.id, { text })'), '成功した区間を store.updateSegment で差し替えていない（failed が残る）');
+  assert.ok(fn.includes('unlinkQuiet(item.wav)'), '文字起こした wav を消していない');
+  assert.ok(fn.includes('（この区間の認識に失敗: '), '失敗した区間に失敗の文を残していない');
+  assert.ok(fn.includes('removeDirIfEmpty(q.dir)'), '空になった退避フォルダを消していない');
+  assert.ok(fn.includes("sendToMainWin('page:updated'"), '開いている復旧ページの文字起こしを描き直していない');
+  const boot = fnBody(m, 'app.whenReady().then(', '\n  });');
+  assert.ok(boot.includes('transcribeRecovered()'), '起動時に復旧の文字起こしを始めていない');
+  assert.ok(boot.includes('cleanOrphanSegbuf('), '起動時に古い退避フォルダを掃除していない');
+  assert.ok(boot.indexOf('recoverDraftIfAny()') < boot.indexOf('cleanOrphanSegbuf('), '復旧より先に掃除している（復旧中のフォルダを消しうる）');
+  const clean = fnBody(m, 'function cleanOrphanSegbuf(', '\n}');
+  assert.ok(clean.includes('staleSegbufDirs('), '7 日の判断を mainlib.staleSegbufDirs で行っていない');
+  assert.ok(clean.includes('if (dir === keepDir) continue;'), '復旧中のフォルダを消しうる');
+});
+
+test('#42(3) 文字起こしが追いつかないときは区間を伸ばして送る回数を減らし、追いついたら戻す', () => {
+  // 判断は mainlib.nextSegmentMs（main.test.js で実行）。ここは結線だけ見る
+  const m = code(main);
+  const bp = fnBody(m, 'function applyBackpressure(', '\n}');
+  assert.ok(bp.includes('nextSegmentMs(pendingSegs, '), '判断を mainlib.nextSegmentMs で行っていない');
+  assert.ok(bp.includes("sendToOverlay('overlay:segment-ms', next)"), 'オーバーレイへ区間の長さを送っていない');
+  assert.ok(bp.includes('if (next === m.segmentMs) return;'), '変わっていないのに送っている');
+  const on = fnBody(m, 'function onMeetingSegment(', '\nasync function maybeFinalizeMeeting');
+  assert.ok(on.includes('pendingSegs++;\n  applyBackpressure(m, 1);'), '増えたときに見ていない');
+  assert.ok(on.includes('pendingSegs = Math.max(0, pendingSegs - 1); applyBackpressure(m, -1);'), '減ったときに見ていない');
+  assert.ok(fnBody(m, 'function startMeeting()', '\nfunction stopMeeting').includes('segmentMs: (settings.segmentSec || 75) * 1000'), '開始時の長さを持っていない');
+  assert.ok(preload.includes("  onSegmentMs: (cb) => ipcRenderer.on('overlay:segment-ms', (_e, ms) => cb(ms)),"), 'preload の onSegmentMs が無い');
+});
+
+test('#42(4) 残り時間の見積もり（etaSec）と打ち切った数（skipped）を meetingStatus で返す', () => {
+  // 見積もりの計算は mainlib.EtaTracker（main.test.js で実行）。ここは結線だけ見る
+  const m = code(main);
+  assert.match(m, /const eta = new EtaTracker\(\)/, '見積もりを mainlib.EtaTracker で行っていない');
+  const st = fnBody(m, 'function meetingStatus()', '\n}');
+  assert.ok(st.includes('etaSec:') && st.includes('skipped:'), 'etaSec / skipped が無い');
+  const etaFn = fnBody(m, 'function etaSecOf(m)', '\n}');
+  assert.ok(etaFn.includes('pendingDurationMs(m.segments)'), '残りの待ちを区間の長さから数えていない');
+  assert.ok(etaFn.includes('m.inFlightSince'), '進行中の区間で経過した分を引いていない');
+  const on = fnBody(m, 'function onMeetingSegment(', '\nasync function maybeFinalizeMeeting');
+  assert.ok(on.includes('eta.record(Date.now() - t0, durationMs)'), '成功した区間で学習していない');
+  assert.ok(on.indexOf('eta.record(') > on.indexOf('} catch (e) {'), '失敗した区間まで学習している');
+  assert.ok(on.includes('m.inFlightSince = t0') && on.includes('m.inFlightSince = 0'), '進行中の区間の開始時刻を持って・戻していない');
+});
+
+test('#42(5) 終了後の文字起こし待ちは打ち切れる（meeting:skipPending）', () => {
+  // 区間の書き換えは mainlib.skipPendingSegments（main.test.js で実行）。ここは結線だけ見る
+  const m = code(main);
+  const h = fnBody(m, "ipcMain.handle('meeting:skipPending'", '\n  });');
+  assert.ok(h.includes('if (!meeting || !meeting.stopping) return { ok: false'), '記録中（終了前）に打ち切れてしまう');
+  assert.ok(h.includes('m.gen++'), '進行中の結果を無効にしていない');
+  assert.ok(h.includes('skipPendingSegments(m.segments)'), '区間の書き換えを mainlib.skipPendingSegments で行っていない');
+  assert.ok(h.includes('unlinkQuiet('), 'wav を消していない');
+  assert.ok(h.includes('pendingSegs = 0;'), '待ち件数を 0 にしていない');
+  assert.ok(h.includes('m.skipped += '), '打ち切った数を数えていない');
+  assert.ok(h.includes('maybeFinalizeMeeting()'), '打ち切ったのに締めていない');
+  assert.ok(h.includes('return { ok: true, skipped:'), '{ ok, skipped } の形で返していない');
+  const on = fnBody(m, 'function onMeetingSegment(', '\nasync function maybeFinalizeMeeting');
+  assert.ok((on.match(/m\.gen !== gen/g) || []).length >= 3, '列の中で世代を見ていない（打ち切った区間の結果が後から混ざる）');
+  assert.ok(preload.includes("  meetingSkipPending: () => ipcRenderer.invoke('meeting:skipPending'),"), 'preload の meetingSkipPending が無い');
 });
