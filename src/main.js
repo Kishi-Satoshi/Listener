@@ -41,7 +41,7 @@ const {
   pasterScript, copyCommand,
   engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
-  publicSegments, settledSegments, recoverSegments, staleSegbufDirs, nextSegmentMs,
+  publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs, nextSegmentMs, EtaTracker,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -902,6 +902,16 @@ function applyBackpressure(m, delta) {
   sendToOverlay('overlay:segment-ms', next);
 }
 
+// 残りの待ち時間（秒）。待ちの区間の長さの合計に、区間ごとの処理時間の比（EMA。
+// mainlib.EtaTracker）を掛ける。進行中の区間で既に経過した分は引く。待ちが無ければ null。
+// 比はアプリの起動中は持ち越す（次の会議の最初の区間から見積もれる）
+const eta = new EtaTracker();
+function etaSecOf(m) {
+  const remain = pendingDurationMs(m.segments);
+  if (remain <= 0) return null;
+  return eta.etaSec(remain, m.inFlightSince ? Date.now() - m.inFlightSince : 0);
+}
+
 // ---------------------------------------------------------------- 議事録
 function meetingStatus() {
   return {
@@ -918,6 +928,9 @@ function meetingStatus() {
     // 選んだマイクが見つからず既定のマイクで録っている（overlay:mic）。黙って
     // 別のマイクで録ると、会議が終わってから片側しか入っていないことに気づく
     micFallback: Boolean(meeting && meeting.micFallback),
+    // 残りの待ち時間の見積もり（秒。材料が無い・待ちが無いときは null）と、打ち切った区間の数
+    etaSec: meeting ? etaSecOf(meeting) : null,
+    skipped: meeting ? meeting.skipped : 0,
   };
 }
 
@@ -1038,7 +1051,8 @@ function startMeeting() {
     systemAudio: false, paused: false, pausedMs: 0, pausedAt: 0,
     // gen: 打ち切り（meeting:skipPending）で進める世代。進行中の結果を捨てる判断に使う
     // segmentMs: いま録音側に頼んでいる区間の長さ（背圧で伸縮する）
-    gen: 0, skipped: 0, micFallback: false, segmentMs: (settings.segmentSec || 75) * 1000 };
+    // inFlightSince: 文字起こし中の区間の開始時刻（残り時間の見積もりで経過分を引く）
+    gen: 0, skipped: 0, micFallback: false, segmentMs: (settings.segmentSec || 75) * 1000, inFlightSince: 0 };
   segChain = Promise.resolve(); pendingSegs = 0;
   state = 'meeting';
   writeDraft();
@@ -1145,15 +1159,20 @@ function onMeetingSegment(buffer, durationMs, isFinal) {
     // 直近の「成功した」区間の末尾。失敗区間のエラー文を渡すと、次の区間が
     // それを文例として真似る（mainlib.promptTail。待ちの区間は飛ばす）。
     const tail = promptTail(m.segments);
+    const t0 = Date.now();
+    m.inFlightSince = t0;
     let text = '';
     try {
       text = await transcribeLocal(buffer, tail, durationMs);
     } catch (e) {
       if (meeting !== m || m.gen !== gen) return;
+      m.inFlightSince = 0;
       settleSegment(m, seg, { text: `（この区間の認識に失敗: ${e.message}）`, failed: true });
       return;
     }
     if (meeting !== m || m.gen !== gen) return;
+    m.inFlightSince = 0;
+    eta.record(Date.now() - t0, durationMs);   // 成功した区間だけで学習（失敗は時間の目安にならない）
     if (settings.removeFillers) text = removeFillersRule(text);
     // 空・直前と同じ（繰り返しハルシネーション）は区間ごと消す
     const done = m.segments.filter((s) => !s.pending);

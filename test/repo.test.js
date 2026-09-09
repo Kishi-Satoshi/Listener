@@ -1007,3 +1007,18 @@ test('#42(3) 文字起こしが追いつかないときは区間を伸ばして�
   assert.ok(fnBody(m, 'function startMeeting()', '\nfunction stopMeeting').includes('segmentMs: (settings.segmentSec || 75) * 1000'), '開始時の長さを持っていない');
   assert.ok(preload.includes("  onSegmentMs: (cb) => ipcRenderer.on('overlay:segment-ms', (_e, ms) => cb(ms)),"), 'preload の onSegmentMs が無い');
 });
+
+test('#42(4) 残り時間の見積もり（etaSec）と打ち切った数（skipped）を meetingStatus で返す', () => {
+  // 見積もりの計算は mainlib.EtaTracker（main.test.js で実行）。ここは結線だけ見る
+  const m = code(main);
+  assert.match(m, /const eta = new EtaTracker\(\)/, '見積もりを mainlib.EtaTracker で行っていない');
+  const st = fnBody(m, 'function meetingStatus()', '\n}');
+  assert.ok(st.includes('etaSec:') && st.includes('skipped:'), 'etaSec / skipped が無い');
+  const etaFn = fnBody(m, 'function etaSecOf(m)', '\n}');
+  assert.ok(etaFn.includes('pendingDurationMs(m.segments)'), '残りの待ちを区間の長さから数えていない');
+  assert.ok(etaFn.includes('m.inFlightSince'), '進行中の区間で経過した分を引いていない');
+  const on = fnBody(m, 'function onMeetingSegment(', '\nasync function maybeFinalizeMeeting');
+  assert.ok(on.includes('eta.record(Date.now() - t0, durationMs)'), '成功した区間で学習していない');
+  assert.ok(on.indexOf('eta.record(') > on.indexOf('} catch (e) {'), '失敗した区間まで学習している');
+  assert.ok(on.includes('m.inFlightSince = t0') && on.includes('m.inFlightSince = 0'), '進行中の区間の開始時刻を持って・戻していない');
+});

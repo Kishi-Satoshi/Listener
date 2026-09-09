@@ -21,7 +21,7 @@ const {
   engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   truncationMessage, extractNotes, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
-  nextSegmentMs,
+  nextSegmentMs, EtaTracker,
 } = require('../src/mainlib');
 const { normalizeSettings } = require('../src/settings');
 
@@ -762,4 +762,22 @@ test('nextSegmentMs: 待ちが 3 を超えたら区間を倍に（上限 300 秒
   assert.strictEqual(nextSegmentMs(0, 300000, 75000, -1), 75000);
   // 現在の長さが無ければ設定の長さから数える
   assert.strictEqual(nextSegmentMs(4, 0, 75000, 1), 150000);
+});
+
+// ---------------------------------------------------------------- #42 残り時間の見積もり
+test('EtaTracker: 区間ごとの処理時間/音声長の EMA から、残りの待ち時間を見積もる', () => {
+  const eta = new EtaTracker(0.3);
+  assert.strictEqual(eta.etaSec(150000), null, '材料が無いうちは null（0 を出すと「もう終わる」に見える）');
+  eta.record(30000, 75000);          // 比 0.4
+  assert.strictEqual(eta.etaSec(150000), 60);
+  eta.record(60000, 75000);          // 比 0.8 → EMA 0.4 + 0.3×(0.8−0.4) = 0.52
+  assert.strictEqual(eta.etaSec(75000), 39);
+  // 進行中の区間で既に経過した分は引く。負にはしない
+  assert.strictEqual(eta.etaSec(75000, 20000), 19);
+  assert.strictEqual(eta.etaSec(75000, 999999), 0);
+  // 壊れた値は学習しない
+  eta.record(-1, 75000);
+  eta.record(1000, 0);
+  assert.strictEqual(eta.etaSec(75000), 39);
+  assert.strictEqual(eta.etaSec(0), 0);
 });

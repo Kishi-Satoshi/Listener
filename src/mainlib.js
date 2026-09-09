@@ -479,6 +479,27 @@ function nextSegmentMs(pending, currentMs, baseMs, delta) {
   return cur;
 }
 
+// ---------------------------------------------------------------- 残り時間の見積もり（#42）
+// 区間ごとの「処理時間 ÷ 音声の長さ」を指数移動平均（EMA）で持ち、残りの待ち（文字起こし
+// 待ちの区間の長さの合計）に掛けて秒で返す。材料が無いうちは null（0 を出すと「もう終わる」
+// に見える）。進行中の区間で既に経過した分は引く。成功した区間だけで学習する（失敗は時間の
+// 目安にならない）。アプリの起動中は持ち越す（次の会議の最初の区間から見積もれる）。
+class EtaTracker {
+  constructor(alpha) { this.alpha = alpha || 0.3; this.ratio = null; }
+  record(procMs, durationMs) {
+    if (!(durationMs > 0) || !(procMs >= 0)) return;
+    const r = procMs / durationMs;
+    this.ratio = this.ratio === null ? r : this.ratio + this.alpha * (r - this.ratio);
+  }
+  etaSec(remainingMs, elapsedMs) {
+    if (this.ratio === null) return null;
+    const remain = Math.max(0, Number(remainingMs) || 0);
+    const elapsed = Math.max(0, Number(elapsedMs) || 0);
+    // ms で丸めてから秒に切り上げる（浮動小数の誤差で 39.0000…01 秒が 40 秒にならないように）
+    return Math.max(0, Math.ceil(Math.round(this.ratio * remain - elapsed) / 1000));
+  }
+}
+
 const SEGBUF_MAX_AGE_MS = 7 * 86400000;
 function staleSegbufDirs(entries, nowMs, maxAgeMs = SEGBUF_MAX_AGE_MS) {
   const out = [];
@@ -500,5 +521,5 @@ module.exports = {
   ENGINE_SETTING_KEYS, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
-  nextSegmentMs,
+  nextSegmentMs, EtaTracker,
 };
