@@ -43,7 +43,7 @@ const {
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs, nextSegmentMs, EtaTracker,
   skipPendingSegments, restoreAfterPaste,
-  planDataMove, sameTree,
+  planDataMove, sameTree, estimateTokens, foldNotes,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -53,6 +53,8 @@ const MIN_RECORD_MS = 400;
 const MEMO_MAX = 1500;
 const SUM_MAX_TOKENS = 3000;   // 最終的な議事録
 const NOTE_MAX_TOKENS = 900;   // 分割要約の各パート
+// 文脈長（settings.sumCtx）のうち、指示文・役割名・書式の余白として取っておく分（#41）
+const SUM_CTX_MARGIN = 256;
 const ENGINE_READY_TIMEOUT_MS = 90000;
 
 const DEFAULT_SETTINGS = {
@@ -356,7 +358,7 @@ function engineSpawnArgs(eng) {
     '--host', '127.0.0.1',
     '--port', String(settings.sumPort),
     '-t', String(settings.sumThreads),
-    '-c', '16384',
+    '-c', String(settings.sumCtx),   // 文脈長（#41）。統合プロンプトが収まらなければ要点メモを畳む
   ];
 }
 const engineExe = (e) => (e === whisperEng ? settings.localServerExe : settings.sumServerExe);
@@ -391,7 +393,8 @@ function engineSignature(eng) {
   return [engineExe(eng), engineModel(eng), enginePort(eng),
     eng === whisperEng ? settings.localThreads : settings.sumThreads,
     eng === whisperEng ? settings.language : '',
-    eng === whisperEng ? `${settings.useVad ? resolveVadModel() : ''}|${settings.suppressNst}` : ''].join('|');
+    eng === whisperEng ? `${settings.useVad ? resolveVadModel() : ''}|${settings.suppressNst}` : '',
+    eng === whisperEng ? '' : settings.sumCtx].join('|');   // 文脈長を変えたら要約エンジンを起動し直す（#41）
 }
 
 // 127.0.0.1:port を一瞬だけ listen して空きを見る（#28/#31）。EADDRINUSE だけを「使用中」
@@ -617,6 +620,10 @@ function minutesTemplate(type) {
   return `${mtype.getFormat(type)}\n\n${OUTPUT_RULE}`;
 }
 
+// 文脈長のうち入力（プロンプト）に使える推定トークン（#41）: 文脈長 − 出力の上限 − 余白。
+// 推定は mainlib.estimateTokens（UTF-8 バイト ÷ 2.5。多めに見積もる）
+const sumCtxBudget = () => settings.sumCtx - SUM_MAX_TOKENS - SUM_CTX_MARGIN;
+
 async function generateMinutes(plain, memo, onProgress, type) {
   const ok = await ensureEngineReady(sumEng);
   if (!ok) throw new Error(sumEng.lastError || '要約エンジンが起動していません');
@@ -630,8 +637,12 @@ async function generateMinutes(plain, memo, onProgress, type) {
   const memoBlock = memoText ? `【会議メモ・アジェンダ（要約のヒント）】\n${memoText}\n\n` : '';
 
   const CHUNK = 5500;
-  // メモの分も含めて1回で収まるかを判断する
-  if (plain.length + memoBlock.length <= CHUNK + 1500) {
+  // 文脈長の予算（#41）。固定分（役割・メモ・書式）は先に引いておく
+  const budget = sumCtxBudget();
+  const fixed = estimateTokens(sys + memoBlock + minutesTemplate(type));
+  // メモの分も含めて1回で収まるかを判断する。文字数のほか推定トークンでも見る
+  // （文脈長を小さくした設定で、1 回分のプロンプトが溢れないように）
+  if (plain.length + memoBlock.length <= CHUNK + 1500 && estimateTokens(plain) + fixed <= budget) {
     const one = await llmChatP([
       { role: 'system', content: sys },
       { role: 'user', content: `${memoBlock}【会議の文字起こし】\n${plain}\n\n上記から、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${minutesTemplate(type)}` },
@@ -647,10 +658,12 @@ async function generateMinutes(plain, memo, onProgress, type) {
   }
   const notes = [];
   const truncatedParts = [];   // 半分にしても上限で切れたパート番号（1 始まり）
-  const extract = async (text, i) => {
+  // 要点の抽出。kind は材料の呼び名（'文字起こし' | '要点メモ'）。文字起こしの分割要約と、
+  // 文脈長に収まらないときの要点メモの畳み（下）が同じ経路を通る
+  const extract = async (text, i, n, kind) => {
     const r = await llmChatP([
       { role: 'system', content: sys },
-      { role: 'user', content: `以下は長い会議の文字起こしの一部（${i + 1}/${chunks.length}）です。重要な発言・決定・依頼・課題・数字を漏らさず、簡潔な箇条書きで抽出してください。文体は常体（だ・である調、体言止め）。\n\n${text}` },
+      { role: 'user', content: `以下は長い会議の${kind}の一部（${i + 1}/${n}）です。重要な発言・決定・依頼・課題・数字を漏らさず、簡潔な箇条書きで抽出してください。文体は常体（だ・である調、体言止め）。\n\n${text}` },
     ], NOTE_MAX_TOKENS);
     return r;
   };
@@ -659,7 +672,7 @@ async function generateMinutes(plain, memo, onProgress, type) {
     // 上限で切れたら半分に割って両方をやり直す（一度だけ。mainlib.extractNotes）。
     // 切れたままだと中盤の議題が黙って欠ける（#16）。それでも切れたら本文は残し、
     // 要点メモに注記を添え、パート番号を控える（summaryError で名指しする）。
-    const part = await extractNotes((t) => extract(t, i), chunks[i]);
+    const part = await extractNotes((t) => extract(t, i, chunks.length, '文字起こし'), chunks[i]);
     let text = part.text;
     if (part.truncated) {
       truncatedParts.push(i + 1);
@@ -667,10 +680,37 @@ async function generateMinutes(plain, memo, onProgress, type) {
     }
     notes.push(`--- パート${i + 1} ---\n${text}`);
   }
+  // 統合プロンプトが文脈長に収まらないなら、要点メモを 2 段で畳む（#41）。前から順に予算に
+  // 収まる束に分け（mainlib.foldNotes）、各束を分割要約と同じ経路（extractNotes・NOTE_MAX_TOKENS）
+  // でもう一段要約してから統合する。畳んだことは engineLog にだけ残す（page.notes や
+  // summaryError には書かない。要約の中身の問題ではなく容量の話で、利用者が直すものではない）。
+  // 束の予算は統合と同じ budget − fixed（束の要約は出力が短く指示文も短いので、余裕がある側）
+  let material = notes;
+  const need = estimateTokens(notes.join('\n\n')) + fixed;
+  if (need > budget) {
+    const bundles = foldNotes(notes, Math.max(1, budget - fixed), estimateTokens);
+    engineLog(`要約: 要点メモ ${notes.length} パート（推定 ${need} トークン）が文脈長 ${settings.sumCtx} の予算 ${budget} を超えるため、${bundles.length} 束に畳んだ`);
+    material = [];
+    let first = 1;
+    for (let k = 0; k < bundles.length; k++) {
+      const last = first + bundles[k].length - 1;
+      if (onProgress) onProgress(`要点メモをまとめ直しています… (${k + 1}/${bundles.length})`);
+      const part = await extractNotes((t) => extract(t, k, bundles.length, '要点メモ'), bundles[k].join('\n\n'));
+      let text = part.text;
+      if (part.truncated) {
+        engineLog(`要約: 束 ${k + 1}（パート${first}〜${last}）のまとめ直しが長さの上限で切れた`);
+        text += `\n（※パート${first}〜${last}のまとめは途中で切れています）`;
+      }
+      material.push(`--- パート${first}〜${last}（まとめ） ---\n${text}`);
+      first = last + 1;
+    }
+    const after = estimateTokens(material.join('\n\n')) + fixed;
+    if (after > budget) engineLog(`要約: 畳んでも推定 ${after} トークンで予算 ${budget} を超える（2 段まで。続行する）`);
+  }
   if (onProgress) onProgress('議事録をまとめています…');
   const final = await llmChatP([
     { role: 'system', content: sys },
-    { role: 'user', content: `${memoBlock}【会議の要点メモ（時系列）】\n${notes.join('\n\n')}\n\n上記の要点メモを統合し、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${minutesTemplate(type)}` },
+    { role: 'user', content: `${memoBlock}【会議の要点メモ（時系列）】\n${material.join('\n\n')}\n\n上記の要点メモを統合し、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${minutesTemplate(type)}` },
   ], SUM_MAX_TOKENS);
   return { md: final.text, truncated: truncatedParts.length > 0 || final.truncated, truncatedParts, finalTruncated: final.truncated };
 }

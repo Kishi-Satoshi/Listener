@@ -307,6 +307,7 @@ const ENGINE_SETTING_LABELS = {
   localServerExe: '文字起こしエンジンの実行ファイル', localModelPath: '文字起こしのモデル', vadModelPath: 'VAD のモデル',
   sumServerExe: '要約エンジンの実行ファイル', sumModelPath: '要約のモデル',
   localPort: '文字起こしのポート', sumPort: '要約のポート', segmentSec: '区間の長さ',
+  sumCtx: '要約の文脈長',
 };
 const ENGINE_SETTING_KEYS = Object.keys(ENGINE_SETTING_LABELS);
 const sameValue = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -366,6 +367,37 @@ async function extractNotes(extract, text) {
   const a = await extract(text.slice(0, half));
   const b = await extract(text.slice(half));
   return { text: `${a.text}\n${b.text}`, truncated: Boolean(a.truncated || b.truncated), retried: true };
+}
+
+// ---------------------------------------------------------------- 要約の文脈長（#41）
+// 推定トークン数。UTF-8 のバイト数 ÷ 2.5 の切り上げ。多くの日本語対応モデルのトークナイザでは
+// 日本語 1 文字（3 バイト）が 1〜2 トークン、英数字は 4 文字（4 バイト）で 1 トークン程度で、
+// どちらも 1 トークン ≒ 2.5〜4 バイト。2.5 で割るのは実際より多めに見積もるためで、外すなら
+// 「収まると思ったら溢れた」側には外さない（溢れると llama-server がプロンプトを黙って切る）。
+function estimateTokens(text) {
+  return Math.ceil(Buffer.byteLength(String(text ?? ''), 'utf8') / 2.5);
+}
+
+// 要点メモ（分割要約の各パート）を、前から順に「推定トークンの合計が予算に収まる束」に分ける。
+// 統合プロンプトが文脈長に収まらないとき、各束をもう一段要約してから統合する（2 段）。
+// 順序は時系列のまま。1 件で予算を超える要点メモは単独の束（それ以上は割らない。もう一段の
+// 要約で NOTE_MAX_TOKENS 以下に縮む）。束の間の区切り（空行）は数えない（束あたり数トークンで、
+// 呼び出し側の余白の内）。estimate は省けば estimateTokens。入力は書き換えない。
+function foldNotes(notes, budgetTokens, estimate) {
+  const list = (Array.isArray(notes) ? notes : []).map((n) => String(n ?? ''));
+  const est = typeof estimate === 'function' ? estimate : estimateTokens;
+  const budget = Number(budgetTokens) > 0 ? Number(budgetTokens) : 1;
+  const out = [];
+  let cur = [];
+  let used = 0;
+  for (const n of list) {
+    const t = est(n);
+    if (cur.length && used + t > budget) { out.push(cur); cur = []; used = 0; }
+    cur.push(n);
+    used += t;
+  }
+  if (cur.length) out.push(cur);
+  return out;
 }
 
 // summaryError に書く一文。parts: 半分にしても切れたパート番号（1 始まり）、
@@ -593,4 +625,5 @@ module.exports = {
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
   nextSegmentMs, EtaTracker, skipPendingSegments,
   planDataMove, sameTree,
+  estimateTokens, foldNotes,
 };

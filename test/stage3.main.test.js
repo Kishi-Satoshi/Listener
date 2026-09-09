@@ -173,3 +173,76 @@ test('#29 フォルダ選択（pickFile(\'folder\)）と pages:actionView の結
   assert.ok(preload.includes("  assigneeList: () => ipcRenderer.invoke('pages:assignees'),"));
   assert.match(m, /ipcMain\.handle\('pages:searchFull', \(_e, q\) => store\.searchFullText\(q \|\| '', 60\)\)/, 'pages:searchFull は store の戻り値をそのまま返す');
 });
+
+// ---------------------------------------------------------------- #41 要約の文脈長（判断）
+const { estimateTokens, foldNotes, ENGINE_SETTING_KEYS, guardEngineSettings } = require('../src/mainlib');
+
+test('estimateTokens: UTF-8 のバイト数 ÷ 2.5 の切り上げ（多めに見積もって溢れる側に外さない）', () => {
+  assert.strictEqual(estimateTokens(''), 0);
+  assert.strictEqual(estimateTokens(null), 0);
+  assert.strictEqual(estimateTokens('abcde'), 2);          // 5 バイト → 2
+  assert.strictEqual(estimateTokens('あ'), 2);              // 3 バイト → 1.2 → 2
+  assert.strictEqual(estimateTokens('あいうえお'), 6);      // 15 バイト → 6
+  assert.strictEqual(estimateTokens('a'.repeat(250)), 100);
+});
+
+test('foldNotes: 前から順に「合計が予算に収まる束」に分ける（1 件で超える要点メモは単独の束）', () => {
+  const len = (t) => t.length;
+  assert.deepStrictEqual(foldNotes(['a', 'bb', 'ccc', 'd'], 3, len), [['a', 'bb'], ['ccc'], ['d']]);
+  assert.deepStrictEqual(foldNotes(['aaaaa', 'b', 'c'], 3, len), [['aaaaa'], ['b', 'c']], '予算を超える 1 件を単独の束にしていない');
+  assert.deepStrictEqual(foldNotes(['a', 'b'], 100, len), [['a', 'b']], '収まるなら 1 束');
+  assert.deepStrictEqual(foldNotes([], 3, len), []);
+  // 順序を入れ替えない（時系列のまま）。入力は書き換えない
+  const notes = ['x', 'yy', 'z'];
+  const r = foldNotes(notes, 2, len);
+  assert.deepStrictEqual(r.flat(), notes);
+  assert.deepStrictEqual(notes, ['x', 'yy', 'z']);
+  // 予算が壊れていても止まらない（0 以下・NaN は 1 とみなす → 全部単独の束）
+  assert.deepStrictEqual(foldNotes(['a', 'b'], 0, len), [['a'], ['b']]);
+  assert.deepStrictEqual(foldNotes(['a', 'b'], NaN, len), [['a'], ['b']]);
+  // 推定関数を省けば estimateTokens で数える
+  assert.deepStrictEqual(foldNotes(['あいうえお', 'かきくけこ'], 6), [['あいうえお'], ['かきくけこ']]);
+});
+
+test('#41 sumCtx は記録中に変えられないエンジン設定で、名前は「要約の文脈長」', () => {
+  assert.ok(ENGINE_SETTING_KEYS.includes('sumCtx'));
+  const prev = { sumCtx: 32768, theme: 'dark' };
+  const r = guardEngineSettings(prev, { sumCtx: 8192, theme: 'light' }, true);
+  assert.strictEqual(r.settings.sumCtx, 32768);
+  assert.deepStrictEqual(r.kept, ['sumCtx']);
+  assert.ok(r.warning.includes('要約の文脈長'), '警告で名指ししていない');
+});
+
+// ---------------------------------------------------------------- #41 要約の文脈長（結線）
+test('#41 llama-server の -c は settings.sumCtx で、署名（再起動の判断）にも入る', () => {
+  const m = code(main);
+  const args = fnBody(m, 'function engineSpawnArgs(eng)', '\n}');
+  assert.ok(args.includes("'-c', String(settings.sumCtx),"), '-c が settings.sumCtx でない');
+  assert.ok(!args.includes("'16384'"), '固定の 16384 が残っている');
+  const sig = fnBody(m, 'function engineSignature(eng)', '\n}');
+  assert.ok(sig.includes("eng === whisperEng ? '' : settings.sumCtx"), '要約エンジンの署名に sumCtx が入っていない（変えても再起動されない）');
+});
+
+test('#41 統合プロンプトが文脈長に収まらないときは要点メモを 2 段で畳み、engineLog にだけ残す', () => {
+  const m = code(main);
+  assert.match(m, /const SUM_CTX_MARGIN = 256;/);
+  assert.match(m, /const sumCtxBudget = \(\) => settings\.sumCtx - SUM_MAX_TOKENS - SUM_CTX_MARGIN;/);
+  const gen = fnBody(m, 'async function generateMinutes', '\nfunction ensurePaster');
+  assert.ok(gen.includes('const budget = sumCtxBudget();'), '予算を sumCtxBudget から取っていない');
+  assert.ok(gen.includes('const fixed = estimateTokens(sys + memoBlock + minutesTemplate(type));'), '固定分（役割・メモ・書式）を推定していない');
+  // 1 回で収まるかの判断は、文字数だけでなく推定トークンでも見る（文脈長を小さくしたとき溢れない）
+  assert.ok(gen.includes('&& estimateTokens(plain) + fixed <= budget) {'), '1 回で収まるかの判断が推定トークンを見ていない');
+  // 畳む: 束の分け方は mainlib.foldNotes、各束は分割要約と同じ経路（extractNotes・NOTE_MAX_TOKENS）
+  const fold = fnBody(gen, 'if (need > budget) {', "if (onProgress) onProgress('議事録をまとめています…');");
+  assert.ok(gen.includes("const need = estimateTokens(notes.join('\\n\\n')) + fixed;"), '統合プロンプトの推定が無い');
+  assert.ok(fold.includes('foldNotes(notes, Math.max(1, budget - fixed), estimateTokens)'), '束の分け方を mainlib.foldNotes で決めていない');
+  assert.ok(fold.includes("extractNotes((t) => extract(t, k, bundles.length, '要点メモ'), bundles[k].join('\\n\\n'))"), '束を分割要約と同じ経路で要約していない');
+  assert.ok(gen.includes("extractNotes((t) => extract(t, i, chunks.length, '文字起こし'), chunks[i])"), '既存の分割要約が同じ extract を通っていない');
+  assert.ok(fold.includes('束に畳んだ'), 'engineLog に「n パートを m 束に畳んだ」を残していない');
+  assert.ok(fold.includes('engineLog('), 'engineLog に残していない');
+  assert.ok(!fold.includes('summaryError') && !fold.includes('page.notes') && !fold.includes('truncatedParts'), 'summaryError / page.notes / 切れたパートの一覧に畳んだことを書いている');
+  // 統合には畳んだ後の材料を渡す
+  assert.ok(gen.includes("【会議の要点メモ（時系列）】\\n${material.join('\\n\\n')}"), '統合に畳んだ材料を渡していない');
+  // llmChatP の呼び出しは 3 か所のまま（repo.test.js が数える）。畳みは extract を通る
+  assert.strictEqual((gen.match(/await llmChatP\(/g) || []).length, 3);
+});
