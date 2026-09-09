@@ -828,3 +828,18 @@ test('保存で main が採らなかった値は、ホットキー以外でも�
   assert.deepStrictEqual(sent, [['en', false], ['ja', true]], `送った値: ${JSON.stringify(sent)}`);
   assert.deepStrictEqual(l.errors.map(fmt), []);
 });
+
+test('記録中の文字起こし面で、まだ文字起こしされていない区間は空行でなく「文字起こし中」と出る', async () => {
+  const l = await load(APP);
+  l.fire('onMeetingUpdate', { active: true, startedAt: Date.now(), pending: 1, segments: [
+    { id: 's1', atMs: 0, text: 'おはようございます。' },
+    { id: 's2', atMs: 75000, text: '', pending: true },
+  ] });
+  await l.drain();
+  const rows = l.byId.get('pScript').querySelectorAll('.seg');
+  assert.strictEqual(rows.length, 2);
+  assert.ok(/文字起こし中/.test(rows[1].textContent), '待ちの区間が空行になっている（無音と区別できない）');
+  assert.ok(rows[1].classList.contains('pending'));
+  assert.ok(!/文字起こし中/.test(rows[0].textContent));
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
