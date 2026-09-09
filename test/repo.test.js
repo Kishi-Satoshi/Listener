@@ -975,3 +975,21 @@ test('#8/#42(1) 区間の音声は文字起こしの前にディスクへ退避�
   // 復旧: 待ちの区間は draft からページに載せるとき失敗扱いにする（判断は mainlib.recoverSegments）
   assert.ok(fnBody(m, 'function recoverDraftIfAny()', '\n}').includes('recoverSegments(d.segments'), '復旧で待ちの区間を直していない');
 });
+
+test('#8/#42(2) 復旧ページの「文字起こし待ち」は起動後に文字起こしして差し替え、古い退避フォルダは消す', () => {
+  const m = code(main);
+  const fn = fnBody(m, 'async function transcribeRecovered()', '\n}');
+  assert.ok(fn.includes('await ensureEngineReady(whisperEng)'), 'エンジンの用意を待っていない');
+  assert.ok(fn.includes('store.updateSegment(q.pageId, item.id, { text })'), '成功した区間を store.updateSegment で差し替えていない（failed が残る）');
+  assert.ok(fn.includes('unlinkQuiet(item.wav)'), '文字起こした wav を消していない');
+  assert.ok(fn.includes('（この区間の認識に失敗: '), '失敗した区間に失敗の文を残していない');
+  assert.ok(fn.includes('removeDirIfEmpty(q.dir)'), '空になった退避フォルダを消していない');
+  assert.ok(fn.includes("sendToMainWin('page:updated'"), '開いている復旧ページの文字起こしを描き直していない');
+  const boot = fnBody(m, 'app.whenReady().then(', '\n  });');
+  assert.ok(boot.includes('transcribeRecovered()'), '起動時に復旧の文字起こしを始めていない');
+  assert.ok(boot.includes('cleanOrphanSegbuf('), '起動時に古い退避フォルダを掃除していない');
+  assert.ok(boot.indexOf('recoverDraftIfAny()') < boot.indexOf('cleanOrphanSegbuf('), '復旧より先に掃除している（復旧中のフォルダを消しうる）');
+  const clean = fnBody(m, 'function cleanOrphanSegbuf(', '\n}');
+  assert.ok(clean.includes('staleSegbufDirs('), '7 日の判断を mainlib.staleSegbufDirs で行っていない');
+  assert.ok(clean.includes('if (dir === keepDir) continue;'), '復旧中のフォルダを消しうる');
+});

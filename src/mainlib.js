@@ -460,6 +460,20 @@ function recoverSegments(segments, exists) {
   }
   return { segments: out, todo };
 }
+// 退避フォルダのうち 7 日より古いもの（復旧されずに残った孤児）。フォルダ名は開始時刻（ms）
+// なのでそれで判断し、数字でなければ更新時刻で判断する。ちょうど 7 日は残す（境目で今日の
+// 分を消さない）。entries: [{ name, mtimeMs }]、戻り値は消してよい name の配列。
+const SEGBUF_MAX_AGE_MS = 7 * 86400000;
+function staleSegbufDirs(entries, nowMs, maxAgeMs = SEGBUF_MAX_AGE_MS) {
+  const out = [];
+  for (const e of (entries || [])) {
+    if (!e || typeof e.name !== 'string') continue;
+    const byName = /^\d{10,}$/.test(e.name) ? Number(e.name) : NaN;
+    const at = Number.isFinite(byName) ? byName : (Number(e.mtimeMs) || 0);
+    if (nowMs - at > maxAgeMs) out.push(e.name);
+  }
+  return out;
+}
 
 module.exports = {
   saveIfExists, meetingDurationSec, promptTail,
@@ -469,5 +483,5 @@ module.exports = {
   engineFileIssue, engineIssueMessage, portInUseError,
   ENGINE_SETTING_KEYS, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
-  publicSegments, settledSegments, pendingDurationMs, recoverSegments,
+  publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
 };

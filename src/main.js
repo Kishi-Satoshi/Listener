@@ -41,7 +41,7 @@ const {
   pasterScript, copyCommand,
   engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
-  publicSegments, settledSegments, recoverSegments,
+  publicSegments, settledSegments, recoverSegments, staleSegbufDirs,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -950,6 +950,75 @@ function recoverDraftIfAny() {
   else removeDirIfEmpty(segbufDir(d.startedAt));
 }
 
+// 復旧ページの「文字起こし待ち」を、起動が済んでエンジンが用意できてから順に文字起こしし、
+// store.updateSegment で本文を差し替える（failed が外れて要約の材料に戻る）。
+// 失敗した区間は失敗の文を残す。ページが消されていたら残りの wav を捨てて止める。
+// 済んだ wav は消し、空になった退避フォルダも消す。
+async function transcribeRecovered() {
+  const q = recoveryQueue;
+  recoveryQueue = null;
+  if (!q) return;
+  const ready = await ensureEngineReady(whisperEng);
+  let done = 0;
+  for (const item of q.items) {
+    if (!store.getPage(q.pageId)) { unlinkQuiet(item.wav); continue; }   // ページが消された
+    let text = null;
+    let err = ready ? '' : (whisperEng.lastError || '文字起こしエンジンが起動していません');
+    if (!err) {
+      try {
+        text = await transcribeLocal(fs.readFileSync(item.wav), '', item.durationMs);
+        if (settings.removeFillers) text = removeFillersRule(text);
+      } catch (e) { err = e.message; }
+    }
+    if (err) {
+      // 失敗の文を残す（updateSegment は failed を外してしまうので直接書く）
+      const segs = store.getTranscript(q.pageId);
+      const s = segs.find((x) => x.id === item.id);
+      if (s) { s.text = `（この区間の認識に失敗: ${err}）`; s.failed = true; store.saveTranscript(q.pageId, segs); }
+    } else if (text) {
+      store.updateSegment(q.pageId, item.id, { text });
+      done++;
+    } else {
+      removeTranscriptSegment(q.pageId, item.id);   // 無音: 区間ごと消す（記録中と同じ扱い）
+      done++;
+    }
+    // 成否にかかわらず消す。失敗した wav をもう一度試す経路は無く、7 日残しても使われない
+    unlinkQuiet(item.wav);
+  }
+  removeDirIfEmpty(q.dir);
+  const page = store.getPage(q.pageId);
+  if (!page) return;
+  // 「続けています」の文を通常の復旧の文に戻す（別の要約が書いていれば触らない）
+  const latest = saveIfExists(store, q.pageId, (p) => {
+    if (String(p.summaryError || '').includes('文字起こしを続けています')) {
+      p.summaryError = '録音が中断されたため要約は未生成です。「要約を生成」で作成できます。';
+    }
+  });
+  sendToMainWin('pages:updated', store.listPages());
+  sendToMainWin('page:updated', { page: latest || page, segments: store.getTranscript(q.pageId) });
+  sendToMainWin('app:notice', `中断されていた文字起こしの復旧が終わりました（${done}/${q.items.length} 区間）。「要約を生成」で議事録を作成できます。`);
+}
+function removeTranscriptSegment(pageId, segId) {
+  store.saveTranscript(pageId, store.getTranscript(pageId).filter((s) => s.id !== segId));
+}
+
+// 7 日より古い退避フォルダを消す（復旧されずに残った孤児。判断は mainlib.staleSegbufDirs）。
+// 今回復旧中のフォルダ（keepDir）は残す
+function cleanOrphanSegbuf(keepDir) {
+  let names = [];
+  try { names = fs.readdirSync(segbufRoot()); } catch (_) { return; }
+  const entries = names.map((name) => {
+    let mtimeMs = 0;
+    try { mtimeMs = fs.statSync(path.join(segbufRoot(), name)).mtimeMs; } catch (_) { /* noop */ }
+    return { name, mtimeMs };
+  });
+  for (const name of staleSegbufDirs(entries, Date.now())) {
+    const dir = path.join(segbufRoot(), name);
+    if (dir === keepDir) continue;
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* noop */ }
+  }
+}
+
 function startMeeting() {
   if (state !== 'idle') return { ok: false, error: '他の処理を実行中です' };
   const problem = whisperProblem();
@@ -1661,6 +1730,7 @@ if (!gotLock) {
   app.whenReady().then(() => {
     loadStores();
     recoverDraftIfAny();
+    cleanOrphanSegbuf(recoveryQueue ? recoveryQueue.dir : '');   // 復旧の後で（復旧中のフォルダは残す）
     applyTheme();
     setupIpc();
     // 相手の声（パソコンから出ている音）を録るための受け口。
@@ -1691,6 +1761,8 @@ if (!gotLock) {
     }
     createTray();
     if (engineValid(whisperEng)) startEngine(whisperEng);
+    // 復旧ページに文字起こし待ちの音声が残っていれば、エンジンの用意を待って順に片付ける
+    transcribeRecovered().catch((e) => engineLog(`復旧の文字起こしに失敗: ${e.message}`));
     ensurePaster();
     createMainWindow();
     app.on('activate', () => createMainWindow());

@@ -20,7 +20,7 @@ const {
   pasterScript, copyCommand,
   engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   truncationMessage, extractNotes, buildPromptParts,
-  publicSegments, settledSegments, pendingDurationMs, recoverSegments,
+  publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
 } = require('../src/mainlib');
 const { normalizeSettings } = require('../src/settings');
 
@@ -728,4 +728,20 @@ test('recoverSegments: 待ちの区間は失敗扱いで「復旧中」にし、
   assert.deepStrictEqual(r.todo, [{ id: 's2', wav: '/b/2.wav', durationMs: 75000 }]);
   assert.strictEqual(segs[1].pending, true, '入力を書き換えている');
   assert.deepStrictEqual(recoverSegments([null, 'x'], () => true), { segments: [], todo: [] }, '壊れた要素で落ちる');
+});
+
+test('staleSegbufDirs: 7 日より古い退避フォルダだけを選ぶ（名前が開始時刻ならそれで、違えば更新時刻で）', () => {
+  // 復旧されずに残った孤児だけを消す。今日の分や復旧中の分を消すと、復旧の材料そのものを失う
+  const now = 1_800_000_000_000;
+  const day = 86400000;
+  const entries = [
+    { name: String(now - 8 * day), mtimeMs: now },            // 名前は 8 日前（更新時刻が新しくても名前が真実）
+    { name: String(now - 2 * day), mtimeMs: now - 30 * day }, // 名前は 2 日前 → 残す
+    { name: 'junk', mtimeMs: now - 10 * day },                // 数字でない → 更新時刻で判断 → 古い
+    { name: 'recent', mtimeMs: now - day },                   // 残す
+  ];
+  assert.deepStrictEqual(staleSegbufDirs(entries, now), [String(now - 8 * day), 'junk']);
+  assert.deepStrictEqual(staleSegbufDirs([], now), []);
+  // ちょうど 7 日は残す（境目で今日の分を消さない）
+  assert.deepStrictEqual(staleSegbufDirs([{ name: String(now - 7 * day), mtimeMs: 0 }], now), []);
 });
