@@ -142,6 +142,9 @@
   .pitem .m > span { flex: none; }
   .pitem .snip { font-size: 11px; color: var(--faint); margin-top: 1px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* 文字起こし検索の件数（#43）。行ではないので .pitem の高さ・形には触れない */
+  .plist .count { flex: none; font-size: 11px; color: var(--muted); padding: 0 2px;
+    font-variant-numeric: tabular-nums; }
 
   /* ---------- ページ本体 ---------- */
   .page { flex: 1; min-width: 0; display: flex; flex-direction: column;
@@ -747,11 +750,22 @@
   }
 
   // ================= 議事録: 一覧 =================
+  // 文字起こし検索の件数（#43）。store は件数に上限を掛けて返すので、上限で打ち切られた
+  // ときは「全部でいくつあって、そのうちいくつ見せているか」を一覧の先頭に出す。
+  // 「すべて」の一覧では null（件数の行を出さない）。
+  let listCount = null;
   async function refreshList() {
     const q = $('searchBox').value.trim();
     if (filter === 'actions') { await renderActionView(q); return; }
-    if (filter === 'full' && q) pages = await window.koeApp.pagesSearchFull(q);
-    else pages = await window.koeApp.pagesSearch(q);
+    listCount = null;
+    if (filter === 'full' && q) {
+      const r = await window.koeApp.pagesSearchFull(q);
+      // 移行中は配列（古い形）で返ることもある
+      const res = Array.isArray(r) ? { hits: r, total: r.length, truncated: false } : (r || {});
+      pages = Array.isArray(res.hits) ? res.hits : [];
+      const total = Number(res.total);
+      listCount = { total: Number.isFinite(total) ? total : pages.length, shown: pages.length, truncated: Boolean(res.truncated) };
+    } else pages = await window.koeApp.pagesSearch(q);
     renderList();
   }
 
@@ -835,6 +849,13 @@
 
   function renderList() {
     const box = $('plist'); box.textContent = '';
+    if (listCount) {
+      const c = document.createElement('div'); c.className = 'count';
+      c.textContent = listCount.truncated
+        ? `${listCount.total}件中 ${listCount.shown}件を表示（先頭から）`
+        : `${listCount.total}件`;
+      box.appendChild(c);
+    }
     if (pages.length === 0) {
       const d = document.createElement('div');
       d.className = 'empty';
