@@ -90,6 +90,8 @@ function init(userDataPath) {
 //       「全議事録が消えたまま」もこれで直る（全ページが (a) になる＝再構築）。
 //   (b) 索引にあって page.json が無い行 → 幽霊行なので除く。
 //   (c) 古い世代の索引には searchText が無く、検索が本文に当たらない → 作り直す。
+//       v0.11.0 より前の索引には memoText が無く（メモは searchText の末尾に連結され、
+//       4000 字で切られていた）、メモと長い要約の後半に検索が当たらない → 同じく作り直す。
 // 起動のたびに全ページを読むのは避けたいので、(a)(c) に該当する行だけ読む。
 // 変更があったときだけ true を返し、呼び出し側が索引を書く。
 function reconcile() {
@@ -111,7 +113,8 @@ function reconcile() {
       continue;
     }
     seen.add(entry.id);
-    if (typeof index.pages[i].searchText === 'string') { kept.push(entry); continue; }
+    if (typeof index.pages[i].searchText === 'string'
+      && typeof index.pages[i].memoText === 'string') { kept.push(entry); continue; }
     const page = getPage(entry.id);
     if (page) { kept.push(summarize(page)); changed = true; } else kept.push(entry);
   }
@@ -129,6 +132,12 @@ function reconcile() {
 }
 
 // ---------------------------------------------------------------- インデックス
+// 索引が持つ検索用本文の上限。要約は長い会議で 1 万字を超えることがあり、4000 字で
+// 切ると後半の要点が検索に出ない（#44）。メモは短い前提だが、無制限に持つと
+// 索引（起動時に丸ごと読む）が肥大するので別に上限を置く。
+const SEARCH_TEXT_MAX = 20000;
+const MEMO_TEXT_MAX = 2000;
+
 function summarize(page) {
   const todos = page.blocks.filter((b) => b.type === 'todo');
   const open = todos.filter((b) => !b.checked);
@@ -151,8 +160,10 @@ function summarize(page) {
     // 「すべて」の検索が見る本文。これが無いと検索はタイトルと最初の
     // 1行しか当たらず、要約の中身を探せない（実機で「検索が全部壊れて
     // いる」と報告された）。文字起こしは searchFullText が受け持つ。
-    searchText: page.blocks.map((b) => b.text).filter(Boolean).join(' ')
-      .concat(' ', String(page.memo || '')).slice(0, 4000),
+    // メモは別のキーに持つ（#44）。要約に連結して切ると、長い会議ではメモが
+    // 上限の外へ押し出され、メモには他の検索経路が無いので二度と探せない。
+    searchText: page.blocks.map((b) => b.text).filter(Boolean).join(' ').slice(0, SEARCH_TEXT_MAX),
+    memoText: String(page.memo || '').slice(0, MEMO_TEXT_MAX),
     recovered: Boolean(page.recovered),
   };
 }
@@ -361,7 +372,21 @@ function foldWithMap(text) {
   return { folded, from, to };
 }
 
-// 一覧（タイトル・要約プレビュー）の絞り込みは同期・即時
+// 畳んだ検索語 q が当たった箇所を、元の本文 text から切り出す（前後を少し添える）。
+// 呼ぶ側が「当たる」ことを確かめてから呼ぶ（外れた本文に文字単位の位置対応を作らない）。
+function snippetOf(text, q) {
+  const { folded, from, to } = foldWithMap(text);
+  const at = folded.indexOf(q);
+  // 元の本文の範囲に戻す。結合の仕方の差で位置が取れない稀な場合は先頭から見せる
+  const s = at >= 0 ? from[at] : 0;
+  const e = at >= 0 ? to[at + q.length - 1] : Math.min(text.length, q.length);
+  const head = Math.max(0, s - 20);
+  return (head > 0 ? '…' : '') + text.slice(head, e + 40);
+}
+
+// 一覧（タイトル・要約本文・メモ）の絞り込みは同期・即時。
+// タイトル → 要約本文（searchText）→ メモ（memoText）の順に当て、抜粋は当たった方の
+// 原文から切る。打鍵のたびに全ページを走るので、まず丸ごと畳んで当たりだけ見る。
 function searchIndex(query) {
   const q = searchFold(query);
   if (!q) return index.pages;
@@ -369,17 +394,9 @@ function searchIndex(query) {
   for (const p of index.pages) {
     if (searchFold(p.title).includes(q)) { out.push(p); continue; }
     const text = p.searchText || p.preview || '';
-    // まず丸ごと畳んで当たりだけ見る。打鍵のたびに全ページを走るので、
-    // 外れたページに文字単位の位置対応（下）を作らない。
-    if (!searchFold(text).includes(q)) continue;
-    const { folded, from, to } = foldWithMap(text);
-    const at = folded.indexOf(q);
-    // 元の本文の範囲に戻す。結合の仕方の差で位置が取れない稀な場合は先頭から見せる
-    const s = at >= 0 ? from[at] : 0;
-    const e = at >= 0 ? to[at + q.length - 1] : Math.min(text.length, q.length);
-    // どこに当たったかを一覧で見せる（前後を少し添える）
-    const head = Math.max(0, s - 20);
-    out.push({ ...p, snippet: (head > 0 ? '…' : '') + text.slice(head, e + 40) });
+    if (searchFold(text).includes(q)) { out.push({ ...p, snippet: snippetOf(text, q) }); continue; }
+    const memo = p.memoText || '';
+    if (searchFold(memo).includes(q)) out.push({ ...p, snippet: snippetOf(memo, q) });
   }
   return out;
 }
