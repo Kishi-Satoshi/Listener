@@ -225,3 +225,240 @@ test('#45 pagesActionView の無い古い preload と組んでも、「アクシ
   assert.deepStrictEqual(l.called('openActions'), [], '古い openActions に戻っている');
   assert.ok(一覧(l).querySelector('.empty'), '空の表示が出ない');
 });
+
+// ================= 設定: 要約の文脈長（sumCtx）とエンジンの自動停止（engineIdleMin） =================
+// 設定キーの契約: sumCtx（整数、既定 32768、4096〜131072）、engineIdleMin（整数、既定 10、0〜120、0 = 止めない）。
+// 範囲の丸めは main（normalizeSettings）が行い、採らなかった値は applied で欄へ戻る（既存の流儀）。
+const { RETURNS } = require('./helpers/simrun.js');
+const 設定 = (extra) => Object.assign({}, RETURNS.getSettings(), extra);
+const カード見出し = (el) => { const c = el.closest('.card'); return c ? c.querySelector('h2').textContent : ''; };
+async function 保存した(l) {
+  l.byId.get('tabSettings').dispatchEvent({ type: 'change' });
+  await l.drain();
+  const c = l.called('saveSettings');
+  return c[c.length - 1].args[0];
+}
+
+test('設定: 要約の文脈長の欄が要約エンジンのカードにあり、ラベルと説明が指定どおり', async () => {
+  const l = await load(APP);
+  const el = l.byId.get('sumCtx');
+  assert.ok(el, '#sumCtx が無い');
+  assert.match(カード見出し(el), /^要約エンジン/, '要約エンジンのカードに無い');
+  const field = el.closest('.field');
+  assert.strictEqual(field.querySelector('label').textContent, '要約の文脈長');
+  assert.strictEqual(field.querySelector('.desc').textContent.trim(),
+    '要約エンジンに渡すトークン数（-c）。既定 32768。Qwen2.5-3B はここまで。大きいほどメモリを使い、小さいと長い会議の統合で足りなくなります');
+});
+
+test('設定: エンジンの自動停止の欄が「動作」のカードにあり、単位「分」とラベル・説明が指定どおり', async () => {
+  const l = await load(APP);
+  const el = l.byId.get('engineIdleMin');
+  assert.ok(el, '#engineIdleMin が無い');
+  assert.strictEqual(カード見出し(el), '動作');
+  const field = el.closest('.field');
+  assert.strictEqual(field.querySelector('label').textContent, '使わないエンジンを止めるまで（分）');
+  assert.strictEqual(field.querySelector('.desc').textContent.trim(),
+    '記録も要約もしていない時間がこれを超えたらエンジンを止めてメモリを空けます（次に使うとき起動し直します。0 で止めない）');
+});
+
+test('設定: sumCtx / engineIdleMin を読み込んで欄に出し、無ければ既定（32768 / 10）。0 分は 0 のまま（既定に化けない）', async () => {
+  const a = await load(APP, { returns: { getSettings: () => 設定({ sumCtx: 8192, engineIdleMin: 0 }) } });
+  assert.strictEqual(a.byId.get('sumCtx').value, '8192');
+  assert.strictEqual(a.byId.get('engineIdleMin').value, '0', '0（止めない）が既定に化けた');
+  const b = await load(APP, { returns: { getSettings: () => 設定({}) } });
+  assert.strictEqual(b.byId.get('sumCtx').value, '32768');
+  assert.strictEqual(b.byId.get('engineIdleMin').value, '10');
+  assert.deepStrictEqual(a.errors.map(fmt).concat(b.errors.map(fmt)), []);
+});
+
+test('設定: sumCtx / engineIdleMin は自動保存で数として送る（0 分も 0 で送る）', async () => {
+  const l = await load(APP, { returns: { getSettings: () => 設定({ sumCtx: 32768, engineIdleMin: 10 }) } });
+  l.byId.get('sumCtx').value = '65536';
+  l.byId.get('engineIdleMin').value = '0';
+  const sent = await 保存した(l);
+  assert.strictEqual(sent.sumCtx, 65536);
+  assert.strictEqual(sent.engineIdleMin, 0);
+  // 空欄・数でない入力は既定に落とす（main が丸める前に NaN を送らない）
+  l.byId.get('sumCtx').value = '';
+  l.byId.get('engineIdleMin').value = 'abc';
+  const sent2 = await 保存した(l);
+  assert.strictEqual(sent2.sumCtx, 32768);
+  assert.strictEqual(sent2.engineIdleMin, 10);
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('設定: main が丸めた値（applied）は sumCtx / engineIdleMin の欄にも戻る', async () => {
+  const l = await load(APP, { returns: { saveSettings: () => ({ ok: true, applied: { sumCtx: 131072, engineIdleMin: 120 } }) } });
+  l.byId.get('sumCtx').value = '999999';
+  l.byId.get('engineIdleMin').value = '500';
+  await 保存した(l);
+  assert.strictEqual(l.byId.get('sumCtx').value, '131072', '丸められた文脈長が欄に戻らない');
+  assert.strictEqual(l.byId.get('engineIdleMin').value, '120', '丸められた分が欄に戻らない');
+});
+
+test('設定: 記録中は要約の文脈長（エンジン起動時の -c）は触れず、自動停止の分は触れる', async () => {
+  const l = await load(APP);
+  l.fire('onMeetingUpdate', { active: true, startedAt: Date.now(), segments: [] });
+  await l.drain();
+  assert.strictEqual(l.byId.get('sumCtx').disabled, true, '記録中に文脈長を変えられる（エンジンが再起動する）');
+  assert.ok(!l.byId.get('engineIdleMin').disabled, '自動停止の分はエンジンの設定ではない');
+  l.fire('onMeetingUpdate', { active: false });
+  await l.drain();
+  assert.strictEqual(l.byId.get('sumCtx').disabled, false, '記録後も触れない');
+});
+
+// ================= 設定: データ保存先 =================
+// dataDirGet() → { dir, isDefault }、dataDirMove(dir) → { ok, dir, error? }、pickFile('folder') → パスか ''。
+const DEF = 'C:\\Users\\someone\\AppData\\Roaming\\Listener';
+const 別 = 'D:\\Listener';
+const 保存先欄 = (l) => l.byId.get('dataDirNow');
+const 移動ボタン = (l) => l.byId.get('dataDirMoveBtn');
+const 既定以外 = (l) => l.byId.get('dataDirNote');
+async function 設定画面(returns = {}) {
+  return load(APP, { preloadSrc: STAGE3(), returns: Object.assign({
+    dataDirGet: () => ({ dir: DEF, isDefault: true }),
+    dataDirMove: (dir) => ({ ok: true, dir }),
+    pickFile: () => 別,
+  }, returns) });
+}
+
+test('データ保存先: 欄は「動作」のカードにあり、起動時に dataDirGet で現在の場所を出す。説明とボタンの文言が指定どおり', async () => {
+  const l = await 設定画面();
+  assert.strictEqual(l.called('dataDirGet').length, 1, '起動時に保存先を聞いていない');
+  assert.strictEqual(カード見出し(保存先欄(l)), '動作');
+  assert.strictEqual(保存先欄(l).value, DEF);
+  assert.ok(既定以外(l).hidden, '既定なのに「（既定以外）」が出る');
+  const field = 保存先欄(l).closest('.field');
+  assert.match(field.querySelector('label').textContent, /^データ保存先/);
+  assert.strictEqual(移動ボタン(l).textContent, '保存先を変更…');
+  assert.strictEqual(field.querySelector('.desc').textContent.trim(),
+    '議事録と設定の保存先。Roaming（既定）は社内のプロファイル同期で複製されることがあります。移動しても元の場所のデータは消しません');
+  // 既存の「データ保存先を開く」はそのまま
+  const open = l.byId.get('openDataBtn');
+  assert.strictEqual(open.textContent, 'データ保存先を開く');
+  assert.ok(l.wired().some((x) => x.id === 'openDataBtn' && x.on.includes('onclick')), '「データ保存先を開く」の結線が消えた');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('データ保存先: 既定以外の場所なら「（既定以外）」を添える', async () => {
+  const l = await 設定画面({ dataDirGet: () => ({ dir: 別, isDefault: false }) });
+  assert.strictEqual(保存先欄(l).value, 別);
+  assert.ok(!既定以外(l).hidden, '「（既定以外）」が出ない');
+  assert.strictEqual(既定以外(l).textContent, '（既定以外）');
+});
+
+test('データ保存先: 「保存先を変更…」はフォルダを選ばせ、空なら何もしない。確認で取り消せば移さない', async () => {
+  const l = await 設定画面({ pickFile: () => '' });
+  移動ボタン(l).dispatchEvent({ type: 'click' });
+  await l.drain();
+  assert.deepStrictEqual(l.called('pickFile').map((c) => c.args[0]), ['folder'], "pickFile('folder') で選ばせていない");
+  assert.deepStrictEqual(l.called('dataDirMove'), [], '空のパスで移動を呼んだ');
+  // simrun の confirm は常に false（取り消し）
+  const l2 = await 設定画面();
+  移動ボタン(l2).dispatchEvent({ type: 'click' });
+  await l2.drain();
+  assert.strictEqual(l2.called('pickFile').length, 1);
+  assert.deepStrictEqual(l2.called('dataDirMove'), [], '確認で取り消したのに移した');
+  assert.strictEqual(保存先欄(l2).value, DEF, '取り消したのに表示が変わった');
+  assert.deepStrictEqual(l.errors.map(fmt).concat(l2.errors.map(fmt)), []);
+});
+
+// boot の confirm は常に true（了承）。移す経路はこちらで見る
+async function 起動して移す(replies) {
+  const os = require('os');
+  const { boot } = require('./helpers/boot.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'listener-stage3-'));
+  const pre = path.join(dir, 'preload.js');
+  fs.writeFileSync(pre, STAGE3());
+  try {
+    let cur = { dir: DEF, isDefault: true };
+    const r = boot('src/renderer/app.html', { preload: pre, replies: Object.assign({}, require('./helpers/replies.js'), {
+      dataDirGet: () => cur,
+      pickFile: () => 別,
+      dataDirMove: (d) => { cur = { dir: d, isDefault: false }; return { ok: true, dir: d }; },
+    }, replies) });
+    await r.drain();
+    const $ = (id) => r.doc.getElementById(id);
+    $('dataDirMoveBtn')._fire('click');
+    for (let i = 0; i < 5; i++) await r.drain();
+    return { r, $ };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('データ保存先: 了承すれば dataDirMove(選んだフォルダ) を呼び、ok なら表示を更新して知らせる', async () => {
+  const { r, $ } = await 起動して移す();
+  assert.deepStrictEqual(r.calls.filter((c) => c === 'dataDirMove').length, 1, 'dataDirMove が 1 回でない');
+  assert.strictEqual($('dataDirNow').value, 別, '移した先が表示に反映されない');
+  assert.strictEqual($('dataDirNote').hidden, false, '移した後に「（既定以外）」が出ない');
+  assert.match($('toast').textContent, /移しました/, '移したことを知らせていない');
+  assert.ok(!$('dataDirMoveBtn').disabled, '移した後にボタンが押せないまま');
+  assert.deepStrictEqual(r.errors, []);
+});
+
+test('データ保存先: 移せなければ error を通知に出し、表示は元のまま', async () => {
+  const { r, $ } = await 起動して移す({ dataDirMove: () => ({ ok: false, error: '書き込めないフォルダです' }) });
+  assert.match($('toast').textContent, /書き込めないフォルダです/, 'error が通知に出ない');
+  assert.strictEqual($('dataDirNow').value, DEF, '失敗したのに表示が変わった');
+  assert.ok(!$('dataDirMoveBtn').disabled, '失敗後にボタンが押せないまま');
+  assert.deepStrictEqual(r.errors, []);
+});
+
+test('データ保存先: 記録中・作成中（finalizing）は「保存先を変更…」を止めて理由を出し、終われば戻す', async () => {
+  const l = await 設定画面();
+  const note = l.byId.get('dataDirLock');
+  assert.ok(!移動ボタン(l).disabled && note.hidden, '前提: 記録前は押せて理由も出ない');
+  l.fire('onMeetingUpdate', { active: true, startedAt: Date.now(), segments: [] });
+  await l.drain();
+  assert.strictEqual(移動ボタン(l).disabled, true, '記録中に保存先を変えられる');
+  assert.ok(!note.hidden && /記録中|要約中/.test(note.textContent), '理由が出ない');
+  l.fire('onMeetingUpdate', { active: false, finalizing: true, startedAt: Date.now() - 60000, stoppedAt: Date.now(), segments: [] });
+  await l.drain();
+  assert.strictEqual(移動ボタン(l).disabled, true, '作成中（要約中）に保存先を変えられる');
+  l.fire('onMeetingUpdate', { active: false });
+  await l.drain();
+  assert.strictEqual(移動ボタン(l).disabled, false, '記録が終わっても押せない');
+  assert.ok(note.hidden, '記録が終わっても理由が残る');
+  // 押しても IPC しない
+  l.fire('onMeetingUpdate', { active: true, startedAt: Date.now(), segments: [] });
+  await l.drain();
+  移動ボタン(l).dispatchEvent({ type: 'click' });
+  await l.drain();
+  assert.deepStrictEqual(l.called('pickFile'), [], '記録中に押せてしまう');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('データ保存先: 「要約を再生成」の最中も止め、終われば戻す', async () => {
+  const { PAGE } = require('./helpers/replies.js');
+  const { STANDUP_SEGMENTS } = require('./fixtures.js');
+  const clone = (x) => JSON.parse(JSON.stringify(x));
+  let done;
+  const l = await 設定画面({
+    pageGet: () => ({ page: clone(PAGE), segments: clone(STANDUP_SEGMENTS) }),
+    pageSummarize: () => new Promise((r) => { done = r; }),
+  });
+  l.fire('onPageOpen', 'p1');
+  await l.drain();
+  const btn = () => l.byId.get('pActs').querySelectorAll('button').find((b) => /要約/.test(b.textContent) || /生成中/.test(b.textContent));
+  btn().dispatchEvent({ type: 'click' });
+  await l.drain();
+  assert.strictEqual(l.called('pageSummarize').length, 1, '前提: 要約が走っている');
+  assert.strictEqual(移動ボタン(l).disabled, true, '要約中に保存先を変えられる');
+  assert.ok(!l.byId.get('dataDirLock').hidden, '理由が出ない');
+  done({ ok: true, stat: { linked: 1, total: 1 } });
+  await l.drain();
+  assert.strictEqual(移動ボタン(l).disabled, false, '要約が終わっても押せない');
+  assert.ok(l.byId.get('dataDirLock').hidden, '要約が終わっても理由が残る');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('データ保存先: dataDirGet / dataDirMove の無い古い preload と組んでも、設定画面は生きて押しても落ちない', async () => {
+  const l = await load(APP);
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+  assert.deepStrictEqual(l.consoleErrors, []);
+  移動ボタン(l).dispatchEvent({ type: 'click' });
+  await l.drain();
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+  assert.deepStrictEqual(l.called('pickFile'), [], '移せないのにフォルダを選ばせた');
+});
