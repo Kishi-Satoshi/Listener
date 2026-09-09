@@ -43,6 +43,7 @@ const {
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs, nextSegmentMs, EtaTracker,
   skipPendingSegments, restoreAfterPaste,
+  planDataMove, sameTree, estimateTokens, foldNotes, idleEnginesToStop,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -52,6 +53,8 @@ const MIN_RECORD_MS = 400;
 const MEMO_MAX = 1500;
 const SUM_MAX_TOKENS = 3000;   // 最終的な議事録
 const NOTE_MAX_TOKENS = 900;   // 分割要約の各パート
+// 文脈長（settings.sumCtx）のうち、指示文・役割名・書式の余白として取っておく分（#41）
+const SUM_CTX_MARGIN = 256;
 const ENGINE_READY_TIMEOUT_MS = 90000;
 
 const DEFAULT_SETTINGS = {
@@ -89,6 +92,13 @@ const DEFAULT_SETTINGS = {
   useSystemAudio: false,
   maxHistory: 500,
   segmentSec: 75,
+  // 要約エンジン（llama-server）の文脈長（-c）。統合プロンプトがこれに収まらないときは
+  // 要点メモを 2 段で畳む（#41。generateMinutes）
+  sumCtx: 32768,
+  // 使われないエンジンを止めるまでの分。0 = 止めない（#58。releaseIdleEngines）
+  engineIdleMin: 10,
+  // データ保存先。'' = 既定の場所 <userData>/data（#29。store.init の第2引数）
+  dataDir: '',
 };
 
 // ---------------------------------------------------------------- 状態
@@ -194,7 +204,60 @@ function loadStores() {
   }
   history = loadJson(historyPath(), []);
   if (!Array.isArray(history)) history = [];
-  store.init(app.getPath('userData'));
+  // 第2引数が空でなければそこをデータフォルダにする（#29）。設定した場所が無くなっていても
+  // （外付けディスクを抜いた等）store 側が作り直すので、起動は止まらない
+  store.init(app.getPath('userData'), settings.dataDir || '');
+}
+// いまのデータフォルダの絶対パス。store.root が無い版でも動くよう守り、無ければ既定の場所
+const dataRoot = () => (typeof store.root === 'function' ? store.root() : path.join(app.getPath('userData'), 'data'));
+
+// ---------------------------------------------------------------- データ保存先の移動（#29）
+// 写す → 確かめる → 設定を切り替える → store を開き直す。元のフォルダは消さない（消すのは
+// 利用者。移せていなかったときに戻れる）。受けるかの判断は mainlib.planDataMove、写した結果の
+// 検証は mainlib.sameTree（ファイル数と合計バイト数の一致）。
+// 退避フォルダ segbuf（<userData>/data/segbuf）は一時物なので写さない（segbufRoot はデータ
+// フォルダを移しても変わらない）。
+const SEGBUF_DIR = 'segbuf';
+// dir 以下のファイル数と合計バイト数。skip（絶対パス）以下は数えない
+function treeSummary(dir, skip) {
+  let files = 0;
+  let bytes = 0;
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (p === skip) continue;
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile()) { files++; bytes += fs.statSync(p).size; }
+    }
+  };
+  walk(dir);
+  return { files, bytes };
+}
+async function moveDataDir(dir) {
+  if (isBusy()) return { ok: false, error: '記録中・要約中は移動できません' };
+  const from = dataRoot();
+  const raw = String(dir || '').trim();
+  const listDir = (p) => { try { return fs.readdirSync(p); } catch (_) { return []; } };
+  const why = planDataMove(from, raw, (p) => fs.existsSync(p), listDir);
+  if (why) return { ok: false, error: why };
+  const to = path.normalize(raw);
+  try {
+    fs.mkdirSync(to, { recursive: true });
+    const skipFrom = path.join(from, SEGBUF_DIR);
+    fs.cpSync(from, to, { recursive: true, filter: (src) => src !== skipFrom });
+    if (!sameTree(treeSummary(from, skipFrom), treeSummary(to, path.join(to, SEGBUF_DIR)))) {
+      return { ok: false, error: '写した内容が元と一致しないため、保存先を切り替えませんでした。元の場所のデータはそのままです' };
+    }
+  } catch (e) {
+    return { ok: false, error: `移動に失敗しました: ${e.message}。元の場所のデータはそのままです` };
+  }
+  settings.dataDir = to;
+  persistSettings();
+  store.init(app.getPath('userData'), settings.dataDir);
+  engineLog(`データ保存先を移動: ${from} → ${to}`);
+  sendToMainWin('pages:updated', store.listPages());
+  sendToMainWin('app:notice', `データの保存先を ${to} に変えました。元の場所のデータは残しています（不要なら手で削除してください）`);
+  return { ok: true, dir: to };
 }
 
 // ---------------------------------------------------------------- テキスト整形
@@ -254,10 +317,14 @@ function buildPrompt(extraTail) { return promptParts(extraTail).prompt; }
 
 // ---------------------------------------------------------------- エンジン管理
 function makeEngine(name) {
-  return { name, proc: null, ready: false, lastError: '', readyPromise: null, startPromise: null, sig: '', stderrTail: '', stopping: false };
+  // lastUsed: 起動時と推論のたびの時刻。使われないまま engineIdleMin 分たったら止める（#58）
+  return { name, proc: null, ready: false, lastError: '', readyPromise: null, startPromise: null, sig: '', stderrTail: '', stopping: false, lastUsed: 0 };
 }
 const whisperEng = makeEngine('文字起こしエンジン');
 const sumEng = makeEngine('要約エンジン');
+const touchEngine = (eng) => { eng.lastUsed = Date.now(); };
+// 起動・終了・停止のたびにトレイ（「エンジンを停止」の有効／無効）を追随させる。終了中は触らない
+function engineChanged() { if (!quitting) updateTray(); }
 
 function engineLog(line) {
   try {
@@ -295,7 +362,7 @@ function engineSpawnArgs(eng) {
     '--host', '127.0.0.1',
     '--port', String(settings.sumPort),
     '-t', String(settings.sumThreads),
-    '-c', '16384',
+    '-c', String(settings.sumCtx),   // 文脈長（#41）。統合プロンプトが収まらなければ要点メモを畳む
   ];
 }
 const engineExe = (e) => (e === whisperEng ? settings.localServerExe : settings.sumServerExe);
@@ -330,7 +397,8 @@ function engineSignature(eng) {
   return [engineExe(eng), engineModel(eng), enginePort(eng),
     eng === whisperEng ? settings.localThreads : settings.sumThreads,
     eng === whisperEng ? settings.language : '',
-    eng === whisperEng ? `${settings.useVad ? resolveVadModel() : ''}|${settings.suppressNst}` : ''].join('|');
+    eng === whisperEng ? `${settings.useVad ? resolveVadModel() : ''}|${settings.suppressNst}` : '',
+    eng === whisperEng ? '' : settings.sumCtx].join('|');   // 文脈長を変えたら要約エンジンを起動し直す（#41）
 }
 
 // 127.0.0.1:port を一瞬だけ listen して空きを見る（#28/#31）。EADDRINUSE だけを「使用中」
@@ -380,6 +448,8 @@ function startEngine(eng) {
       eng.lastError = `${eng.name}を起動できません: ${e.message}`; engineLog(eng.lastError); return;
     }
     eng.proc = p;
+    eng.lastUsed = Date.now();
+    engineChanged();
     // 以下のハンドラは「自分が起動したプロセス」のときだけ状態を触る（#57）。
     // 再起動のあとに古いプロセスの exit が届き、新しいプロセスを null にしていた。
     p.stderr.on('data', (d) => {
@@ -399,6 +469,7 @@ function startEngine(eng) {
         engineLog(eng.lastError);
       }
       eng.proc = null; eng.ready = false; eng.readyPromise = null;
+      engineChanged();
     });
   })().finally(() => { eng.startPromise = null; });
   return eng.startPromise;
@@ -407,6 +478,24 @@ function startEngine(eng) {
 function stopEngine(eng) {
   if (eng.proc) { eng.stopping = true; try { eng.proc.kill(); } catch (_) { /* noop */ } eng.proc = null; }
   eng.ready = false; eng.readyPromise = null;
+  engineChanged();
+}
+
+// 使われないエンジンを止める（#58）。60 秒ごとに呼ぶ。判断は mainlib.idleEnginesToStop
+// （手が空いていて、起動していて、engineIdleMin 分使われていない。0 = 止めない）。
+// 次に使うときは ensureEngineReady が起動し直す
+const ENGINE_IDLE_CHECK_MS = 60000;
+function releaseIdleEngines() {
+  for (const eng of idleEnginesToStop([whisperEng, sumEng], Date.now(), settings.engineIdleMin, isBusy())) {
+    engineLog(`${eng.name}: ${settings.engineIdleMin} 分使われていないため停止（メモリを解放）`);
+    stopEngine(eng);
+  }
+}
+// トレイの「エンジンを停止（メモリを解放）」。次に使うときは起動し直す
+function stopEnginesFromTray() {
+  if (isBusy()) return;
+  engineLog('トレイからエンジンを停止（メモリを解放）');
+  stopEngine(whisperEng); stopEngine(sumEng);
 }
 
 function ensureEngineReady(eng) {
@@ -484,8 +573,10 @@ async function transcribeLocal(wavBuffer, extraPromptTail, durationMs) {
   // トレードオフ: エンジンが応答しないままハングした場合、この時間まで
   // 待ち続ける（議事録は「破棄」で抜けられる）。喪失よりは待ちを選ぶ。
   const waitMs = Math.min(1800000, Math.max(240000, Math.round(durationMs || 0) * 5 + 60000));
+  touchEngine(whisperEng);
   const res = await fetch(`http://127.0.0.1:${settings.localPort}/inference`,
     { method: 'POST', body: form, signal: AbortSignal.timeout(waitMs) });
+  touchEngine(whisperEng);
   if (!res.ok) {
     let detail = '';
     try { detail = (await res.json())?.error || ''; } catch (_) { /* noop */ }
@@ -506,6 +597,7 @@ async function llmChat(messages, maxTokens, onWait) {
   let res;
   let waited = false;
   const deadline = Date.now() + 120000;
+  touchEngine(sumEng);
   for (;;) {
     res = await fetch(`http://127.0.0.1:${settings.sumPort}/v1/chat/completions`, {
       method: 'POST',
@@ -513,6 +605,7 @@ async function llmChat(messages, maxTokens, onWait) {
       body: JSON.stringify({ messages, temperature: 0.2, max_tokens: maxTokens }),
       signal: AbortSignal.timeout(900000),
     });
+    touchEngine(sumEng);
     if (res.status !== 503 || Date.now() >= deadline) break;
     if (!waited && onWait) {
       waited = true;
@@ -556,6 +649,10 @@ function minutesTemplate(type) {
   return `${mtype.getFormat(type)}\n\n${OUTPUT_RULE}`;
 }
 
+// 文脈長のうち入力（プロンプト）に使える推定トークン（#41）: 文脈長 − 出力の上限 − 余白。
+// 推定は mainlib.estimateTokens（UTF-8 バイト ÷ 2.5。多めに見積もる）
+const sumCtxBudget = () => settings.sumCtx - SUM_MAX_TOKENS - SUM_CTX_MARGIN;
+
 async function generateMinutes(plain, memo, onProgress, type) {
   const ok = await ensureEngineReady(sumEng);
   if (!ok) throw new Error(sumEng.lastError || '要約エンジンが起動していません');
@@ -569,8 +666,12 @@ async function generateMinutes(plain, memo, onProgress, type) {
   const memoBlock = memoText ? `【会議メモ・アジェンダ（要約のヒント）】\n${memoText}\n\n` : '';
 
   const CHUNK = 5500;
-  // メモの分も含めて1回で収まるかを判断する
-  if (plain.length + memoBlock.length <= CHUNK + 1500) {
+  // 文脈長の予算（#41）。固定分（役割・メモ・書式）は先に引いておく
+  const budget = sumCtxBudget();
+  const fixed = estimateTokens(sys + memoBlock + minutesTemplate(type));
+  // メモの分も含めて1回で収まるかを判断する。文字数のほか推定トークンでも見る
+  // （文脈長を小さくした設定で、1 回分のプロンプトが溢れないように）
+  if (plain.length + memoBlock.length <= CHUNK + 1500 && estimateTokens(plain) + fixed <= budget) {
     const one = await llmChatP([
       { role: 'system', content: sys },
       { role: 'user', content: `${memoBlock}【会議の文字起こし】\n${plain}\n\n上記から、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${minutesTemplate(type)}` },
@@ -586,10 +687,12 @@ async function generateMinutes(plain, memo, onProgress, type) {
   }
   const notes = [];
   const truncatedParts = [];   // 半分にしても上限で切れたパート番号（1 始まり）
-  const extract = async (text, i) => {
+  // 要点の抽出。kind は材料の呼び名（'文字起こし' | '要点メモ'）。文字起こしの分割要約と、
+  // 文脈長に収まらないときの要点メモの畳み（下）が同じ経路を通る
+  const extract = async (text, i, n, kind) => {
     const r = await llmChatP([
       { role: 'system', content: sys },
-      { role: 'user', content: `以下は長い会議の文字起こしの一部（${i + 1}/${chunks.length}）です。重要な発言・決定・依頼・課題・数字を漏らさず、簡潔な箇条書きで抽出してください。文体は常体（だ・である調、体言止め）。\n\n${text}` },
+      { role: 'user', content: `以下は長い会議の${kind}の一部（${i + 1}/${n}）です。重要な発言・決定・依頼・課題・数字を漏らさず、簡潔な箇条書きで抽出してください。文体は常体（だ・である調、体言止め）。\n\n${text}` },
     ], NOTE_MAX_TOKENS);
     return r;
   };
@@ -598,7 +701,7 @@ async function generateMinutes(plain, memo, onProgress, type) {
     // 上限で切れたら半分に割って両方をやり直す（一度だけ。mainlib.extractNotes）。
     // 切れたままだと中盤の議題が黙って欠ける（#16）。それでも切れたら本文は残し、
     // 要点メモに注記を添え、パート番号を控える（summaryError で名指しする）。
-    const part = await extractNotes((t) => extract(t, i), chunks[i]);
+    const part = await extractNotes((t) => extract(t, i, chunks.length, '文字起こし'), chunks[i]);
     let text = part.text;
     if (part.truncated) {
       truncatedParts.push(i + 1);
@@ -606,10 +709,37 @@ async function generateMinutes(plain, memo, onProgress, type) {
     }
     notes.push(`--- パート${i + 1} ---\n${text}`);
   }
+  // 統合プロンプトが文脈長に収まらないなら、要点メモを 2 段で畳む（#41）。前から順に予算に
+  // 収まる束に分け（mainlib.foldNotes）、各束を分割要約と同じ経路（extractNotes・NOTE_MAX_TOKENS）
+  // でもう一段要約してから統合する。畳んだことは engineLog にだけ残す（page.notes や
+  // summaryError には書かない。要約の中身の問題ではなく容量の話で、利用者が直すものではない）。
+  // 束の予算は統合と同じ budget − fixed（束の要約は出力が短く指示文も短いので、余裕がある側）
+  let material = notes;
+  const need = estimateTokens(notes.join('\n\n')) + fixed;
+  if (need > budget) {
+    const bundles = foldNotes(notes, Math.max(1, budget - fixed), estimateTokens);
+    engineLog(`要約: 要点メモ ${notes.length} パート（推定 ${need} トークン）が文脈長 ${settings.sumCtx} の予算 ${budget} を超えるため、${bundles.length} 束に畳んだ`);
+    material = [];
+    let first = 1;
+    for (let k = 0; k < bundles.length; k++) {
+      const last = first + bundles[k].length - 1;
+      if (onProgress) onProgress(`要点メモをまとめ直しています… (${k + 1}/${bundles.length})`);
+      const part = await extractNotes((t) => extract(t, k, bundles.length, '要点メモ'), bundles[k].join('\n\n'));
+      let text = part.text;
+      if (part.truncated) {
+        engineLog(`要約: 束 ${k + 1}（パート${first}〜${last}）のまとめ直しが長さの上限で切れた`);
+        text += `\n（※パート${first}〜${last}のまとめは途中で切れています）`;
+      }
+      material.push(`--- パート${first}〜${last}（まとめ） ---\n${text}`);
+      first = last + 1;
+    }
+    const after = estimateTokens(material.join('\n\n')) + fixed;
+    if (after > budget) engineLog(`要約: 畳んでも推定 ${after} トークンで予算 ${budget} を超える（2 段まで。続行する）`);
+  }
   if (onProgress) onProgress('議事録をまとめています…');
   const final = await llmChatP([
     { role: 'system', content: sys },
-    { role: 'user', content: `${memoBlock}【会議の要点メモ（時系列）】\n${notes.join('\n\n')}\n\n上記の要点メモを統合し、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${minutesTemplate(type)}` },
+    { role: 'user', content: `${memoBlock}【会議の要点メモ（時系列）】\n${material.join('\n\n')}\n\n上記の要点メモを統合し、次の構成のMarkdown議事録を作成してください。見出しはこの通りに使い、本文だけを出力してください。\n\n${minutesTemplate(type)}` },
   ], SUM_MAX_TOKENS);
   return { md: final.text, truncated: truncatedParts.length > 0 || final.truncated, truncatedParts, finalTruncated: final.truncated };
 }
@@ -1048,6 +1178,7 @@ async function transcribeRecovered() {
   let q = recoveryQueue;
   if (!q) return;
   recoveryRunning = true;
+  updateTray();   // 復旧中は「手が塞がっている」（isBusy）。トレイの有効／無効を追随させる
   try {
     const seen = new Set();   // 同じ待ち行列を二度拾わない（recovery.json を消せなかったとき）
     while (q && !seen.has(q.dir)) {
@@ -1066,6 +1197,7 @@ async function transcribeRecovered() {
     }
   } finally {
     recoveryRunning = false;
+    updateTray();
   }
 }
 async function transcribeRecoveredItems(q) {
@@ -1151,7 +1283,9 @@ function startMeeting() {
   state = 'meeting';
   writeDraft();
   ensureEngineReady(whisperEng);
-  if (engineValid(sumEng)) startEngine(sumEng);
+  // 要約エンジンはここで先読みしない（#58）。記録開始で起動すると約 3GB が上がり、破棄しても
+  // 降りない（記録だけして要約しない会議でも掴んだまま）。要約直前の ensureEngineReady(sumEng)
+  // （generateMinutes）に任せる。その分、最初の要約はモデル読み込みの待ちを含む
   positionOverlay();
   overlayWin.showInactive();
   // 音声入力の開始（上の 'dictation'）には systemAudio を渡さない。
@@ -1361,6 +1495,9 @@ const runSummary = makeSummaryRunner(doRunSummary, () => updateTray());
 // 要約が走っている間はアプリを「忙しい」として扱う（#52）: 省電力を止めない・終了前に
 // 確かめる・更新と再起動を拒む。件数は mainlib.makeSummaryRunner が持つ。
 const isSummarizing = () => runSummary.running().length > 0;
+// 「手が塞がっている」: 記録・文字起こし・要約・復旧の文字起こしのどれかが動いている。
+// データ保存先の移動（#29）と、使われないエンジンの停止（#58）はこれが false のときだけ
+const isBusy = () => state !== 'idle' || isSummarizing() || recoveryRunning || pendingSegs > 0;
 
 // 要約の生成 → ブロック化 → 出典付与 → 保存
 async function doRunSummary(pageId) {
@@ -1586,6 +1723,8 @@ function updateTray() {
   // アプリ内更新で直すこともできなくなる（実機で起きた）。
   // 復旧の手段が、壊れうるものに依存していてはいけない。
   items.push({ label: '更新を確認', enabled: state === 'idle' && !isSummarizing(), click: checkUpdateFromTray });
+  // エンジンを手で止めてメモリを解放する（#58）。どちらかが起動していて、手が空いているときだけ
+  items.push({ label: 'エンジンを停止（メモリを解放）', enabled: (Boolean(whisperEng.proc) || Boolean(sumEng.proc)) && !isBusy(), click: stopEnginesFromTray });
   items.push({ type: 'separator' });
   items.push({ label: '終了', click: quitFromTray });
   // 既定で代替している／登録できていないキーがあれば、その旨を添える
@@ -1703,6 +1842,11 @@ function setupIpc() {
   ipcMain.handle('pages:searchFull', (_e, q) => store.searchFullText(q || '', 60));
   ipcMain.handle('pages:openActions', () => store.openActions());
   ipcMain.handle('pages:assignees', () => store.assigneeList());
+  // アクション一覧（絞り込み込み）。store.actionView の戻り値 { actions, people, total } をそのまま返す
+  ipcMain.handle('pages:actionView', (_e, { q, assignee } = {}) => store.actionView({ q, assignee }));
+  // データ保存先（#29）。isDefault は「既定の場所 <userData>/data のまま」
+  ipcMain.handle('data:dir', () => ({ dir: dataRoot(), isDefault: !settings.dataDir }));
+  ipcMain.handle('data:move', (_e, dir) => moveDataDir(dir));
   ipcMain.handle('page:get', (_e, id) => {
     const page = store.getPage(id);
     if (!page) return null;
@@ -1814,7 +1958,8 @@ function setupIpc() {
     const p = resolveVadModel();
     return { path: p, auto: Boolean(p) && p !== settings.vadModelPath };
   });
-  ipcMain.handle('app:open-data-dir', () => { shell.openPath(app.getPath('userData')); return true; });
+  // 開くのはいまのデータフォルダ（移動後はそこ。#29）
+  ipcMain.handle('app:open-data-dir', () => { shell.openPath(dataRoot()); return true; });
   // Windows のサウンド設定を開く。録音されるスピーカーは「既定の再生デバイス」
   // で決まり、アプリ側から選ぶ手段は無いので、変える場所へ案内する。
   ipcMain.handle('app:open-sound-settings', () => {
@@ -1850,6 +1995,11 @@ function setupIpc() {
     return true;
   });
   ipcMain.handle('dialog:pick', async (_e, kind) => {
+    // フォルダ（データ保存先の移動先。#29）。戻り値はパスか ''
+    if (kind === 'folder') {
+      const res = await dialog.showOpenDialog(mainWin, { properties: ['openDirectory'] });
+      return res.canceled ? '' : (res.filePaths[0] || '');
+    }
     const filters = kind === 'exe'
       ? [{ name: '実行ファイル', extensions: process.platform === 'win32' ? ['exe'] : ['*'] }]
       : [{ name: 'モデルファイル', extensions: ['bin', 'gguf'] }];
@@ -1957,6 +2107,8 @@ if (!gotLock) {
     }
     createTray();
     if (engineValid(whisperEng)) startEngine(whisperEng);
+    // 使われないエンジンを 60 秒ごとに見て止める（#58。判断は mainlib.idleEnginesToStop）
+    setInterval(releaseIdleEngines, ENGINE_IDLE_CHECK_MS);
     // 復旧ページに文字起こし待ちの音声が残っていれば、エンジンの用意を待って順に片付ける
     transcribeRecovered().catch((e) => engineLog(`復旧の文字起こしに失敗: ${e.message}`));
     ensurePaster();

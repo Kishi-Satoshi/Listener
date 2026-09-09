@@ -12,6 +12,11 @@
 function clampInt(v, min, max, fallback) {
   return Math.max(min, Math.min(max, parseInt(v, 10) || fallback));
 }
+// 0 を有効な値として受ける版（engineIdleMin の 0 = 「止めない」）。数にならない値だけ既定へ
+function clampIntOrZero(v, min, max, fallback) {
+  const n = parseInt(v, 10);
+  return Number.isNaN(n) ? fallback : Math.max(min, Math.min(max, n));
+}
 
 // raw: 既定値を重ねた後の設定。defaults: 壊れた値を戻す先（DEFAULT_SETTINGS）。
 // 入力は書き換えず、新しいオブジェクトを返す。
@@ -25,6 +30,10 @@ function normalizeSettings(raw, defaults) {
   s.localThreads = clampInt(s.localThreads, 1, 64, d.localThreads || 4);
   s.sumThreads = clampInt(s.sumThreads, 1, 64, d.sumThreads || 4);
   s.segmentSec = clampInt(s.segmentSec, 20, 300, d.segmentSec || 75);
+  // 第3段（v0.11.0）で足した 3 つ。古い settings.json には無いので既定で埋める
+  s.sumCtx = clampInt(s.sumCtx, 4096, 131072, d.sumCtx || 32768);              // 要約の文脈長（#41）
+  s.engineIdleMin = clampIntOrZero(s.engineIdleMin, 0, 120, d.engineIdleMin ?? 10);   // 使われないエンジンを止めるまでの分（#58）
+  s.dataDir = typeof s.dataDir === 'string' ? s.dataDir.trim() : '';           // データ保存先（'' = 既定の場所。#29）
   return s;
 }
 

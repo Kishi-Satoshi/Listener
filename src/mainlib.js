@@ -307,6 +307,7 @@ const ENGINE_SETTING_LABELS = {
   localServerExe: '文字起こしエンジンの実行ファイル', localModelPath: '文字起こしのモデル', vadModelPath: 'VAD のモデル',
   sumServerExe: '要約エンジンの実行ファイル', sumModelPath: '要約のモデル',
   localPort: '文字起こしのポート', sumPort: '要約のポート', segmentSec: '区間の長さ',
+  sumCtx: '要約の文脈長',
 };
 const ENGINE_SETTING_KEYS = Object.keys(ENGINE_SETTING_LABELS);
 const sameValue = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -366,6 +367,37 @@ async function extractNotes(extract, text) {
   const a = await extract(text.slice(0, half));
   const b = await extract(text.slice(half));
   return { text: `${a.text}\n${b.text}`, truncated: Boolean(a.truncated || b.truncated), retried: true };
+}
+
+// ---------------------------------------------------------------- 要約の文脈長（#41）
+// 推定トークン数。UTF-8 のバイト数 ÷ 2.5 の切り上げ。多くの日本語対応モデルのトークナイザでは
+// 日本語 1 文字（3 バイト）が 1〜2 トークン、英数字は 4 文字（4 バイト）で 1 トークン程度で、
+// どちらも 1 トークン ≒ 2.5〜4 バイト。2.5 で割るのは実際より多めに見積もるためで、外すなら
+// 「収まると思ったら溢れた」側には外さない（溢れると llama-server がプロンプトを黙って切る）。
+function estimateTokens(text) {
+  return Math.ceil(Buffer.byteLength(String(text ?? ''), 'utf8') / 2.5);
+}
+
+// 要点メモ（分割要約の各パート）を、前から順に「推定トークンの合計が予算に収まる束」に分ける。
+// 統合プロンプトが文脈長に収まらないとき、各束をもう一段要約してから統合する（2 段）。
+// 順序は時系列のまま。1 件で予算を超える要点メモは単独の束（それ以上は割らない。もう一段の
+// 要約で NOTE_MAX_TOKENS 以下に縮む）。束の間の区切り（空行）は数えない（束あたり数トークンで、
+// 呼び出し側の余白の内）。estimate は省けば estimateTokens。入力は書き換えない。
+function foldNotes(notes, budgetTokens, estimate) {
+  const list = (Array.isArray(notes) ? notes : []).map((n) => String(n ?? ''));
+  const est = typeof estimate === 'function' ? estimate : estimateTokens;
+  const budget = Number(budgetTokens) > 0 ? Number(budgetTokens) : 1;
+  const out = [];
+  let cur = [];
+  let used = 0;
+  for (const n of list) {
+    const t = est(n);
+    if (cur.length && used + t > budget) { out.push(cur); cur = []; used = 0; }
+    cur.push(n);
+    used += t;
+  }
+  if (cur.length) out.push(cur);
+  return out;
 }
 
 // summaryError に書く一文。parts: 半分にしても切れたパート番号（1 始まり）、
@@ -533,6 +565,59 @@ function skipPendingSegments(segments) {
   return { count, wavs };
 }
 
+// ---------------------------------------------------------------- 使われないエンジンの停止（#58）
+// 要約エンジンは起動すると約 3GB を掴んだまま降りない。使われないまま idleMin 分たったら止め、
+// 次に使うとき（ensureEngineReady）に起動し直す。engines は main.js のエンジン { proc, lastUsed,
+// readyPromise }（proc: 起動中のプロセス、lastUsed: 起動時と推論のたびの時刻、readyPromise:
+// 準備完了を待っている人がいる印）。戻り値は止めてよいエンジンの配列。
+//   - busy（記録・文字起こし・要約・復旧のどれか）なら何も止めない
+//   - idleMin が 0 以下・数でないなら止めない（0 = 止めない）
+//   - 起動していない／待っている人がいる／使った時刻が無い エンジンは止めない
+function idleEnginesToStop(engines, now, idleMin, busy) {
+  const min = Number(idleMin);
+  if (busy || !(min > 0)) return [];
+  const limit = min * 60000;
+  return (engines || []).filter((e) => e && e.proc && !e.readyPromise
+    && Number.isFinite(e.lastUsed) && now - e.lastUsed >= limit);
+}
+
+// ---------------------------------------------------------------- データ保存先の移動（#29）
+// 移動は「写す → 確かめる → 設定を切り替える」で、元のフォルダは消さない（消すのは利用者）。
+// ここは移動先を受けるかの判断。拒む理由の一文を返し、通すなら ''。
+//   from: いまのデータフォルダ、to: 移動先、exists(p): fs.existsSync 相当、
+//   listDir(p): fs.readdirSync 相当（無ければ []）。
+// Windows 向けなので、比較は区切り文字（\ と /）と大文字小文字の違いを無視する。
+// 拒むもの:
+//   - 空・相対パス（ダイアログは絶対パスを返す。相対だと作業フォルダ次第で別の場所になる）
+//   - 今と同じ場所
+//   - 今のデータフォルダの中（写す先が写す元に含まれ、終わらない）
+//   - 今のデータフォルダを含む親（写す元が写す先に含まれ、同じく終わらない）
+//   - 既に Listener のデータがある場所（別のデータを上書きする）・空でないフォルダ
+//     （利用者の書類の中に pages/ などが混ざる。空のフォルダを選んでもらう）
+const normPath = (p) => String(p ?? '').trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+const isAbsPath = (n) => /^([a-z]:(\/|$)|\/)/.test(n);   // C:/…（末尾の / を落とした C: も）か /（UNC の //server/share も）
+function planDataMove(from, to, exists, listDir) {
+  const t = normPath(to);
+  if (!t) return '移動先が指定されていません';
+  if (!isAbsPath(t)) return '移動先は絶対パスで指定してください';
+  const f = normPath(from);
+  if (t === f) return '今と同じ場所です';
+  if (t.startsWith(`${f}/`)) return '今のデータフォルダの中には移せません';
+  if (f.startsWith(`${t}/`)) return '今のデータフォルダを含むフォルダ（親フォルダ）には移せません';
+  const raw = String(to ?? '').trim();
+  const sub = (name) => `${raw.replace(/[\\/]+$/, '')}${raw.includes('\\') ? '\\' : '/'}${name}`;
+  if (exists(sub('pages')) || exists(sub('index.json'))) return '移動先に既に Listener のデータがあります。別の空のフォルダを選んでください';
+  if (exists(raw) && (listDir(raw) || []).length > 0) return '移動先は空のフォルダにしてください';
+  return '';
+}
+// 写した結果の検証。a / b は { files: ファイル数, bytes: 合計バイト数 }。両方一致で同じ木とみなす。
+// 数えられなかった（NaN）ときは一致としない（確かめていないのに切り替えない）
+function sameTree(a, b) {
+  if (!a || !b) return false;
+  const n = (v) => Number.isFinite(v);
+  return n(a.files) && n(b.files) && n(a.bytes) && n(b.bytes) && a.files === b.files && a.bytes === b.bytes;
+}
+
 const SEGBUF_MAX_AGE_MS = 7 * 86400000;
 function staleSegbufDirs(entries, nowMs, maxAgeMs = SEGBUF_MAX_AGE_MS) {
   const out = [];
@@ -555,4 +640,6 @@ module.exports = {
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
   nextSegmentMs, EtaTracker, skipPendingSegments,
+  planDataMove, sameTree,
+  estimateTokens, foldNotes, idleEnginesToStop,
 };
