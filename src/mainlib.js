@@ -500,6 +500,25 @@ class EtaTracker {
   }
 }
 
+// ---------------------------------------------------------------- 打ち切り（#42）
+// 文字起こし待ちの区間を全部「打ち切り」にする（meeting:skipPending）。失敗扱いにして本文を
+// 「（文字起こしを打ち切り）」に置き、pending/wav を外す（id/atMs はそのまま）。黙って消さず
+// 失敗の行として残すのは、何が欠けたかが議事録から分かるようにするため。
+// 戻り値は { count: 打ち切った数, wavs: 消すべき wav のパス }。配列の要素は書き換える。
+function skipPendingSegments(segments) {
+  const wavs = [];
+  let count = 0;
+  for (const s of (segments || [])) {
+    if (!s || !s.pending) continue;
+    count++;
+    if (s.wav) wavs.push(s.wav);
+    delete s.pending; delete s.wav;
+    s.text = '（文字起こしを打ち切り）';
+    s.failed = true;
+  }
+  return { count, wavs };
+}
+
 const SEGBUF_MAX_AGE_MS = 7 * 86400000;
 function staleSegbufDirs(entries, nowMs, maxAgeMs = SEGBUF_MAX_AGE_MS) {
   const out = [];
@@ -521,5 +540,5 @@ module.exports = {
   ENGINE_SETTING_KEYS, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
-  nextSegmentMs, EtaTracker,
+  nextSegmentMs, EtaTracker, skipPendingSegments,
 };

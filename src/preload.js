@@ -73,6 +73,7 @@ contextBridge.exposeInMainWorld('koeApp', {
   meetingDiscard: () => ipcRenderer.invoke('meeting:discard'),
   meetingStatus: () => ipcRenderer.invoke('meeting:status'),
   meetingSetMemo: (memo) => ipcRenderer.invoke('meeting:set-memo', memo),
+  meetingSkipPending: () => ipcRenderer.invoke('meeting:skipPending'),
 
   // イベント
   onHistoryUpdated: (cb) => ipcRenderer.on('history:updated', (_e, h) => cb(h)),

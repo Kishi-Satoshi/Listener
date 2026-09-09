@@ -1022,3 +1022,20 @@ test('#42(4) 残り時間の見積もり（etaSec）と打ち切った数（skip
   assert.ok(on.indexOf('eta.record(') > on.indexOf('} catch (e) {'), '失敗した区間まで学習している');
   assert.ok(on.includes('m.inFlightSince = t0') && on.includes('m.inFlightSince = 0'), '進行中の区間の開始時刻を持って・戻していない');
 });
+
+test('#42(5) 終了後の文字起こし待ちは打ち切れる（meeting:skipPending）', () => {
+  // 区間の書き換えは mainlib.skipPendingSegments（main.test.js で実行）。ここは結線だけ見る
+  const m = code(main);
+  const h = fnBody(m, "ipcMain.handle('meeting:skipPending'", '\n  });');
+  assert.ok(h.includes('if (!meeting || !meeting.stopping) return { ok: false'), '記録中（終了前）に打ち切れてしまう');
+  assert.ok(h.includes('m.gen++'), '進行中の結果を無効にしていない');
+  assert.ok(h.includes('skipPendingSegments(m.segments)'), '区間の書き換えを mainlib.skipPendingSegments で行っていない');
+  assert.ok(h.includes('unlinkQuiet('), 'wav を消していない');
+  assert.ok(h.includes('pendingSegs = 0;'), '待ち件数を 0 にしていない');
+  assert.ok(h.includes('m.skipped += '), '打ち切った数を数えていない');
+  assert.ok(h.includes('maybeFinalizeMeeting()'), '打ち切ったのに締めていない');
+  assert.ok(h.includes('return { ok: true, skipped:'), '{ ok, skipped } の形で返していない');
+  const on = fnBody(m, 'function onMeetingSegment(', '\nasync function maybeFinalizeMeeting');
+  assert.ok((on.match(/m\.gen !== gen/g) || []).length >= 3, '列の中で世代を見ていない（打ち切った区間の結果が後から混ざる）');
+  assert.ok(preload.includes("  meetingSkipPending: () => ipcRenderer.invoke('meeting:skipPending'),"), 'preload の meetingSkipPending が無い');
+});

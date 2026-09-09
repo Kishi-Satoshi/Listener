@@ -42,6 +42,7 @@ const {
   engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs, nextSegmentMs, EtaTracker,
+  skipPendingSegments,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -1634,6 +1635,23 @@ function setupIpc() {
   ipcMain.handle('meeting:discard', () => discardMeeting());
   ipcMain.handle('meeting:status', () => meetingStatus());
   ipcMain.handle('meeting:set-memo', (_e, memo) => { if (meeting) { meeting.memo = String(memo || ''); writeDraft(); } return true; });
+  // 終了後の文字起こし待ちを打ち切る（#42）。記録中（終了前）は打ち切れない。待ちの区間は
+  // 「（文字起こしを打ち切り）」の失敗扱いでページに残し、wav は消す（mainlib.skipPendingSegments）。
+  // 進行中・待ち行列の結果は世代（gen）で無効にし、待ち件数を 0 にして締める
+  ipcMain.handle('meeting:skipPending', () => {
+    if (!meeting || !meeting.stopping) return { ok: false, error: '記録を終了したあとにだけ打ち切れます' };
+    const m = meeting;
+    m.gen++;
+    const r = skipPendingSegments(m.segments);
+    for (const f of r.wavs) unlinkQuiet(f);
+    m.skipped += r.count;
+    m.inFlightSince = 0;
+    pendingSegs = 0;
+    writeDraft();
+    sendToMainWin('meeting:update', meetingStatus());
+    maybeFinalizeMeeting().catch((e) => engineLog(`finalize failed: ${e.message}`));
+    return { ok: true, skipped: r.count };
+  });
 
   ipcMain.handle('clipboard:copy', (_e, t) => { copyPrivate(String(t ?? '')); return true; });
   ipcMain.handle('app:test', async () => {

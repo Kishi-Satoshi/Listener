@@ -21,7 +21,7 @@ const {
   engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   truncationMessage, extractNotes, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
-  nextSegmentMs, EtaTracker,
+  nextSegmentMs, EtaTracker, skipPendingSegments,
 } = require('../src/mainlib');
 const { normalizeSettings } = require('../src/settings');
 
@@ -780,4 +780,21 @@ test('EtaTracker: 区間ごとの処理時間/音声長の EMA から、残り�
   eta.record(1000, 0);
   assert.strictEqual(eta.etaSec(75000), 39);
   assert.strictEqual(eta.etaSec(0), 0);
+});
+
+// ---------------------------------------------------------------- #42 打ち切り
+test('skipPendingSegments: 待ちの区間を全部「打ち切り」の失敗扱いにし、消すべき wav と件数を返す', () => {
+  // 終了後の待ちが長すぎるとき、利用者は「ここまでで作る」を選べる。打ち切った区間は
+  // 黙って消さず、失敗扱いの行として残す（何が欠けたかが分かる）
+  const segs = [
+    { id: 's1', atMs: 0, text: '発言' },
+    { id: 's2', atMs: 75000, text: '', pending: true, wav: '/b/2.wav', durationMs: 75000 },
+    { id: 's3', atMs: 150000, text: '', pending: true, wav: '', durationMs: 30000 },
+  ];
+  const r = skipPendingSegments(segs);
+  assert.deepStrictEqual(r, { count: 2, wavs: ['/b/2.wav'] });
+  assert.deepStrictEqual(segs[0], { id: 's1', atMs: 0, text: '発言' }, '済んだ区間を触っている');
+  assert.deepStrictEqual(segs[1], { id: 's2', atMs: 75000, text: '（文字起こしを打ち切り）', failed: true, durationMs: 75000 });
+  assert.deepStrictEqual(segs[2], { id: 's3', atMs: 150000, text: '（文字起こしを打ち切り）', failed: true, durationMs: 30000 });
+  assert.deepStrictEqual(skipPendingSegments([]), { count: 0, wavs: [] });
 });
