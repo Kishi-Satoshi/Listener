@@ -142,6 +142,9 @@
   .pitem .m > span { flex: none; }
   .pitem .snip { font-size: 11px; color: var(--faint); margin-top: 1px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* 文字起こし検索の件数（#43）。行ではないので .pitem の高さ・形には触れない */
+  .plist .count { flex: none; font-size: 11px; color: var(--muted); padding: 0 2px;
+    font-variant-numeric: tabular-nums; }
 
   /* ---------- ページ本体 ---------- */
   .page { flex: 1; min-width: 0; display: flex; flex-direction: column;
@@ -488,6 +491,11 @@
             <div class="desc ng lockNote" hidden>記録中はエンジンの設定を変更できません</div>
           </div>
           <div class="field">
+            <label for="engineIdleMin">使わないエンジンを止めるまで（分）</label>
+            <input type="text" id="engineIdleMin" />
+            <div class="desc">記録も要約もしていない時間がこれを超えたらエンジンを止めてメモリを空けます（次に使うとき起動し直します。0 で止めない）</div>
+          </div>
+          <div class="field">
             <label for="pillPos">録音バーの表示位置（表示中はドラッグでも移動できます）</label>
             <select id="pillPos">
               <option value="bottom">下・中央（既定）</option>
@@ -547,6 +555,15 @@
             <span>ウィンドウを閉じてもタスクトレイに残す<br />
               <span class="d">オフのときは、閉じるとアプリも終了します。
                 終了中はホットキーの音声入力も使えません。</span></span></label>
+          <div class="field">
+            <label for="dataDirNow">データ保存先 <span id="dataDirNote" hidden>（既定以外）</span></label>
+            <div class="row">
+              <input type="text" id="dataDirNow" readonly />
+              <button class="ghost" id="dataDirMoveBtn" type="button">保存先を変更…</button>
+            </div>
+            <div class="desc">議事録と設定の保存先。Roaming（既定）は社内のプロファイル同期で複製されることがあります。移動しても元の場所のデータは消しません</div>
+            <div class="desc ng" id="dataDirLock" hidden>記録中・要約中は保存先を変更できません</div>
+          </div>
         </div>
         <div class="card">
           <h2>ユーザー辞書（認識ヒント）</h2>
@@ -634,6 +651,11 @@
             <div class="desc">通常は変更不要です。意味は文字起こしエンジンの欄と同じです
               （こちらは要約に使われます）。2つのエンジンのポートは別の番号にしてください。</div>
           </div>
+          <div class="field">
+            <label for="sumCtx">要約の文脈長</label>
+            <input type="text" id="sumCtx" />
+            <div class="desc">要約エンジンに渡すトークン数（-c）。既定 32768。Qwen2.5-3B はここまで。大きいほどメモリを使い、小さいと長い会議の統合で足りなくなります</div>
+          </div>
           <div class="row" style="display:flex;gap:8px">
             <button class="ghost" id="testSumBtn" type="button">起動テスト</button>
             <span class="desc save-msg" id="testSumMsg" style="align-self:center"></span>
@@ -670,6 +692,7 @@
   let mtStoppedAt = null;
   let mtPausedMs = 0;
   let mtWasActive = false;
+  let mtBusy = false;       // 記録中・作成中（main がデータフォルダへ書いている最中）
   let dragBlockId = null;   // 並べ替え中のブロック
   let memoTimer = null;     // メモの遅延保存（500ms）。ページ切替・記録開始の前に flushMemo で確定する
   let memoFlush = null;     // 保留中のメモ保存を即時に走らせる関数
@@ -747,24 +770,41 @@
   }
 
   // ================= 議事録: 一覧 =================
+  // 文字起こし検索の件数（#43）。store は件数に上限を掛けて返すので、上限で打ち切られた
+  // ときは「全部でいくつあって、そのうちいくつ見せているか」を一覧の先頭に出す。
+  // 「すべて」の一覧では null（件数の行を出さない）。
+  let listCount = null;
   async function refreshList() {
     const q = $('searchBox').value.trim();
     if (filter === 'actions') { await renderActionView(q); return; }
-    if (filter === 'full' && q) pages = await window.koeApp.pagesSearchFull(q);
-    else pages = await window.koeApp.pagesSearch(q);
+    listCount = null;
+    if (filter === 'full' && q) {
+      const r = await window.koeApp.pagesSearchFull(q);
+      // 移行中は配列（古い形）で返ることもある
+      const res = Array.isArray(r) ? { hits: r, total: r.length, truncated: false } : (r || {});
+      pages = Array.isArray(res.hits) ? res.hits : [];
+      const total = Number(res.total);
+      listCount = { total: Number.isFinite(total) ? total : pages.length, shown: pages.length, truncated: Boolean(res.truncated) };
+    } else pages = await window.koeApp.pagesSearch(q);
     renderList();
   }
 
-  // 未完了アクションを全議事録から集めて、期限順に表示する
+  // 未完了アクションを全議事録から集めて、期限順に表示する。
+  // 検索語と担当の絞り込みは store 側（pagesActionView）で行い、行・担当チップ・絞る前の
+  // 件数（total）を 1 回の IPC で受け取る（#45。以前は openActions と assigneeList の 2 回で、
+  // 絞り込みは画面側だった。1 打鍵ごとに全ページを 2 度読んでいた）。
   async function renderActionView(q) {
     const box = $('plist'); box.textContent = '';
-    let acts = await window.koeApp.openActions();
-    const fq = fold(q);
-    if (fq) acts = acts.filter((x) => fold(x.text).includes(fq) || fold(x.pageTitle).includes(fq) || fold(x.assignee).includes(fq));
-    if (assigneeFilter) acts = acts.filter((x) => x.assignee === assigneeFilter);
+    let r = null;
+    // 古い preload と組んだときも例外で一覧を殺さない（空として描く）
+    if (typeof window.koeApp.pagesActionView === 'function') {
+      try { r = await window.koeApp.pagesActionView({ q, assignee: assigneeFilter }); } catch (_) { r = null; }
+    }
+    const acts = r && Array.isArray(r.actions) ? r.actions : [];
+    const people = r && Array.isArray(r.people) ? r.people : [];
+    const total = r && Number.isFinite(Number(r.total)) ? Number(r.total) : acts.length;
 
     // 担当者での絞り込みチップ
-    const people = await window.koeApp.assigneeList();
     if (people.length) {
       const row = document.createElement('div');
       row.className = 'filters'; row.style.flexWrap = 'wrap'; row.style.marginBottom = '4px';
@@ -782,7 +822,10 @@
 
     if (!acts.length) {
       const d = document.createElement('div'); d.className = 'empty';
-      d.innerHTML = '<div class="big">未完了のアクションはありません</div>議事録の要約から自動で集められます。';
+      // 絞り込みで空なのか、本当に無いのかを分ける。total は絞る前の件数
+      d.innerHTML = total > 0
+        ? `<div class="big">条件に合うアクションはありません</div>未完了は全部で ${total} 件あります。検索語や担当の絞り込みを外してください。`
+        : '<div class="big">未完了のアクションはありません</div>議事録の要約から自動で集められます。';
       box.appendChild(d); return;
     }
 
@@ -835,6 +878,13 @@
 
   function renderList() {
     const box = $('plist'); box.textContent = '';
+    if (listCount) {
+      const c = document.createElement('div'); c.className = 'count';
+      c.textContent = listCount.truncated
+        ? `${listCount.total}件中 ${listCount.shown}件を表示（先頭から）`
+        : `${listCount.total}件`;
+      box.appendChild(c);
+    }
     if (pages.length === 0) {
       const d = document.createElement('div');
       d.className = 'empty';
@@ -979,11 +1029,12 @@
       const pid = curId;
       if (summarizing.has(pid)) return;
       summarizing.add(pid);
+      refreshDataDirLock();   // 要約中は保存先を動かせない（main が書いている最中）
       sumBtn.disabled = true; sumBtn.textContent = '生成中…';
       let r;
       try { r = await window.koeApp.pageSummarize(pid); }
       catch (e) { r = { ok: false, error: e && e.message ? e.message : String(e) }; }
-      finally { summarizing.delete(pid); }
+      finally { summarizing.delete(pid); refreshDataDirLock(); }
       if (!r || !r.ok) { toast((r && r.error) || '生成に失敗しました'); if (/未設定/.test((r && r.error) || '')) showTab('settings'); }
       else toast(`議事録を作成しました（出典 ${r.stat.linked}/${r.stat.total}）`);
       if (pid === curId) await openPage(pid);
@@ -1415,7 +1466,8 @@
   // 止める欄は main が記録中に前の値を保つキーと同じ。「参照…」も一緒に止める
   //（押せてもパスを書けない）。
   const ENGINE_KEYS = ['language', 'localThreads', 'sumThreads', 'useVad', 'suppressNst', 'localServerExe',
-    'localModelPath', 'vadModelPath', 'sumServerExe', 'sumModelPath', 'localPort', 'sumPort', 'segmentSec'];
+    'localModelPath', 'vadModelPath', 'sumServerExe', 'sumModelPath', 'localPort', 'sumPort', 'segmentSec',
+    'sumCtx'];   // 要約の文脈長（-c）も起動時の引数。engineIdleMin は止める間合いなので止めない
   const ENGINE_PICKERS = ['pickExeBtn', 'pickModelBtn', 'pickVadBtn', 'pickSumExeBtn', 'pickSumModelBtn'];
   function lockEngineFields(locked) {
     for (const id of [...ENGINE_KEYS, ...ENGINE_PICKERS]) $(id).disabled = locked;
@@ -1445,6 +1497,9 @@
     }
     mtWasActive = Boolean(st.active);
     lockEngineFields(Boolean(st.active));
+    // 記録中と作成中（終了後の文字起こし・要約）はデータ保存先を動かせない
+    mtBusy = Boolean(st.active || st.finalizing);
+    refreshDataDirLock();
     $('mtToggleBtn').textContent = st.finalizing ? '作成中…' : st.active ? '■ 終了して作成' : '● 記録開始';
     $('mtToggleBtn').disabled = Boolean(st.finalizing);
     $('mtDiscardBtn').style.display = st.active && !st.finalizing ? '' : 'none';
@@ -1697,6 +1752,8 @@
     $('sumModelPath').value = s.sumModelPath || '';
     $('sumThreads').value = s.sumThreads || 4;
     $('sumPort').value = s.sumPort || 8991;
+    $('sumCtx').value = intOr(s.sumCtx, 32768);
+    $('engineIdleMin').value = intOr(s.engineIdleMin, 10);   // 0 は「止めない」。|| で既定に化けさせない
     $('hotkey').value = s.hotkey || '';
     $('meetingHotkey').value = s.meetingHotkey || '';
     $('segmentSec').value = s.segmentSec || 75;
@@ -1725,6 +1782,51 @@
   $('pickSumExeBtn').onclick = pick('exe', 'sumServerExe');
   $('pickSumModelBtn').onclick = pick('model', 'sumModelPath');
   $('openDataBtn').onclick = () => window.koeApp.openDataDir();
+
+  // 整数の欄。数でなければ既定へ。0 も値として通す（`|| 既定` だと 0 が既定に化ける）
+  function intOr(v, d) { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; }
+
+  // ---------------- データ保存先 ----------------
+  // 議事録と設定の置き場所。Roaming（既定）は社内のプロファイル同期で複製されることが
+  // あるので、別のフォルダへ移せるようにする。移すのは main（dataDirMove）。画面は
+  // 現在地の表示と、フォルダ選択 → 確認 → 移動 → 結果の通知だけを受け持つ。
+  async function refreshDataDir() {
+    if (typeof window.koeApp.dataDirGet !== 'function') return;   // 古い preload と組んだときも設定画面は生かす
+    let r;
+    try { r = await window.koeApp.dataDirGet(); } catch (_) { return; }
+    if (!r || typeof r.dir !== 'string') return;
+    $('dataDirNow').value = r.dir;
+    $('dataDirNote').hidden = r.isDefault !== false;
+  }
+  // 記録中・要約中は main がデータフォルダへ書いている最中なので動かせない
+  function lockDataDir(busy) {
+    $('dataDirMoveBtn').disabled = busy;
+    $('dataDirLock').hidden = !busy;
+  }
+  function refreshDataDirLock() {
+    lockDataDir(mtBusy || summarizing.size > 0);
+  }
+  $('dataDirMoveBtn').onclick = async () => {
+    if (mtBusy || summarizing.size > 0) return;
+    if (typeof window.koeApp.dataDirMove !== 'function') return;   // 古い preload
+    const dir = await window.koeApp.pickFile('folder');
+    if (!dir) return;
+    if (!confirm(`データの保存先を次の場所へ移します。\n${dir}\n\n議事録と設定をここへ写し、以後はここに保存します。元の場所のデータは消しません。\n\n続行しますか？`)) return;
+    const b = $('dataDirMoveBtn'); b.disabled = true;
+    let r;
+    try { r = await window.koeApp.dataDirMove(dir); }
+    catch (e) { r = { ok: false, error: (e && e.message) ? e.message : String(e) }; }
+    refreshDataDirLock();   // 押せる状態を必ず戻す（例外で抜けても押せないまま残さない）
+    if (r && r.ok) {
+      const moved = typeof r.dir === 'string' && r.dir ? r.dir : dir;
+      if (settings) settings.dataDir = moved;
+      $('dataDirNow').value = moved;
+      await refreshDataDir();   // 「（既定以外）」の印は main の判断に合わせる
+      toast(`データの保存先を移しました: ${moved}`);
+      return;
+    }
+    toast((r && r.error) || 'データの保存先を移せませんでした');
+  };
 
   // 画面の組み立てで1か所つまずいても、設定の読み込みまで巻き添えにしない。
   // 以前、存在しない要素への代入で初期化が止まり、設定が未読込のまま
@@ -1849,6 +1951,8 @@
       sumModelPath: $('sumModelPath').value.trim(),
       sumThreads: parseInt($('sumThreads').value, 10) || 4,
       sumPort: parseInt($('sumPort').value, 10) || 8991,
+      sumCtx: intOr($('sumCtx').value, 32768),
+      engineIdleMin: intOr($('engineIdleMin').value, 10),
       hotkey: $('hotkey').value.trim() || 'Control+Shift+Space',
       meetingHotkey: $('meetingHotkey').value.trim() || 'Alt+M',
       segmentSec: parseInt($('segmentSec').value, 10) || 75,
@@ -2025,6 +2129,7 @@
     fill(settings);
     settingsLoaded = true;   // ここを通るまで save() は書き込まない
     refreshVad();
+    refreshDataDir();
     refreshHotkeyState();
     refreshPromptInfo();
     mtypes = await window.koeApp.meetingTypes();
