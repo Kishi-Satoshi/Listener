@@ -43,6 +43,7 @@ const {
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs, nextSegmentMs, EtaTracker,
   skipPendingSegments, restoreAfterPaste,
+  planDataMove, sameTree,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -89,6 +90,13 @@ const DEFAULT_SETTINGS = {
   useSystemAudio: false,
   maxHistory: 500,
   segmentSec: 75,
+  // 要約エンジン（llama-server）の文脈長（-c）。統合プロンプトがこれに収まらないときは
+  // 要点メモを 2 段で畳む（#41。generateMinutes）
+  sumCtx: 32768,
+  // 使われないエンジンを止めるまでの分。0 = 止めない（#58。releaseIdleEngines）
+  engineIdleMin: 10,
+  // データ保存先。'' = 既定の場所 <userData>/data（#29。store.init の第2引数）
+  dataDir: '',
 };
 
 // ---------------------------------------------------------------- 状態
@@ -194,7 +202,60 @@ function loadStores() {
   }
   history = loadJson(historyPath(), []);
   if (!Array.isArray(history)) history = [];
-  store.init(app.getPath('userData'));
+  // 第2引数が空でなければそこをデータフォルダにする（#29）。設定した場所が無くなっていても
+  // （外付けディスクを抜いた等）store 側が作り直すので、起動は止まらない
+  store.init(app.getPath('userData'), settings.dataDir || '');
+}
+// いまのデータフォルダの絶対パス。store.root が無い版でも動くよう守り、無ければ既定の場所
+const dataRoot = () => (typeof store.root === 'function' ? store.root() : path.join(app.getPath('userData'), 'data'));
+
+// ---------------------------------------------------------------- データ保存先の移動（#29）
+// 写す → 確かめる → 設定を切り替える → store を開き直す。元のフォルダは消さない（消すのは
+// 利用者。移せていなかったときに戻れる）。受けるかの判断は mainlib.planDataMove、写した結果の
+// 検証は mainlib.sameTree（ファイル数と合計バイト数の一致）。
+// 退避フォルダ segbuf（<userData>/data/segbuf）は一時物なので写さない（segbufRoot はデータ
+// フォルダを移しても変わらない）。
+const SEGBUF_DIR = 'segbuf';
+// dir 以下のファイル数と合計バイト数。skip（絶対パス）以下は数えない
+function treeSummary(dir, skip) {
+  let files = 0;
+  let bytes = 0;
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (p === skip) continue;
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile()) { files++; bytes += fs.statSync(p).size; }
+    }
+  };
+  walk(dir);
+  return { files, bytes };
+}
+async function moveDataDir(dir) {
+  if (isBusy()) return { ok: false, error: '記録中・要約中は移動できません' };
+  const from = dataRoot();
+  const raw = String(dir || '').trim();
+  const listDir = (p) => { try { return fs.readdirSync(p); } catch (_) { return []; } };
+  const why = planDataMove(from, raw, (p) => fs.existsSync(p), listDir);
+  if (why) return { ok: false, error: why };
+  const to = path.normalize(raw);
+  try {
+    fs.mkdirSync(to, { recursive: true });
+    const skipFrom = path.join(from, SEGBUF_DIR);
+    fs.cpSync(from, to, { recursive: true, filter: (src) => src !== skipFrom });
+    if (!sameTree(treeSummary(from, skipFrom), treeSummary(to, path.join(to, SEGBUF_DIR)))) {
+      return { ok: false, error: '写した内容が元と一致しないため、保存先を切り替えませんでした。元の場所のデータはそのままです' };
+    }
+  } catch (e) {
+    return { ok: false, error: `移動に失敗しました: ${e.message}。元の場所のデータはそのままです` };
+  }
+  settings.dataDir = to;
+  persistSettings();
+  store.init(app.getPath('userData'), settings.dataDir);
+  engineLog(`データ保存先を移動: ${from} → ${to}`);
+  sendToMainWin('pages:updated', store.listPages());
+  sendToMainWin('app:notice', `データの保存先を ${to} に変えました。元の場所のデータは残しています（不要なら手で削除してください）`);
+  return { ok: true, dir: to };
 }
 
 // ---------------------------------------------------------------- テキスト整形
@@ -1361,6 +1422,9 @@ const runSummary = makeSummaryRunner(doRunSummary, () => updateTray());
 // 要約が走っている間はアプリを「忙しい」として扱う（#52）: 省電力を止めない・終了前に
 // 確かめる・更新と再起動を拒む。件数は mainlib.makeSummaryRunner が持つ。
 const isSummarizing = () => runSummary.running().length > 0;
+// 「手が塞がっている」: 記録・文字起こし・要約・復旧の文字起こしのどれかが動いている。
+// データ保存先の移動（#29）と、使われないエンジンの停止（#58）はこれが false のときだけ
+const isBusy = () => state !== 'idle' || isSummarizing() || recoveryRunning || pendingSegs > 0;
 
 // 要約の生成 → ブロック化 → 出典付与 → 保存
 async function doRunSummary(pageId) {
@@ -1703,6 +1767,11 @@ function setupIpc() {
   ipcMain.handle('pages:searchFull', (_e, q) => store.searchFullText(q || '', 60));
   ipcMain.handle('pages:openActions', () => store.openActions());
   ipcMain.handle('pages:assignees', () => store.assigneeList());
+  // アクション一覧（絞り込み込み）。store.actionView の戻り値 { actions, people, total } をそのまま返す
+  ipcMain.handle('pages:actionView', (_e, { q, assignee } = {}) => store.actionView({ q, assignee }));
+  // データ保存先（#29）。isDefault は「既定の場所 <userData>/data のまま」
+  ipcMain.handle('data:dir', () => ({ dir: dataRoot(), isDefault: !settings.dataDir }));
+  ipcMain.handle('data:move', (_e, dir) => moveDataDir(dir));
   ipcMain.handle('page:get', (_e, id) => {
     const page = store.getPage(id);
     if (!page) return null;
@@ -1814,7 +1883,8 @@ function setupIpc() {
     const p = resolveVadModel();
     return { path: p, auto: Boolean(p) && p !== settings.vadModelPath };
   });
-  ipcMain.handle('app:open-data-dir', () => { shell.openPath(app.getPath('userData')); return true; });
+  // 開くのはいまのデータフォルダ（移動後はそこ。#29）
+  ipcMain.handle('app:open-data-dir', () => { shell.openPath(dataRoot()); return true; });
   // Windows のサウンド設定を開く。録音されるスピーカーは「既定の再生デバイス」
   // で決まり、アプリ側から選ぶ手段は無いので、変える場所へ案内する。
   ipcMain.handle('app:open-sound-settings', () => {
@@ -1850,6 +1920,11 @@ function setupIpc() {
     return true;
   });
   ipcMain.handle('dialog:pick', async (_e, kind) => {
+    // フォルダ（データ保存先の移動先。#29）。戻り値はパスか ''
+    if (kind === 'folder') {
+      const res = await dialog.showOpenDialog(mainWin, { properties: ['openDirectory'] });
+      return res.canceled ? '' : (res.filePaths[0] || '');
+    }
     const filters = kind === 'exe'
       ? [{ name: '実行ファイル', extensions: process.platform === 'win32' ? ['exe'] : ['*'] }]
       : [{ name: 'モデルファイル', extensions: ['bin', 'gguf'] }];

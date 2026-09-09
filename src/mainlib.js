@@ -533,6 +533,43 @@ function skipPendingSegments(segments) {
   return { count, wavs };
 }
 
+// ---------------------------------------------------------------- データ保存先の移動（#29）
+// 移動は「写す → 確かめる → 設定を切り替える」で、元のフォルダは消さない（消すのは利用者）。
+// ここは移動先を受けるかの判断。拒む理由の一文を返し、通すなら ''。
+//   from: いまのデータフォルダ、to: 移動先、exists(p): fs.existsSync 相当、
+//   listDir(p): fs.readdirSync 相当（無ければ []）。
+// Windows 向けなので、比較は区切り文字（\ と /）と大文字小文字の違いを無視する。
+// 拒むもの:
+//   - 空・相対パス（ダイアログは絶対パスを返す。相対だと作業フォルダ次第で別の場所になる）
+//   - 今と同じ場所
+//   - 今のデータフォルダの中（写す先が写す元に含まれ、終わらない）
+//   - 今のデータフォルダを含む親（写す元が写す先に含まれ、同じく終わらない）
+//   - 既に Listener のデータがある場所（別のデータを上書きする）・空でないフォルダ
+//     （利用者の書類の中に pages/ などが混ざる。空のフォルダを選んでもらう）
+const normPath = (p) => String(p ?? '').trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+const isAbsPath = (n) => /^([a-z]:(\/|$)|\/)/.test(n);   // C:/…（末尾の / を落とした C: も）か /（UNC の //server/share も）
+function planDataMove(from, to, exists, listDir) {
+  const t = normPath(to);
+  if (!t) return '移動先が指定されていません';
+  if (!isAbsPath(t)) return '移動先は絶対パスで指定してください';
+  const f = normPath(from);
+  if (t === f) return '今と同じ場所です';
+  if (t.startsWith(`${f}/`)) return '今のデータフォルダの中には移せません';
+  if (f.startsWith(`${t}/`)) return '今のデータフォルダを含むフォルダ（親フォルダ）には移せません';
+  const raw = String(to ?? '').trim();
+  const sub = (name) => `${raw.replace(/[\\/]+$/, '')}${raw.includes('\\') ? '\\' : '/'}${name}`;
+  if (exists(sub('pages')) || exists(sub('index.json'))) return '移動先に既に Listener のデータがあります。別の空のフォルダを選んでください';
+  if (exists(raw) && (listDir(raw) || []).length > 0) return '移動先は空のフォルダにしてください';
+  return '';
+}
+// 写した結果の検証。a / b は { files: ファイル数, bytes: 合計バイト数 }。両方一致で同じ木とみなす。
+// 数えられなかった（NaN）ときは一致としない（確かめていないのに切り替えない）
+function sameTree(a, b) {
+  if (!a || !b) return false;
+  const n = (v) => Number.isFinite(v);
+  return n(a.files) && n(b.files) && n(a.bytes) && n(b.bytes) && a.files === b.files && a.bytes === b.bytes;
+}
+
 const SEGBUF_MAX_AGE_MS = 7 * 86400000;
 function staleSegbufDirs(entries, nowMs, maxAgeMs = SEGBUF_MAX_AGE_MS) {
   const out = [];
@@ -555,4 +592,5 @@ module.exports = {
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
   nextSegmentMs, EtaTracker, skipPendingSegments,
+  planDataMove, sameTree,
 };
