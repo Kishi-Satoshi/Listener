@@ -343,19 +343,20 @@ test('searchFullText: 文字起こしも畳み込みで当て、抜粋は区間�
     { id: 's2', atMs: 1000, text: 'ＡＩ推進室の件は次回に回します。' },
     { id: 's3', atMs: 2000, text: 'ﾃﾞｰﾀ移行の手順を確認します。' },
   ] });
-  let hits = store.searchFullText('予算案の作成');
+  // 戻り値は { hits, total, truncated }（#43）。当たりの形は hits の要素
+  let { hits } = store.searchFullText('予算案の作成');
   assert.strictEqual(hits.length, 1);
   assert.strictEqual(hits[0].id, p.id);
   assert.strictEqual(hits[0].segmentHits, 1);
   assert.strictEqual(hits[0].snippet, 'では、予算案の、作成を進めます。');
-  hits = store.searchFullText('ai推進室');
+  ({ hits } = store.searchFullText('ai推進室'));
   assert.strictEqual(hits.length, 1);
   assert.strictEqual(hits[0].snippet, 'ＡＩ推進室の件は次回に回します。');
   // 半角カナの濁点は結合して比べる（「ﾃﾞｰﾀ」＝「データ」）
-  assert.strictEqual(store.searchFullText('データ移行').length, 1);
-  assert.strictEqual(store.searchFullText('ﾃﾞｰﾀ移行').length, 1);
-  assert.deepStrictEqual(store.searchFullText('クラウド移行'), []);
-  assert.deepStrictEqual(store.searchFullText('、'), []);
+  assert.strictEqual(store.searchFullText('データ移行').hits.length, 1);
+  assert.strictEqual(store.searchFullText('ﾃﾞｰﾀ移行').hits.length, 1);
+  assert.deepStrictEqual(store.searchFullText('クラウド移行'), { hits: [], total: 0, truncated: false });
+  assert.deepStrictEqual(store.searchFullText('、'), { hits: [], total: 0, truncated: false });
 });
 
 test('searchIndex: 半角カナ（結合記号あり）の本文でも抜粋の位置が元の本文に対応する', () => {

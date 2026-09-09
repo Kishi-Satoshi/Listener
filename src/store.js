@@ -406,22 +406,33 @@ function searchIndex(query) {
 // 要約は編集や言い換えを経ているので、「言ったかどうか」を探す用途では
 // 原文の方が信頼できる。要約やタイトルは通常の検索（searchIndex）が受け持つ。
 // 抜粋は当たった区間の原文そのもの（畳んだ文字列は見せない）。
+//
+// 戻り値は { hits, total, truncated }（#43）。以前は limit 件たまった時点で走査を
+// 止め、打ち切ったことが戻り値にも画面にも出なかった（「全件見た」と誤解させる）。
+// 全ページを走査して当たったページ数を total に数え、hits は先頭 limit 件（索引の
+// 並び＝新しい順）、truncated は「見せていない当たりがある」印。
+const FULL_TEXT_LIMIT = 60;
 function searchFullText(query, limit) {
   const q = searchFold(query);
-  if (!q) return [];
+  if (!q) return { hits: [], total: 0, truncated: false };
+  const max = Number(limit) > 0 ? Math.trunc(Number(limit)) : FULL_TEXT_LIMIT;
+  const hit = (s) => s.text && searchFold(s.text).includes(q);
   const hits = [];
+  let total = 0;
   for (const entry of index.pages) {
-    if (hits.length >= (limit || 50)) break;
     const segments = getTranscript(entry.id);
-    const inSegments = segments.filter((s) => s.text && searchFold(s.text).includes(q));
+    // hits が埋まったあとは数えるだけ（当たりが1つあれば足りる）
+    if (hits.length >= max) { if (segments.some(hit)) total++; continue; }
+    const inSegments = segments.filter(hit);
     if (inSegments.length === 0) continue;
+    total++;
     hits.push({
       ...entry,
       segmentHits: inSegments.length,
       snippet: inSegments[0].text,
     });
   }
-  return hits;
+  return { hits, total, truncated: total > hits.length };
 }
 
 // 全ページ横断の未完了アクションアイテム

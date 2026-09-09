@@ -102,3 +102,52 @@ test('#44 init: 古い世代の索引（memoText が無い行）は page.json �
   store.init(d);
   assert.strictEqual(fs.readFileSync(ifile(d), 'utf8'), raw);
 });
+
+// ---------------------------------------------------------------- #43 全文検索の打ち切り
+// ヒットが limit 件たまった時点で走査を止め、打ち切ったことが戻り値にも画面にも
+// 出なかった（「全件見た」と誤解させる）。全ページを走査して total と truncated を返す。
+const seg = (id, text) => ({ id, atMs: 0, text });
+// createdAt を i の降順にして、索引の並び（新しい順）を決め打ちにする
+const mkFull = (n, text) => {
+  const ids = [];
+  for (let i = 0; i < n; i++) {
+    ids.push(store.createPage({ title: `p${i}`, createdAt: `2026-01-01T00:00:${String(i).padStart(2, '0')}.000Z`, segments: [seg('s1', text), seg('s2', text)] }).id);
+  }
+  return ids.reverse();   // 索引の並び（新しい順）
+};
+
+test('#43 searchFullText: limit を超える件数では hits を limit 件に切り、total と truncated で伝える', () => {
+  fresh();
+  const ids = mkFull(5, 'では、予算案の、作成を進めます。');
+  store.createPage({ title: 'x', segments: [seg('s1', '無関係な発言')] });
+  const r = store.searchFullText('予算案の作成', 3);
+  assert.strictEqual(r.total, 5, '当たったページ数が total でない');
+  assert.strictEqual(r.hits.length, 3, 'hits が limit 件でない');
+  assert.strictEqual(r.truncated, true);
+  assert.deepStrictEqual(r.hits.map((h) => h.id), ids.slice(0, 3), '先頭（新しい順）の limit 件でない');
+  // hit の形は今までと同じ（索引の行 + segmentHits + snippet）
+  assert.strictEqual(r.hits[0].segmentHits, 2);
+  assert.strictEqual(r.hits[0].snippet, 'では、予算案の、作成を進めます。');
+  assert.strictEqual(r.hits[0].title, 'p4');
+});
+
+test('#43 searchFullText: limit 未満なら truncated=false、query が空なら空の結果', () => {
+  fresh();
+  mkFull(5, '予算案の作成');
+  let r = store.searchFullText('予算案の作成', 10);
+  assert.deepStrictEqual({ n: r.hits.length, total: r.total, truncated: r.truncated }, { n: 5, total: 5, truncated: false });
+  r = store.searchFullText('予算案の作成', 5);
+  assert.deepStrictEqual({ n: r.hits.length, total: r.total, truncated: r.truncated }, { n: 5, total: 5, truncated: false }, 'ちょうど limit 件は打ち切りでない');
+  assert.deepStrictEqual(store.searchFullText('クラウド移行', 10), { hits: [], total: 0, truncated: false });
+  assert.deepStrictEqual(store.searchFullText('', 10), { hits: [], total: 0, truncated: false });
+  assert.deepStrictEqual(store.searchFullText('、。', 10), { hits: [], total: 0, truncated: false }, '記号だけの検索は空の検索と同じ');
+});
+
+test('#43 searchFullText: limit の既定は 60（61 件目から打ち切り）', () => {
+  fresh();
+  mkFull(62, '予算案の作成');
+  const r = store.searchFullText('予算案の作成');
+  assert.strictEqual(r.hits.length, 60);
+  assert.strictEqual(r.total, 62);
+  assert.strictEqual(r.truncated, true);
+});
