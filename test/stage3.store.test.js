@@ -265,3 +265,47 @@ test('#45 actionView: 未完了が無ければ空（ページは1つも読まな
   assert.deepStrictEqual(result, { actions: [], people: [], total: 0 });
   assert.deepStrictEqual(read, []);
 });
+
+// ---------------------------------------------------------------- #29 データ保存先
+// main がデータ保存先の設定で init(userDataPath, dataRoot) を呼び、root() で今の場所を出す。
+test('#29 root(): 第2引数を渡さない init は今まで通り userData/data を使う', () => {
+  const d = fresh();
+  assert.strictEqual(typeof store.root, 'function');
+  assert.strictEqual(store.root(), path.join(d, 'data'));
+  assert.strictEqual(store.init(d), store.root(), 'init の戻り値と root() が違う');
+  for (const empty of ['', undefined, null]) {
+    store.init(d, empty);
+    assert.strictEqual(store.root(), path.join(d, 'data'), `dataRoot=${String(empty)} で既定の場所にならない`);
+  }
+});
+
+test('#29 init(userDataPath, dataRoot): dataRoot が空でない文字列ならそれを保存先に使う', () => {
+  const d = fresh();
+  const custom = path.join(d, 'elsewhere', 'mydata');
+  assert.strictEqual(store.init(d, custom), custom);
+  assert.strictEqual(store.root(), custom);
+  assert.ok(fs.existsSync(path.join(custom, 'pages')), 'pages/ が保存先に作られていない');
+  assert.ok(fs.existsSync(path.join(custom, 'transcripts')), 'transcripts/ が保存先に作られていない');
+  const p = store.createPage({ title: '別の場所', segments: [seg('s1', '発言')] });
+  assert.ok(fs.existsSync(path.join(custom, 'pages', `${p.id}.json`)), 'page.json が保存先に無い');
+  assert.ok(fs.existsSync(path.join(custom, 'transcripts', `${p.id}.json`)), 'transcript が保存先に無い');
+  assert.ok(fs.existsSync(path.join(custom, 'index.json')), 'index.json が保存先に無い');
+  assert.ok(!fs.existsSync(path.join(d, 'data', 'pages', `${p.id}.json`)), '既定の場所にも書いている');
+  // 既定の場所に戻すと見えず、保存先に戻すとまた見える（データは場所ごと）
+  store.init(d);
+  assert.strictEqual(store.root(), path.join(d, 'data'));
+  assert.ok(!store.listPages().some((x) => x.id === p.id));
+  store.init(d, custom);
+  assert.deepStrictEqual(store.listPages().map((x) => x.id), [p.id]);
+  assert.strictEqual(store.getPage(p.id).title, '別の場所');
+});
+
+test('#29 root() は絶対パスを返す（末尾の区切りや相対指定は正規化する）', () => {
+  const d = fresh();
+  const custom = path.join(d, 'mydata');
+  store.init(d, custom + path.sep);
+  assert.strictEqual(store.root(), custom);
+  store.init(d, path.relative(process.cwd(), custom));
+  assert.strictEqual(store.root(), custom);
+  assert.ok(path.isAbsolute(store.root()));
+});
