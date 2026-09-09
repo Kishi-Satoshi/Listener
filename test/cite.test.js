@@ -582,3 +582,19 @@ test('attachCitations / refreshCitations: 節ごとの照合でも冪等で、�
   assert.strictEqual(JSON.stringify(a.map((b) => b.cites)), snap);
   assert.deepStrictEqual(r2, r);
 });
+
+test('matchLine: 固有のバイグラムが 3 つに満たない節（同じ文字の繰り返し）は単独で照合しない', () => {
+  // 文字数は足りていて述語の形（〜る）でも、バイグラムが「るる」1 種類しか無い節は
+  // その文字の連なりを含む発言に満点で当たる。節にはせず、要点1行の照合に任せる。
+  const segs = [
+    { id: 'r1', atMs: 0, text: 'るるるるるるる。' },
+    { id: 'r2', atMs: 1000, text: '在庫連携のバッチ処理は今週中に見直します。' },
+  ];
+  const idx = buildIndex(segs);
+  const text = 'るるるるるる、在庫連携のバッチ処理を今週中に見直す';
+  assert.strictEqual(splitClauses(text).length, 2, `前提が崩れた（節に割れていない）: ${JSON.stringify(splitClauses(text))}`);
+  assert.ok(matchOne('るるるるるる', idx).some((h) => h.id === 'r1'), '前提が崩れた（単独で照合すれば当たる文でない）');
+  const ids = matchLine(text, idx).map((h) => h.id);
+  assert.ok(!ids.includes('r1'), `繰り返しの節が発言を指した: ${ids}`);
+  assert.deepStrictEqual(ids, ['r2']);
+});
