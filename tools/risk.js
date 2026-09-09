@@ -276,6 +276,32 @@ function analyze(base, head) {
   return { findings: F.slice(), needs, changed };
 }
 
+// ---------- このゲートの射程 ----------
+// 「危険な変更は見つからなかった」は、ここに挙げた範囲の話でしかない。出典照合や保存の
+// ロジック（src/cite.js など）はこのゲートの射程外で、そこを触ったコミットにも同じ文が
+// 出て全否定に読めた（監査 #38）。射程外は npm test が守る（pre-commit もそれを走らせる）。
+const SCOPE = {
+  sees: [
+    'HTML の木の健全さ（閉じ忘れ・相手のいない閉じタグ）',
+    '要素の消失・枠からの離脱・参照の破れ',
+    '透過ウィンドウの地雷（台帳 tools/lib/mines.js）',
+    '地とインクの向き',
+    '.ps1 の BOM と書き出し口',
+    '復旧の導線が main 側にあること',
+  ],
+  blind: ['src/cite.js', 'src/store.js', 'src/minutes.js', 'src/actions.js'],
+};
+/** 射程の但し書き。changed（変更ファイルの集合）に射程外のファイルがあれば名指しする */
+function scopeNote(changed) {
+  const lines = [
+    `  このゲートが見る範囲: ${SCOPE.sees.join(' / ')}`,
+    `  見ていないもの: ${SCOPE.blind.join(' / ')} のロジック — これらは npm test が守る`,
+  ];
+  const hit = SCOPE.blind.filter((f) => changed && changed.has(f));
+  if (hit.length) lines.push(`  ※ この変更には ${hit.join(' / ')} が含まれる。ここはこのゲートの射程外 — npm test を通すこと`);
+  return lines.join('\n');
+}
+
 function main(argv) {
   const arg = (k, d) => { const i = argv.indexOf(k); return i < 0 ? d : argv[i + 1]; };
   let base = arg('--base', 'HEAD');
@@ -301,7 +327,8 @@ function main(argv) {
   const show = (title, xs) => { if (!xs.length) return; console.log(`── ${title} ──\n`); for (const f of xs) console.log(`[${f.level}] ${f.rule}  ${f.file}\n   ${f.msg}\n   → ${f.how}\n`); };
   show('この変更で新たに危険になったもの', [...blocks, ...warns].filter((f) => !STANDING.has(f.rule)));
   show('常時の不変条件（この変更とは無関係に破れている）', [...blocks, ...warns].filter((f) => STANDING.has(f.rule)));
-  if (!findings.length) console.log('危険な変更は見つからなかった。\n');
+  if (!findings.length) console.log('危険な変更は見つからなかった（このゲートが見る範囲では）。\n' + scopeNote(changed) + '\n');
+  else if (SCOPE.blind.some((f) => changed.has(f))) console.log(scopeNote(changed).split('\n').pop() + '\n');
   const a0 = { errTotal: findings.filter((f) => f.rule === 'HTML-木の破損').length };
   const md = ['# リリース前チェックリスト（自動生成）', '', `基準 ${base} → ${target}`, ''];
   if (needs.length) { md.push('## 実機（Windows）で見ること', ''); needs.forEach((n, i) => md.push(`- [ ] ${i + 1}. ${n}`)); }
@@ -313,7 +340,8 @@ function main(argv) {
     line('透過ウィンドウの地雷（台帳 tools/lib/mines.js）', blocks.filter((b) => b.rule.includes('地雷')).length),
     line('地とインクの向き', blocks.filter((b) => b.rule.includes('インク')).length),
     line('.ps1 の BOM と書き出し口', blocks.filter((b) => b.rule.includes('ps1')).length),
-    line('復旧の導線が main 側にあること', blocks.filter((b) => b.rule.includes('復旧')).length));
+    line('復旧の導線が main 側にあること', blocks.filter((b) => b.rule.includes('復旧')).length),
+    '', `このゲートが見ていないもの: ${SCOPE.blind.join(' / ')} のロジック — npm test が守る（リリース前に必ず通す）`);
   const out = arg('--checklist');
   if (out) { fs.writeFileSync(out, md.join('\n') + '\n'); console.log('チェックリストを書き出した: ' + out); }
   else if (needs.length) console.log('― 実機で見ること ―\n' + needs.map((n, i) => `  ${i + 1}. ${n}`).join('\n') + '\n');
@@ -321,4 +349,4 @@ function main(argv) {
   return blocks.length ? 1 : 0;
 }
 if (require.main === module) process.exit(main(process.argv.slice(2)));
-module.exports = { analyze, checkHtml, windows, mineHits, inkFindings, refIds };
+module.exports = { analyze, checkHtml, windows, mineHits, inkFindings, refIds, SCOPE, scopeNote };

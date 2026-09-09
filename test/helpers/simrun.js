@@ -54,6 +54,24 @@ function preloadApis(src) {
   return out;
 }
 
+/* ---- 偽の音（#36）。decode / render が返す AudioBuffer 風は実機と同じ形にする ---- */
+/** MediaRecorder の 1 chunk が表すバイト数／秒。chunk 1 つ = 1 秒ぶんの音 */
+const BYTES_PER_SEC = 4000;
+const RECORDED_CHUNK = Uint8Array.from({ length: BYTES_PER_SEC }, (_, i) => (i * 7 + 3) & 0xff);
+/** Float32Array を AudioBuffer 風に包む（getChannelData(0) がその配列） */
+function audioBufferOf(data, sampleRate) {
+  return {
+    duration: data.length / sampleRate, sampleRate, length: data.length, numberOfChannels: 1,
+    getChannelData(ch) { if (ch !== 0) throw new RangeError(`channel ${ch} は無い（mono）`); return data; },
+  };
+}
+/** 決定的で非無音の AudioBuffer 風: 440Hz・振幅 0.5 の正弦波 */
+function sineBuffer(frames, sampleRate = 48000) {
+  const data = new Float32Array(Math.max(1, frames));
+  for (let i = 0; i < data.length; i++) data[i] = 0.5 * Math.sin((2 * Math.PI * 440 * i) / sampleRate);
+  return audioBufferOf(data, sampleRate);
+}
+
 /** IPC の既定の戻り値。初期化を最後まで通すのに要るものだけ書く */
 const RETURNS = {
   getSettings: () => ({
@@ -144,13 +162,61 @@ async function load(htmlPath, opt = {}) {
 
   /* ---- 画面まわりの最小スタブ ---- */
   const noop = () => {};
-  const timers = new Set();
+  /*
+   * 偽の時計と時限（#37）。setTimeout / setInterval は記録するだけで、進めなければ発火しない
+   * （以前と同じ）。log.clock.advance(ms) が期限の来たものを順に発火し、Date.now もこの
+   * 時計に追従する。log.clock.jump(ms) は発火させずに時刻だけ進める＝画面が隠れて
+   * setTimeout が間引かれた状態（区切りの見張り onTick はそのために在る）。
+   */
+  const clockState = { now: opt.now === undefined ? Date.now() : opt.now };
+  const timerQ = new Map();   // id -> { fn, args, at, every }
+  let timerSeq = 0;
+  const addTimer = (fn, ms, every, args) => {
+    const id = ++timerSeq;
+    const delay = Math.max(0, Number(ms) || 0);
+    timerQ.set(id, { fn, args, at: clockState.now + delay, every: every ? Math.max(1, delay) : 0 });
+    return id;
+  };
+  // Date.now だけを偽の時計に向けた Date。new Date() も追従し、それ以外は本物のまま
+  class FakeDate extends Date {
+    constructor(...a) { super(...(a.length ? a : [clockState.now])); }
+    static now() { return clockState.now; }
+  }
   const rafQ = [];
   let rafId = 0;
   let rafLeft = opt.frames === undefined ? 4 : opt.frames;   // 描画ループは有限回だけ回す
   function fakeStream() {
     const track = { stop: noop, kind: 'audio', enabled: true, addEventListener: noop, onended: null };
     return { getTracks: () => [track], getAudioTracks: () => [track], addTrack: noop, active: true };
+  }
+  /*
+   * 音の経路は「本物のバイト列」を通す（#36）。
+   *   MediaRecorder が止まると決定的なバイト列の chunk が届き、Blob はそれを連結して
+   *   本物の ArrayBuffer を返し、decodeAudioData はその長さぶんの正弦波（非無音）を返し、
+   *   OfflineAudioContext は繋いで start() した音源を間引いてレンダリングする。
+   *   以前は decode が {duration} だけを返し、レンダリングは全部 0 だったので、
+   *   0 バイトを送る壊れ方でも「区間が送られた」検査が通っていた。
+   */
+  class FakeBlob {
+    constructor(parts, o) {
+      this.parts = parts || [];
+      this.type = (o && o.type) || '';
+      this._bytes = concatBytes(this.parts);
+      this.size = this._bytes.length;
+    }
+    arrayBuffer() { return Promise.resolve(this._bytes.slice().buffer); }
+  }
+  function concatBytes(parts) {
+    const bs = parts.map((p) => {
+      if (p instanceof FakeBlob) return p._bytes;
+      if (p instanceof ArrayBuffer) return new Uint8Array(p);
+      if (ArrayBuffer.isView(p)) return new Uint8Array(p.buffer, p.byteOffset, p.byteLength);
+      return new Uint8Array(Buffer.from(String(p), 'utf8'));
+    });
+    const out = new Uint8Array(bs.reduce((n, b) => n + b.length, 0));
+    let off = 0;
+    for (const b of bs) { out.set(b, off); off += b.length; }
+    return out;
   }
   class FakeAudioContext {
     constructor() { this.currentTime = 0; this.destination = {}; this.state = 'running'; this.sampleRate = 48000; }
@@ -161,36 +227,59 @@ async function load(htmlPath, opt = {}) {
     createMediaStreamDestination() { return { stream: fakeStream(), connect: noop }; }
     resume() { return Promise.resolve(); }
     close() { return Promise.resolve(); }
-    // WAV変換（blobToWav16k）を最後まで通す。ここが無いと変換が常に失敗し、
-    // 「区間が送られたか」を見る検査が変換失敗と区別できない。
-    decodeAudioData() { return Promise.resolve({ duration: 0.01, sampleRate: 48000, numberOfChannels: 1, length: 480 }); }
+    // 実機と同じく ArrayBuffer 以外は TypeError、0 バイトは EncodingError で失敗する。
+    // 中身は見ず、長さに比例した正弦波を返す（録れたバイト列が空なら変換は失敗する）。
+    decodeAudioData(arr) {
+      if (!(arr instanceof ArrayBuffer)) return Promise.reject(new TypeError('decodeAudioData: ArrayBuffer ではない'));
+      if (arr.byteLength === 0) return Promise.reject(Object.assign(new Error('Unable to decode audio data'), { name: 'EncodingError' }));
+      return Promise.resolve(sineBuffer(Math.round(arr.byteLength / BYTES_PER_SEC * 48000), 48000));
+    }
   }
   class FakeOfflineAudioContext {
-    constructor(ch, len, rate) { this.length = len; this.sampleRate = rate; this.destination = {}; }
-    createBufferSource() { return { buffer: null, connect: noop, start: noop }; }
-    startRendering() { const n = this.length; return Promise.resolve({ getChannelData: () => new Float32Array(n) }); }
+    constructor(ch, len, rate) { this.numberOfChannels = ch; this.length = len; this.sampleRate = rate; this.destination = { _offline: this }; this._sources = []; }
+    createBufferSource() {
+      const dest = this.destination;
+      const src = { buffer: null, _connected: false, _started: false, connect(node) { if (node === dest) src._connected = true; return node; }, start() { src._started = true; }, stop: noop };
+      this._sources.push(src);
+      return src;
+    }
+    startRendering() {
+      const out = new Float32Array(this.length);
+      // 実機どおり、destination に繋いで start() した音源だけが音になる。素朴な間引きで再標本化する
+      for (const s of this._sources) {
+        if (!s._connected || !s._started || !s.buffer) continue;
+        const inp = s.buffer.getChannelData(0), ratio = s.buffer.sampleRate / this.sampleRate;
+        for (let i = 0; i < out.length; i++) { const j = Math.floor(i * ratio); if (j < inp.length) out[i] += inp[j]; }
+      }
+      return Promise.resolve(audioBufferOf(out, this.sampleRate));
+    }
   }
   class FakeMediaRecorder {
     constructor(stream, o) { this.stream = stream; this.mimeType = (o && o.mimeType) || 'audio/webm'; this.state = 'inactive'; this.ondataavailable = null; this.onstop = null; this.onerror = null; }
     start() { this.state = 'recording'; }
-    stop() { this.state = 'inactive'; if (this.onstop) this.onstop(); }
+    // 実機と同じく、止めると（state が inactive になってから）溜まっていたデータが先に届き、その後に onstop
+    stop() { this.state = 'inactive'; this._flush(); if (this.onstop) this.onstop(); }
     pause() { this.state = 'paused'; }
     resume() { this.state = 'recording'; }
-    requestData() {}
+    requestData() { this._flush(); }
+    /** 録れたデータを1つの chunk として届ける（決定的なバイト列。1 chunk = 1 秒ぶん） */
+    _flush() { if (this.ondataavailable) this.ondataavailable({ data: new FakeBlob([RECORDED_CHUNK], { type: this.mimeType }) }); }
     static isTypeSupported() { return true; }
   }
 
   const window = Object.assign(win, {
     document,
-    setTimeout: (fn, ms) => { const id = setTimeout(noop, 0); timers.add(id); return id; },
-    clearTimeout: (id) => { clearTimeout(id); timers.delete(id); },
-    setInterval: () => 0, clearInterval: noop,
+    setTimeout: (fn, ms, ...args) => addTimer(fn, ms, false, args),
+    clearTimeout: (id) => { timerQ.delete(id); },
+    setInterval: (fn, ms, ...args) => addTimer(fn, ms, true, args),
+    clearInterval: (id) => { timerQ.delete(id); },
+    Date: FakeDate,
     requestAnimationFrame: (fn) => { if (rafLeft > 0) { rafLeft--; rafQ.push(fn); } return ++rafId; },
     cancelAnimationFrame: () => { rafQ.length = 0; },
     addEventListener: noop, removeEventListener: noop,
     AudioContext: FakeAudioContext, webkitAudioContext: FakeAudioContext, OfflineAudioContext: FakeOfflineAudioContext,
     MediaRecorder: FakeMediaRecorder,
-    Blob: class { constructor(p, o) { this.parts = p || []; this.type = (o && o.type) || ''; this.size = 1; } arrayBuffer() { return Promise.resolve(new ArrayBuffer(0)); } },
+    Blob: FakeBlob,
     navigator: {
       mediaDevices: {
         getUserMedia: () => Promise.resolve(fakeStream()),
@@ -218,14 +307,14 @@ async function load(htmlPath, opt = {}) {
   if (!scripts.length) throw new Error(`${htmlPath}: 実行できる <script> が無い（検査が空振りしている）`);
   const names = ['window','document','navigator','console','setTimeout','clearTimeout','setInterval','clearInterval',
     'requestAnimationFrame','cancelAnimationFrame','AudioContext','webkitAudioContext','MediaRecorder','Blob','Option',
-    'alert','confirm','prompt','getComputedStyle','matchMedia','self','location'];
+    'alert','confirm','prompt','getComputedStyle','matchMedia','self','location','Date'];
   for (const s of scripts) {
     try {
       const fn = new Function(...names, `with (window) {\n${s._raw}\n}\n//# sourceURL=${mark}`);
       fn(window, document, window.navigator, console2, window.setTimeout, window.clearTimeout, window.setInterval,
         window.clearInterval, window.requestAnimationFrame, window.cancelAnimationFrame, window.AudioContext,
         window.webkitAudioContext, window.MediaRecorder, window.Blob, window.Option, window.alert, window.confirm,
-        window.prompt, window.getComputedStyle, window.matchMedia, window, window.location);
+        window.prompt, window.getComputedStyle, window.matchMedia, window, window.location, window.Date);
     } catch (e) { log.errors.push(e); }
   }
   for (let i = 0; i < 60; i++) {
@@ -233,7 +322,29 @@ async function load(htmlPath, opt = {}) {
     const fn = rafQ.shift();
     if (fn) { try { fn(i); } catch (e) { log.errors.push(e); } }
   }
-  for (const id of timers) clearTimeout(id);
+
+  /** 偽の時計。now / advance(ms): 期限の来た時限を順に発火して進める / jump(ms): 発火させずに進める */
+  log.clock = {
+    get now() { return clockState.now; },
+    async advance(ms) {
+      const target = clockState.now + Math.max(0, Number(ms) || 0);
+      for (let fired = 0; ; fired++) {
+        let next = null;
+        for (const [id, t] of timerQ) if (t.at <= target && (!next || t.at < next.t.at)) next = { id, t };   // 同時刻は登録順
+        if (!next) break;
+        if (fired >= 100000) { log.errors.push(new Error(`時限が止まらない（advance(${ms}) の間に発火が 10 万回を超えた）`)); break; }
+        clockState.now = Math.max(clockState.now, next.t.at);
+        if (next.t.every) next.t.at += next.t.every; else timerQ.delete(next.id);
+        try { next.t.fn(...next.t.args); } catch (e) { log.errors.push(e); }
+        await new Promise((r) => setImmediate(r));   // 実機と同じく、時限の間で非同期（onstop など）が進む
+      }
+      clockState.now = target;
+      return clockState.now;
+    },
+    jump(ms) { clockState.now += Math.max(0, Number(ms) || 0); return clockState.now; },
+    /** まだ発火していない時限（期限の昇順） */
+    pending: () => [...timerQ.entries()].map(([id, t]) => ({ id, at: t.at, every: t.every })).sort((a, b) => a.at - b.at || a.id - b.id),
+  };
 
   log.window = window;
   log.document = document;
@@ -279,4 +390,4 @@ function wired(root) {
   return out;
 }
 
-module.exports = { load, preloadApis, wired, RETURNS };
+module.exports = { load, preloadApis, wired, RETURNS, sineBuffer, audioBufferOf, BYTES_PER_SEC };

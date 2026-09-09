@@ -12,7 +12,7 @@ const assert = require('node:assert');
 const path = require('path');
 const fs = require('fs');
 const { parseHTML } = require('./helpers/simdom.js');
-const { load } = require('./helpers/simrun.js');
+const { load, sineBuffer } = require('./helpers/simrun.js');
 const C = require('./helpers/simcss.js');
 
 const OVL = path.join(__dirname, '..', 'src', 'renderer', 'overlay.html');
@@ -58,6 +58,70 @@ test('開始の合図で実際に録音まで進み、停止で音声が渡る',
     '停止しても音声がメインに渡らない（録音が成立していない）');
 });
 
+/*
+ * #36 送られたものが本物の WAV であること。以前の偽の decode は {duration} だけを返し、
+ * レンダリングは全部 0 だったので、0 バイトを送る壊れ方でも上の検査が通っていた。
+ * ここでは overlay.html の blobToWav16k が実際に組み立てたバイト列を読む。
+ */
+/** 16kHz・mono・16bit の WAV として読み、ヘッダの各欄と PCM サンプルを返す */
+function WAVを読む(u8) {
+  assert.ok(u8 instanceof Uint8Array, `送られたものが Uint8Array でない: ${Object.prototype.toString.call(u8)}`);
+  assert.ok(u8.length >= 44, `WAV ヘッダ（44 バイト）より短い: ${u8.length} バイト`);
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const str = (off, n) => String.fromCharCode(...u8.subarray(off, off + n));
+  const h = {
+    riff: str(0, 4), riffSize: dv.getUint32(4, true), wave: str(8, 4), fmt: str(12, 4), fmtSize: dv.getUint32(16, true),
+    format: dv.getUint16(20, true), channels: dv.getUint16(22, true), rate: dv.getUint32(24, true),
+    byteRate: dv.getUint32(28, true), blockAlign: dv.getUint16(32, true), bits: dv.getUint16(34, true),
+    data: str(36, 4), dataSize: dv.getUint32(40, true),
+  };
+  const samples = new Int16Array(Math.floor((u8.length - 44) / 2));
+  for (let i = 0; i < samples.length; i++) samples[i] = dv.getInt16(44 + i * 2, true);
+  return { h, samples };
+}
+function 本物のWAVである(u8, where) {
+  const { h, samples } = WAVを読む(u8);
+  assert.deepStrictEqual(
+    { riff: h.riff, wave: h.wave, fmt: h.fmt, fmtSize: h.fmtSize, format: h.format, channels: h.channels, rate: h.rate, byteRate: h.byteRate, blockAlign: h.blockAlign, bits: h.bits, data: h.data },
+    { riff: 'RIFF', wave: 'WAVE', fmt: 'fmt ', fmtSize: 16, format: 1, channels: 1, rate: 16000, byteRate: 32000, blockAlign: 2, bits: 16, data: 'data' },
+    `${where}: WAV ヘッダが 16kHz・mono・16bit PCM でない`);
+  assert.strictEqual(h.dataSize, u8.length - 44, `${where}: data チャンクの長さがバイト列と合わない`);
+  assert.strictEqual(h.riffSize, u8.length - 8, `${where}: RIFF チャンクの長さがバイト列と合わない`);
+  assert.ok(samples.length >= 1000, `${where}: サンプルが ${samples.length} 個しかない（録れた 1 秒ぶんが変換されていない）`);
+  const peak = samples.reduce((m, s) => Math.max(m, Math.abs(s)), 0);
+  assert.ok(peak > 0, `${where}: 全サンプルが 0（無音）。録った音が WAV に入っていない`);
+  // 偽の音は振幅 0.5 の正弦波。間引いても山は残るので、頂点は 0.5 × 32767 の近くにある
+  assert.ok(peak >= 0.45 * 32767 && peak <= 32767, `${where}: 頂点 ${peak} が録った音（振幅 0.5）と違う`);
+  assert.ok(samples.some((s) => s < 0) && samples.some((s) => s > 0), `${where}: 正負の両側が無い（波形でない）`);
+}
+
+test('議事録で送られる区間は、16kHz・mono・16bit の本物の WAV で、録った音が入っている', async () => {
+  const log = await load(OVL);
+  log.fire('onStart', { mode: 'meeting', segmentSec: 75, sound: false, systemAudio: false });
+  await log.drain();
+  log.fire('onStop');
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '例外');
+  const segs = log.called('sendSegment');
+  assert.strictEqual(segs.length, 1, '最後の区間が 1 回だけ届いていない');
+  assert.strictEqual(segs[0].args[2], true, '最後の印が無い');
+  本物のWAVである(segs[0].args[0], 'sendSegment');
+});
+
+test('音声入力で送られる音声は、16kHz・mono・16bit の本物の WAV で、録った音が入っている', async () => {
+  const log = await load(OVL);
+  log.fire('onStart', { mode: 'dictation', sound: false });
+  await log.drain();
+  log.fire('onStop');
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '例外');
+  const sent = log.called('sendAudio');
+  assert.strictEqual(sent.length, 1, '音声が 1 回だけ届いていない');
+  assert.strictEqual(sent[0].args[1], 'audio/wav', 'MIME が audio/wav でない');
+  本物のWAVである(sent[0].args[0], 'sendAudio');
+  assert.strictEqual(log.called('sendError').length, 0, '変換に成功したのにエラーを伝えている');
+});
+
 test('実際に描いた色は、ピルの地の上で見える', () => {
   const css = 録音.root.querySelectorAll('style').map((s) => s._raw).join('\n');
   const bg = C.firstColor(C.declsFor(C.parse(css), '.pill', { at: '' }).background);
@@ -88,9 +152,13 @@ function 非同期onstopに(log) {
   MR.prototype.start = function () { log.recorders.push(this); start.call(this); };
   MR.prototype.stop = function () {
     this.state = 'inactive';
+    this._flush();                                             // 実機と同じく、録れたデータは onstop より先に届く
     setImmediate(() => { if (this.onstop) this.onstop(); });   // 実機と同じく後で発火
   };
 }
+
+/** decodeAudioData の差し替えが返すもの。simrun の既定と同じ形（getChannelData を持つ非無音の正弦波） */
+const 復号した音 = () => sineBuffer(480);
 
 /** simrun の fakeStream と同じ形で、トラックの stop() 回数を数える（マイクを手放したかの観測） */
 function 偽ストリーム() {
@@ -109,7 +177,7 @@ function マイクを数える(log) {
 function 変換を待たせる(log) {
   let release;
   const gate = new Promise((r) => { release = r; });
-  log.window.AudioContext.prototype.decodeAudioData = () => gate.then(() => ({ duration: 0.01, sampleRate: 48000, numberOfChannels: 1, length: 480 }));
+  log.window.AudioContext.prototype.decodeAudioData = () => gate.then(復号した音);
   return release;
 }
 
@@ -269,17 +337,19 @@ test('音声入力の WAV 変換に失敗すると、エラーを1回だけ伝�
  * 変換は裏で続ける。送る順は区間の番号で守る（短い後の区間が先に変換し終えても
  * 先に届かない。main は届いた順に atMs を積む）。
  */
-/** overlay の Date.now() をテストが進める時計に差し替える（with(window) 経由で引かれる） */
-function 時計(log, t0 = 1_700_000_000_000) {
-  let t = t0;
-  log.window.Date = { now: () => t };
-  return { now: () => t, 進める(ms) { t += ms; return t; } };
+/**
+ * overlay の Date.now() を進める（simrun の偽の時計 log.clock）。ここの 進める は時限
+ * （setTimeout）を発火させない＝画面が隠れて setTimeout が間引かれた状態。区切りの見張り
+ * （onTick）を検査するための時計。時限まで進めるときは log.clock.advance(ms) を使う。
+ */
+function 時計(log) {
+  return { now: () => log.clock.now, 進める(ms) { return log.clock.jump(ms); } };
 }
 /** WAV 変換を呼ばれた順に個別に止める。戻り値の配列の要素を呼ぶと、その変換だけ進む */
 function 変換を個別に待たせる(log) {
   const gates = [];
   log.window.AudioContext.prototype.decodeAudioData = () => new Promise((r) => {
-    gates.push(() => r({ duration: 0.01, sampleRate: 48000, numberOfChannels: 1, length: 480 }));
+    gates.push(() => r(復号した音()));
   });
   return gates;
 }
@@ -296,6 +366,60 @@ async function 議事録を開始(opt = {}) {
   assert.strictEqual(log.recorders.length, 1, '最初の区間の recorder が始まっていない（検査が空振り）');
   return { log, clock };
 }
+
+/*
+ * #37 区間長そのもの。最初の区間は FIRST_SEG_MS（20 秒）、以後は設定の segmentSec 秒。
+ * これまで時計を進めるテストは区切りの「見張り」（onTick）だけを通していて、setTimeout の
+ * 期限で自動に切れる本線に時間軸が無かった。segmentSec * 1000 の * 1000 を消しても
+ * 全件が緑だった（最初の 20 秒だけ残り、以後が 75 ミリ秒ごとに細切れになる壊れ方）。
+ */
+/** 区間が「最初 FIRST_SEG → 以後 segMs」の長さで、時限が来ると自動に切れて順に届くことを見る */
+async function 時限で切れる区間を見る(segmentSec) {
+  const segMs = segmentSec * 1000;
+  const { log } = await 議事録を開始({ start: { segmentSec } });
+  const 届いた = () => log.called('sendSegment').map((c) => [c.args[1], c.args[2]]);
+  await log.clock.advance(FIRST_SEG - 1);
+  assert.strictEqual(log.recorders.length, 1, `最初の区間が ${FIRST_SEG} ms より前に切られている`);
+  await log.clock.advance(1);
+  assert.strictEqual(log.recorders.length, 2, `最初の区間が ${FIRST_SEG} ms で切られない（setTimeout の期限で自動に切れていない）`);
+  assert.strictEqual(log.recorders[1].state, 'recording', '2 つ目の区間が録っていない');
+  await log.drain();
+  assert.deepStrictEqual(届いた(), [[FIRST_SEG, false]], '最初の区間が 20 秒の長さで途中の印で届いていない');
+  await log.clock.advance(segMs - 1);
+  assert.strictEqual(log.recorders.length, 2, `2 つ目の区間が設定の ${segmentSec} 秒より前に切られている（segmentSec の単位が壊れている疑い）`);
+  await log.clock.advance(1);
+  assert.strictEqual(log.recorders.length, 3, `2 つ目の区間が設定の ${segmentSec} 秒で切られない`);
+  await log.drain();
+  await log.clock.advance(segMs);
+  assert.strictEqual(log.recorders.length, 4, `3 つ目の区間が設定の ${segmentSec} 秒で切られない`);
+  await log.drain();
+  assert.deepStrictEqual(届いた(), [[FIRST_SEG, false], [segMs, false], [segMs, false]],
+    `区間が ${FIRST_SEG} → ${segMs} → ${segMs} ms の長さで順に届いていない`);
+  log.fire('onStop');
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '例外');
+  assert.deepStrictEqual(log.called('sendSegment').map((c) => c.args[2]), [false, false, false, true], '最後の印が最後の区間だけに付いていない');
+  assert.strictEqual(log.recorders.length, 4, '終了で区間が余計に始まっている');
+  return log;
+}
+
+test('区間は最初 20 秒（FIRST_SEG_MS）、以後は設定の 75 秒で、setTimeout の期限が来ると自動に切れて順に届く', async () => {
+  await 時限で切れる区間を見る(75);
+});
+
+test('設定の segmentSec が 120 なら、2 つ目からの区間は 120 秒で切れる（75 秒の決め打ちではない）', async () => {
+  await 時限で切れる区間を見る(120);
+});
+
+test('偽の時計は、進めた時間のぶんだけ Date.now と経過表示が進む（時間軸の検査そのものが空振りしていない）', async () => {
+  const { log } = await 議事録を開始();
+  const t0 = log.clock.now;
+  assert.ok(log.clock.pending().some((t) => t.at === t0 + FIRST_SEG && !t.every), '最初の区間の時限（20 秒）が登録されていない');
+  assert.ok(log.clock.pending().some((t) => t.every === 250), '経過表示の setInterval（250ms）が登録されていない');
+  await log.clock.advance(61_500);
+  assert.strictEqual(log.clock.now - t0, 61_500, '時計が進んでいない');
+  assert.strictEqual(log.byId.get('timer').textContent, '1:01', '経過表示が偽の時計に追従していない');
+});
 
 test('区切りの見張りで区間を切ると、変換を待たずに次の区間が始まる', async () => {
   let 変換を進める;
