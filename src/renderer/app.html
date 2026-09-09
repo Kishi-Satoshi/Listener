@@ -769,16 +769,22 @@
     renderList();
   }
 
-  // 未完了アクションを全議事録から集めて、期限順に表示する
+  // 未完了アクションを全議事録から集めて、期限順に表示する。
+  // 検索語と担当の絞り込みは store 側（pagesActionView）で行い、行・担当チップ・絞る前の
+  // 件数（total）を 1 回の IPC で受け取る（#45。以前は openActions と assigneeList の 2 回で、
+  // 絞り込みは画面側だった。1 打鍵ごとに全ページを 2 度読んでいた）。
   async function renderActionView(q) {
     const box = $('plist'); box.textContent = '';
-    let acts = await window.koeApp.openActions();
-    const fq = fold(q);
-    if (fq) acts = acts.filter((x) => fold(x.text).includes(fq) || fold(x.pageTitle).includes(fq) || fold(x.assignee).includes(fq));
-    if (assigneeFilter) acts = acts.filter((x) => x.assignee === assigneeFilter);
+    let r = null;
+    // 古い preload と組んだときも例外で一覧を殺さない（空として描く）
+    if (typeof window.koeApp.pagesActionView === 'function') {
+      try { r = await window.koeApp.pagesActionView({ q, assignee: assigneeFilter }); } catch (_) { r = null; }
+    }
+    const acts = r && Array.isArray(r.actions) ? r.actions : [];
+    const people = r && Array.isArray(r.people) ? r.people : [];
+    const total = r && Number.isFinite(Number(r.total)) ? Number(r.total) : acts.length;
 
     // 担当者での絞り込みチップ
-    const people = await window.koeApp.assigneeList();
     if (people.length) {
       const row = document.createElement('div');
       row.className = 'filters'; row.style.flexWrap = 'wrap'; row.style.marginBottom = '4px';
@@ -796,7 +802,10 @@
 
     if (!acts.length) {
       const d = document.createElement('div'); d.className = 'empty';
-      d.innerHTML = '<div class="big">未完了のアクションはありません</div>議事録の要約から自動で集められます。';
+      // 絞り込みで空なのか、本当に無いのかを分ける。total は絞る前の件数
+      d.innerHTML = total > 0
+        ? `<div class="big">条件に合うアクションはありません</div>未完了は全部で ${total} 件あります。検索語や担当の絞り込みを外してください。`
+        : '<div class="big">未完了のアクションはありません</div>議事録の要約から自動で集められます。';
       box.appendChild(d); return;
     }
 

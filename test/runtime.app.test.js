@@ -123,7 +123,7 @@ const { PAGE } = require('./helpers/replies.js');
 const { STANDUP_SEGMENTS } = require('./fixtures.js');
 const clone = (x) => JSON.parse(JSON.stringify(x));
 
-async function 開いた(extra = {}) {
+async function 開いた(extra = {}, opt = {}) {
   const segs = clone(STANDUP_SEGMENTS);
   const returns = Object.assign({
     pageGet: (id) => ({ page: Object.assign(clone(PAGE), { id, title: id === 'p2' ? '二つ目の議事録' : PAGE.title }), segments: segs }),
@@ -132,7 +132,7 @@ async function 開いた(extra = {}) {
       segments: segs.map((s) => (s.id === segId ? Object.assign({}, s, { text: patch.text }) : s)),
     }),
   }, extra);
-  const l = await load(APP, { returns });
+  const l = await load(APP, Object.assign({ returns }, opt));
   l.fire('onPageOpen', 'p1');
   await l.drain();
   return l;
@@ -604,13 +604,13 @@ test('議事録の一覧は listbox で、行は Tab で辿れ Enter / Space で
 });
 
 test('アクション横断ビューの出典行も、Tab で辿れ Enter で元の議事録を開ける', async () => {
+  // #45 以降、行は pagesActionView({ q, assignee }) の 1 回で受け取る（形は openActions の行と同じ）
   const l = await 開いた({
-    openActions: () => [
+    pagesActionView: () => ({ actions: [
       { pageId: 'p1', pageTitle: '一つ目', blockId: 'b2', text: 'やること', assignee: '佐藤', date: '9/1' },
       { pageId: 'p2', pageTitle: '二つ目', blockId: 'b9', text: '別のやること', assignee: '', date: '9/2' },
-    ],
-    assigneeList: () => [],
-  });
+    ], people: [], total: 2 }),
+  }, { preloadSrc: preloadWith('pagesActionView') });
   l.byId.get('fltActions').dispatchEvent({ type: 'click' });
   await l.drain();
   const rows = l.byId.get('plist').querySelectorAll('.src');
@@ -662,24 +662,25 @@ test('音声入力の履歴検索は、全角と半角・大文字小文字の�
   assert.deepStrictEqual(l.errors.map(fmt), []);
 });
 
-test('アクション横断ビューの絞り込みは、句読点の違いを越えて当たる', async () => {
+test('アクション横断ビューの絞り込みは store に任せる（検索語は畳まずに渡し、返った行を絞り直さない）', async () => {
+  // #45 以降、句読点の違いを越えて当てるのは store 側（searchFold）。画面は q をそのまま渡し、
+  // 返ってきた行をそのまま描く。画面側で二重に絞ると、store が当てた行が消える。
   const l = await 開いた({
-    openActions: () => [
+    pagesActionView: ({ q }) => ({ actions: q ? [
+      { pageId: 'p1', pageTitle: '一つ目', blockId: 'b2', text: '予算案の、作成', assignee: '佐藤', date: '9/1' },
+    ] : [
       { pageId: 'p1', pageTitle: '一つ目', blockId: 'b2', text: '予算案の、作成', assignee: '佐藤', date: '9/1' },
       { pageId: 'p1', pageTitle: '一つ目', blockId: 'b3', text: '会場の予約', assignee: '', date: '9/1' },
-    ],
-    assigneeList: () => [],
-  });
+    ], people: [{ name: '佐藤', count: 1 }], total: 2 }),
+  }, { preloadSrc: preloadWith('pagesActionView') });
   const rows = () => l.byId.get('plist').querySelectorAll('.actrow').map((r) => r.querySelector('.body').childNodes[0].textContent);
   // 検索欄の input は遅延（220ms）で走るので、チップを押して即時に描き直す
   l.byId.get('searchBox').value = '予算案の作成';
   l.byId.get('fltActions').dispatchEvent({ type: 'click' });
   await l.drain();
-  assert.deepStrictEqual(rows(), ['予算案の、作成'], '「予算案の、作成」が 予算案の作成 で当たらない');
-  l.byId.get('searchBox').value = 'さとう';
-  l.byId.get('fltActions').dispatchEvent({ type: 'click' });
-  await l.drain();
-  assert.deepStrictEqual(rows(), [], '当たらないものまで出る');
+  const sent = l.called('pagesActionView').map((c) => c.args[0]);
+  assert.deepStrictEqual(sent, [{ q: '予算案の作成', assignee: '' }], '検索語がそのまま store へ渡らない');
+  assert.deepStrictEqual(rows(), ['予算案の、作成'], 'store が当てた行を画面が絞り直して消している');
   assert.deepStrictEqual(l.errors.map(fmt), []);
 });
 
