@@ -74,6 +74,11 @@
     box-shadow: inset 0 1px 0 rgba(var(--srf),.6), var(--shadow-soft); }
   button.ghost:hover { background: rgba(var(--srf),.82); color: var(--ink); }
   button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* 一覧の行は div。Tab で辿れるようにしても、既定では今どこにいるか見えない */
+  .pitem:focus-visible, .actrow .src:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* 記録中に止めた欄。触れないことが見た目で分かるようにする */
+  button.ghost:disabled { opacity: .5; cursor: default; }
+  input:disabled, select:disabled, textarea:disabled { opacity: .55; cursor: not-allowed; }
 
   input[type="text"], select, textarea {
     background: rgba(var(--srf),.62); border: 1px solid rgba(var(--srf),.78);
@@ -244,8 +249,12 @@
   .seg .txt:empty::before { content: '（削除済み）'; color: var(--faint); }
 
   /* ---------- 進行中バー ---------- */
-  .live { display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
+  .live { display: flex; align-items: center; gap: 6px 10px; margin-bottom: 10px; flex-wrap: wrap;
     background: rgba(var(--srf),.62); border: 1px solid var(--gline); border-radius: 14px; padding: 11px 14px; }
+  /* 進捗・打ち切り・マイクの注意は、1行目（状態と時計）の下に折り返して出す */
+  .live .desc { flex: none; width: 100%; font-size: 11px; color: var(--muted); }
+  .live .desc.ng { color: var(--danger); }
+  .live button.ghost { font-size: 12px; padding: 5px 12px; }
   .rec-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent);
     animation: pulse 1.4s ease-in-out infinite; flex: none; }
   @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(91,110,225,.4); } 50% { box-shadow: 0 0 0 7px rgba(91,110,225,0); } }
@@ -386,7 +395,7 @@
             <button class="chip" id="fltActions">アクション</button>
             <button class="chip" id="fltFull">文字起こし検索</button>
           </div>
-          <div class="plist" id="plist"></div>
+          <div class="plist" id="plist" role="listbox" aria-label="議事録の一覧"></div>
         </aside>
 
         <div class="page" id="pageWrap">
@@ -475,6 +484,7 @@
             <label for="segmentSec">議事録の文字起こし間隔（秒）</label>
             <input type="text" id="segmentSec" />
             <div class="desc">短いほど早く画面に出ますが、文の切れ目が増えます（既定75秒。最初の1回は20秒）。</div>
+            <div class="desc ng lockNote" hidden>記録中はエンジンの設定を変更できません</div>
           </div>
           <div class="field">
             <label for="pillPos">録音バーの表示位置（表示中はドラッグでも移動できます）</label>
@@ -521,6 +531,7 @@
             <select id="language">
               <option value="ja">日本語</option><option value="en">英語</option><option value="auto">自動判定</option>
             </select>
+            <div class="desc ng lockNote" hidden>記録中はエンジンの設定を変更できません</div>
           </div>
           <label class="check"><input type="checkbox" id="autoPaste" />
             <span>文字起こし後、カーソル位置へ自動貼り付け</span></label>
@@ -541,6 +552,7 @@
           <div class="field">
             <textarea id="dictionary" rows="5" placeholder="1行に1語ずつ&#10;自社名&#10;製品名&#10;部署名"></textarea>
             <div class="desc">固有名詞・社内用語をエンジンへ渡し、認識精度を上げます。</div>
+            <div class="desc ng" id="dictWarn" hidden></div>
           </div>
           <label class="check"><input type="checkbox" id="useBuiltinTerms" />
             <span>業務でよく使う言葉のヒントも渡す<br />
@@ -549,6 +561,7 @@
         </div>
         <div class="card">
           <h2>文字起こしエンジン（whisper.cpp・オフライン）</h2>
+          <div class="field lockNote" hidden><div class="desc ng">記録中はエンジンの設定を変更できません</div></div>
           <div class="field">
             <label for="localServerExe">whisper-server.exe のパス</label>
             <div class="row">
@@ -596,6 +609,7 @@
         </div>
         <div class="card">
           <h2>要約エンジン（llama.cpp・オフライン）— 議事録の自動要約に使用</h2>
+          <div class="field lockNote" hidden><div class="desc ng">記録中はエンジンの設定を変更できません</div></div>
           <div class="field">
             <label for="sumServerExe">llama-server.exe のパス</label>
             <div class="row">
@@ -689,6 +703,11 @@
     const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
     return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(x).padStart(2,'0')}` : `${m}:${String(x).padStart(2,'0')}`;
   }
+  // 検索の正規化。全角／半角・大文字小文字・句読点や空白の違いで取りこぼさないよう、
+  // 両辺を同じ形に畳んでから含有を見る。main 側（cite.js の searchFold）と同じ規則。
+  // 規則を変えるときは両方を直す（一覧の検索と画面内の絞り込みで当たり方が食い違う）。
+  const fold = (s) => String(s || '').normalize('NFKC')
+    .replace(/[、。「」『』（）()［］\[\]【】・,.!?！？"'`~\-—…:：;；*_\/\s]/g, '').toLowerCase();
   function dueInfo(due, approx) {
     if (!due) return null;
     const today = new Date(); today.setHours(0,0,0,0);
@@ -711,6 +730,21 @@
     return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
   }
 
+  // 一覧の行（div）をキーボードでも扱えるようにする。Tab で辿れ（tabIndex）、
+  // 読み上げには選択肢として伝わり（role / aria-selected）、Enter か Space で開く。
+  // マウスの onclick は今までどおり。
+  function asOption(el, selected, open) {
+    el.tabIndex = 0;
+    el.setAttribute('role', 'option');
+    el.setAttribute('aria-selected', selected ? 'true' : 'false');
+    el.onclick = open;
+    el.onkeydown = (ev) => {
+      if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      ev.preventDefault();   // Space で一覧がスクロールしないように
+      open();
+    };
+  }
+
   // ================= 議事録: 一覧 =================
   async function refreshList() {
     const q = $('searchBox').value.trim();
@@ -724,7 +758,8 @@
   async function renderActionView(q) {
     const box = $('plist'); box.textContent = '';
     let acts = await window.koeApp.openActions();
-    if (q) acts = acts.filter((x) => x.text.includes(q) || x.pageTitle.includes(q) || x.assignee.includes(q));
+    const fq = fold(q);
+    if (fq) acts = acts.filter((x) => fold(x.text).includes(fq) || fold(x.pageTitle).includes(fq) || fold(x.assignee).includes(fq));
     if (assigneeFilter) acts = acts.filter((x) => x.assignee === assigneeFilter);
 
     // 担当者での絞り込みチップ
@@ -791,7 +826,7 @@
     if (meta.childNodes.length) body.appendChild(meta);
     const src = document.createElement('div'); src.className = 'src';
     src.textContent = `${x.date} ${x.pageTitle}`;
-    src.onclick = () => openPage(x.pageId);
+    asOption(src, x.pageId === curId, () => openPage(x.pageId));
     body.appendChild(src);
     el.append(cb, body);
     return el;
@@ -828,7 +863,7 @@
         const sn = document.createElement('div'); sn.className = 'snip'; sn.textContent = p.snippet;
         el.appendChild(sn);
       }
-      el.onclick = () => openPage(p.id);
+      asOption(el, p.id === curId, () => openPage(p.id));
       box.appendChild(el);
     }
   }
@@ -1374,6 +1409,18 @@
     if (e.key === 'Enter') { e.preventDefault(); $('pTitle').blur(); }
   };
 
+  // 記録中は main がエンジンに関わる設定の変更を受け付けない（変換の途中でエンジンが
+  // 再起動され、区間が失われる）。画面でも欄を止めて、理由を出す。
+  // 止める欄は main が記録中に前の値を保つキーと同じ。「参照…」も一緒に止める
+  //（押せてもパスを書けない）。
+  const ENGINE_KEYS = ['language', 'localThreads', 'sumThreads', 'useVad', 'suppressNst', 'localServerExe',
+    'localModelPath', 'vadModelPath', 'sumServerExe', 'sumModelPath', 'localPort', 'sumPort', 'segmentSec'];
+  const ENGINE_PICKERS = ['pickExeBtn', 'pickModelBtn', 'pickVadBtn', 'pickSumExeBtn', 'pickSumModelBtn'];
+  function lockEngineFields(locked) {
+    for (const id of [...ENGINE_KEYS, ...ENGINE_PICKERS]) $(id).disabled = locked;
+    for (const n of $('tabSettings').querySelectorAll('.lockNote')) n.hidden = !locked;
+  }
+
   // ---------------- 録音セッション ----------------
   function mtClock() {
     if (!mtStartedAt) return '0:00';
@@ -1396,6 +1443,7 @@
       renderList(); renderPage();
     }
     mtWasActive = Boolean(st.active);
+    lockEngineFields(Boolean(st.active));
     $('mtToggleBtn').textContent = st.finalizing ? '作成中…' : st.active ? '■ 終了して作成' : '● 記録開始';
     $('mtToggleBtn').disabled = Boolean(st.finalizing);
     $('mtDiscardBtn').style.display = st.active && !st.finalizing ? '' : 'none';
@@ -1404,8 +1452,16 @@
     if (st.active) {
       if (!live) {
         live = document.createElement('div'); live.className = 'live'; live.id = 'liveBar';
-        live.innerHTML = '<span class="rec-dot"></span><span id="liveTitle">議事録を記録中</span><span class="tm" id="liveTm">0:00</span>';
+        // 進捗と打ち切りの要素は最初から作っておき、状態に応じて隠す。
+        // 更新のたびに作り直すと、押そうとした瞬間にボタンが消えて押せない。
+        live.innerHTML = '<span class="rec-dot"></span><span id="liveTitle">議事録を記録中</span>'
+          + '<button class="ghost" id="liveSkipBtn" type="button" hidden>文字起こしを打ち切って要約</button>'
+          + '<span class="tm" id="liveTm">0:00</span>'
+          + '<div class="desc" id="liveEta" hidden></div>'
+          + '<div class="desc" id="liveSkipped" hidden></div>'
+          + '<div class="desc ng" id="liveMic" hidden></div>';
         $('pBody').insertBefore(live, $('pBody').firstChild);
+        $('liveSkipBtn').onclick = skipPending;
       }
       // 相手の声も録れているかは、会議が終わってから気づくと手遅れなので
       // 記録中のバーに出す。
@@ -1413,6 +1469,7 @@
       $('liveTitle').textContent = st.finalizing ? '議事録を作成しています…'
         : st.paused ? '一時停止中（録音していません）'
         : st.pending > 0 ? `${recLabel}（${st.pending}区間を文字起こし中）` : recLabel;
+      renderLiveNotes(st);
       if (!mtTimer) mtTimer = setInterval(() => { const e = $('liveTm'); if (e) e.textContent = mtClock(); }, 500);
       // 記録中はライブ文字起こしを表示
       if (!curId) {
@@ -1466,6 +1523,36 @@
     }
   }
 
+  // 終了後に残っている文字起こしの進み具合と、それを打ち切る導線。
+  // 長い会議だと終了後の変換に何分もかかり、待つべきか分からず強制終了されていた
+  //（区間ごと失われる）。残りと見込みを出し、諦めるなら要約だけ進められるようにする。
+  function renderLiveNotes(st) {
+    const waiting = Boolean(st.stopping) && st.pending > 0;   // 終了後に、まだ変換していない区間がある
+    const etaKnown = typeof st.etaSec === 'number' && Number.isFinite(st.etaSec);
+    const etaEl = $('liveEta');
+    etaEl.hidden = !waiting;
+    if (waiting) {
+      etaEl.textContent = etaKnown
+        ? `残り ${st.pending} 区間（約 ${Math.max(1, Math.ceil(st.etaSec / 60))} 分）`
+        : `残り ${st.pending} 区間`;
+    }
+    $('liveSkipBtn').hidden = !waiting;
+    const skippedEl = $('liveSkipped');
+    skippedEl.hidden = !(st.skipped > 0);
+    if (st.skipped > 0) skippedEl.textContent = `${st.skipped} 区間を打ち切りました`;
+    // 選んだマイクが外れていて、main が既定のマイクに切り替えて録っている。
+    // 会議が終わってから気づくと手遅れなので、記録中に赤で出す。
+    const micEl = $('liveMic');
+    micEl.hidden = !st.micFallback;
+    micEl.textContent = st.micFallback ? '選んだマイクが見つからないため、既定のマイクで録音しています' : '';
+  }
+  async function skipPending() {
+    if (!confirm('残っている文字起こしを打ち切り、いまある分だけで議事録を作ります。\n打ち切った区間の発言は議事録に入りません。よろしいですか？')) return;
+    const r = await window.koeApp.meetingSkipPending();
+    if (r && r.ok === false && r.error) toast(r.error);
+    setMeetingUi(await window.koeApp.meetingStatus());
+  }
+
   $('mtToggleBtn').onclick = async () => {
     const r = await window.koeApp.meetingToggle();
     if (r && r.ok === false && r.error) { toast(r.error); if (/未設定/.test(r.error)) showTab('settings'); }
@@ -1516,7 +1603,8 @@
     $('stSaved').innerHTML = saved >= 60 ? `${(saved/60).toFixed(1)}<small>時間</small>` : `${Math.round(saved)}<small>分</small>`;
 
     const q = $('histSearch').value.trim();
-    const list = q ? history.filter((h) => h.text.includes(q)) : history;
+    const fq = fold(q);
+    const list = fq ? history.filter((h) => fold(h.text).includes(fq)) : history;
     const box = $('histList'); box.textContent = '';
     if (!list.length) {
       const d = document.createElement('div'); d.className = 'empty';
@@ -1687,6 +1775,20 @@
     }
   }
 
+  // 辞書は認識ヒント（whisper のプロンプト）として渡すが、載せられる長さに上限があり、
+  // 超えた分は黙って捨てられる。何語まで効いているかを辞書欄の下に出す。
+  // 設定の表示時と保存後に main へ聞く。
+  async function refreshPromptInfo() {
+    const w = $('dictWarn');
+    if (typeof window.koeApp.promptInfo !== 'function') return;   // 古い preload と組んだときも設定画面は生かす
+    let r;
+    try { r = await window.koeApp.promptInfo(); } catch (_) { return; }
+    const over = Boolean(r && r.ok !== false && r.over);
+    w.textContent = over
+      ? `辞書が認識ヒントの上限を超えています（先頭から ${Number(r.kept) || 0} 語まで有効。それ以降は渡されません）` : '';
+    w.hidden = !over;
+  }
+
   async function refreshVad() {
     try {
       const s = await window.koeApp.vadStatus();
@@ -1713,6 +1815,17 @@
   // 自動保存があるので、初期化に失敗して画面が空のまま何かに触れると、
   // その空の値でディスク上の設定を上書きしてしまう。
   let settingsLoaded = false;
+
+  // 設定のキー → 入力欄。ほとんどは id がキーと同じで、違うものだけここに書く。
+  // main が採らなかった値を欄へ戻すときに使う（save の applied）。
+  const FIELD_IDS = { micId: 'micSelect', theme: 'themeSel' };
+  function setField(k, v) {
+    const el = $(FIELD_IDS[k] || k);
+    if (!el) return;
+    if (el.getAttribute('type') === 'checkbox') el.checked = Boolean(v);
+    else if (k === 'dictionary') el.value = (Array.isArray(v) ? v : [v]).join('\n');
+    else el.value = v;
+  }
 
   async function save(silent) {
     if (!settingsLoaded) {
@@ -1751,11 +1864,15 @@
     const m = $('saveMsg');
     if (r.ok) {
       settings = { ...settings, ...next };
-      // 登録できなかったホットキーは main が前の値に戻している。画面も同じ値に揃える。
-      // 揃えないと、以後の無関係な保存のたびに同じキーで失敗と警告を繰り返す。
-      if (r.applied) {
-        for (const k of ['hotkey', 'meetingHotkey']) {
-          if (typeof r.applied[k] === 'string' && r.applied[k]) { settings[k] = r.applied[k]; $(k).value = r.applied[k]; }
+      // main が採らなかった値（登録できなかったホットキー、記録中に変えられないエンジン設定）は
+      // applied に「実際に残った値」が入って返る。画面も同じ値に揃える。揃えないと、以後の
+      // 無関係な保存のたびに同じ値を送って同じ警告を繰り返す。
+      // 画面に欄の無いキーは触らない（送っていないものを戻す先が無い）。
+      if (r.applied && typeof r.applied === 'object') {
+        for (const [k, v] of Object.entries(r.applied)) {
+          if (v === undefined || v === null || !(k in next)) continue;
+          settings[k] = v;
+          setField(k, v);
         }
       }
       if (!silent) { m.textContent = '保存しました'; m.className = 'save-msg ok'; }
@@ -1763,6 +1880,7 @@
       if (r.warning) toast(r.warning);
       refreshVad();
       refreshHotkeyState();
+      refreshPromptInfo();
       return true;
     }
     m.textContent = r.error || '保存に失敗しました'; m.className = 'save-msg ng';
@@ -1903,6 +2021,7 @@
     settingsLoaded = true;   // ここを通るまで save() は書き込まない
     refreshVad();
     refreshHotkeyState();
+    refreshPromptInfo();
     mtypes = await window.koeApp.meetingTypes();
     try {
       const v = await window.koeApp.appVersion();
