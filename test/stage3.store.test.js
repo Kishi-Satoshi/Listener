@@ -151,3 +151,117 @@ test('#43 searchFullText: limit の既定は 60（61 件目から打ち切り）
   assert.strictEqual(r.total, 62);
   assert.strictEqual(r.truncated, true);
 });
+
+// ---------------------------------------------------------------- #45 アクションの1走査
+// アクションタブは1打鍵ごとに openActions()（全ページを読む）+ assigneeList() の
+// IPC 2本を呼んでいた。actionView は1回の走査で行・担当者・件数を返し、索引の
+// openActionCount が 0 のページは読まない。
+const todo = (id, text, more) => blk(id, 'todo', text, { checked: false, ...(more || {}) });
+// 4 ページ。A・B に未完了、C は完了のみ（actionCount 2 / openActionCount 0）、D は todo 無し
+function mkActions() {
+  const A = store.createPage({ title: '週次定例', date: '2026-09-08', createdAt: '2026-09-08T00:00:00.000Z', segments: [], blocks: [
+    blk('h', 'heading', 'アクション'),
+    todo('a1', 'ＡＩ資料を送る', { assignee: '山田', due: '2026-09-10', dueRaw: '9/10' }),
+    todo('a2', '見積を作る', { assignee: '佐藤' }),
+    todo('a3', '完了済みの作業', { checked: true, assignee: '佐藤' }),
+    todo('a4', '', { assignee: '佐藤' }),   // 本文の無い todo は行にしない（openActions と同じ）
+  ] });
+  const B = store.createPage({ title: 'キックオフ', date: '2026-09-01', createdAt: '2026-09-01T00:00:00.000Z', segments: [], blocks: [
+    todo('b1', '会場を、予約する', { assignee: '山田', due: '2026-09-01', dueRaw: '来週', dueApprox: true }),
+    todo('b2', '済んだ作業', { checked: true }),
+  ] });
+  const C = store.createPage({ title: '振り返り', date: '2026-08-20', createdAt: '2026-08-20T00:00:00.000Z', segments: [], blocks: [
+    todo('c1', '済んだ作業1', { checked: true, assignee: '田中' }),
+    todo('c2', '済んだ作業2', { checked: true }),
+  ] });
+  const D = store.createPage({ title: '雑談', date: '2026-08-10', createdAt: '2026-08-10T00:00:00.000Z', segments: [], blocks: [blk('d1', 'bullet', '要点')] });
+  return { A, B, C, D };
+}
+// pages/ の下の読み取りをページ id で記録しながら fn を実行する
+function readingPages(fn) {
+  const orig = fs.readFileSync;
+  const read = [];
+  fs.readFileSync = function (file, ...rest) {
+    const f = String(file);
+    if (f.includes(`${path.sep}pages${path.sep}`)) read.push(path.basename(f, '.json'));
+    return orig.call(fs, file, ...rest);
+  };
+  try { return { result: fn(), read }; } finally { fs.readFileSync = orig; }
+}
+
+test('#45 actionView: 索引の openActionCount が 0 のページは読まない', () => {
+  fresh();
+  const { A, B, C, D } = mkActions();
+  assert.strictEqual(row(C.id).actionCount, 2, '前提: C は todo を持つ');
+  assert.strictEqual(row(C.id).openActionCount, 0, '前提: C の todo は全部完了');
+  const { result, read } = readingPages(() => store.actionView({}));
+  assert.deepStrictEqual(new Set(read), new Set([A.id, B.id]), `読んだページ: ${read.join(',')}`);
+  assert.ok(!read.includes(C.id), '完了だけのページを読んでいる');
+  assert.ok(!read.includes(D.id), 'todo の無いページを読んでいる');
+  assert.strictEqual(result.total, 3);
+});
+
+test('#45 actionView: 行の形と並びは openActions と同じ（期限が近い順、期限なしは末尾）', () => {
+  fresh();
+  const { A, B } = mkActions();
+  const { actions, people, total } = store.actionView({});
+  assert.deepStrictEqual(actions, [
+    { pageId: B.id, blockId: 'b1', pageTitle: 'キックオフ', date: '2026-09-01', text: '会場を、予約する', assignee: '山田', due: '2026-09-01', dueRaw: '来週', dueApprox: true },
+    { pageId: A.id, blockId: 'a1', pageTitle: '週次定例', date: '2026-09-08', text: 'ＡＩ資料を送る', assignee: '山田', due: '2026-09-10', dueRaw: '9/10', dueApprox: false },
+    { pageId: A.id, blockId: 'a2', pageTitle: '週次定例', date: '2026-09-08', text: '見積を作る', assignee: '佐藤', due: '', dueRaw: '', dueApprox: false },
+  ]);
+  assert.deepStrictEqual(people, [{ name: '山田', count: 2 }, { name: '佐藤', count: 1 }], '未完了件数の降順でない');
+  assert.strictEqual(total, 3);
+  // 既存の openActions / assigneeList は残り、同じ中身を返す
+  assert.deepStrictEqual(store.openActions(), actions);
+  assert.deepStrictEqual(store.assigneeList(), people);
+  // 引数なしでも同じ
+  assert.deepStrictEqual(store.actionView(), { actions, people, total });
+});
+
+test('#45 actionView: q は畳み込みで本文・議事録名・担当に当て、people と total は絞る前の値', () => {
+  fresh();
+  const { A, B } = mkActions();
+  const ids = (r) => r.actions.map((x) => `${x.pageId}/${x.blockId}`);
+  let r = store.actionView({ q: 'ai資料' });   // 全角・大文字の違いを越える
+  assert.deepStrictEqual(ids(r), [`${A.id}/a1`]);
+  assert.deepStrictEqual(r.people, [{ name: '山田', count: 2 }, { name: '佐藤', count: 1 }], '絞ったら people が変わった');
+  assert.strictEqual(r.total, 3, '絞ったら total が変わった');
+  r = store.actionView({ q: '会場を予約' });    // 読点をまたぐ
+  assert.deepStrictEqual(ids(r), [`${B.id}/b1`]);
+  r = store.actionView({ q: 'キックオフ' });   // 議事録名
+  assert.deepStrictEqual(ids(r), [`${B.id}/b1`]);
+  r = store.actionView({ q: '山田' });         // 担当
+  assert.deepStrictEqual(ids(r), [`${B.id}/b1`, `${A.id}/a1`]);
+  r = store.actionView({ q: '存在しない語' });
+  assert.deepStrictEqual(ids(r), []);
+  assert.strictEqual(r.total, 3);
+  r = store.actionView({ q: '、。' });          // 記号だけは絞らない
+  assert.strictEqual(r.actions.length, 3);
+});
+
+test('#45 actionView: assignee は完全一致で絞り、q と重ねられる', () => {
+  fresh();
+  const { A, B } = mkActions();
+  const ids = (r) => r.actions.map((x) => `${x.pageId}/${x.blockId}`);
+  let r = store.actionView({ assignee: '佐藤' });
+  assert.deepStrictEqual(ids(r), [`${A.id}/a2`]);
+  assert.strictEqual(r.total, 3);
+  assert.deepStrictEqual(r.people, [{ name: '山田', count: 2 }, { name: '佐藤', count: 1 }]);
+  r = store.actionView({ assignee: '山' });   // 部分一致では絞らない
+  assert.deepStrictEqual(ids(r), []);
+  r = store.actionView({ assignee: '山田', q: '会場' });
+  assert.deepStrictEqual(ids(r), [`${B.id}/b1`]);
+  r = store.actionView({ assignee: '佐藤', q: '会場' });
+  assert.deepStrictEqual(ids(r), []);
+  r = store.actionView({ assignee: '' });   // 空は「全員」
+  assert.strictEqual(r.actions.length, 3);
+});
+
+test('#45 actionView: 未完了が無ければ空（ページは1つも読まない）', () => {
+  fresh();
+  store.createPage({ title: 't', segments: [], blocks: [todo('c1', '済んだ作業', { checked: true })] });
+  const { result, read } = readingPages(() => store.actionView({ q: 'x' }));
+  assert.deepStrictEqual(result, { actions: [], people: [], total: 0 });
+  assert.deepStrictEqual(read, []);
+});

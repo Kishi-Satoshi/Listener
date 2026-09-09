@@ -435,42 +435,67 @@ function searchFullText(query, limit) {
   return { hits, total, truncated: total > hits.length };
 }
 
-// 全ページ横断の未完了アクションアイテム
-function openActions() {
-  const out = [];
+// ---------------------------------------------------------------- 未完了アクション
+// アクションタブの1行。page.json の todo ブロックから画面に要る分だけ写す
+function actionRow(page, b) {
+  return {
+    pageId: page.id, blockId: b.id, pageTitle: page.title, date: page.date,
+    text: b.text, assignee: b.assignee || '', due: b.due || '',
+    dueRaw: b.dueRaw || '', dueApprox: Boolean(b.dueApprox),
+  };
+}
+
+// 期限が近い順。期限なしは末尾へ回す（無期限を先頭に出しても行動につながらない）
+function byDue(a, b) {
+  if (a.due && b.due) return a.due.localeCompare(b.due);
+  if (a.due) return -1;
+  if (b.due) return 1;
+  return String(b.date).localeCompare(String(a.date));
+}
+
+// アクションタブの1画面分を1回の走査で作る（#45）。
+// 以前は1打鍵ごとに openActions()（全 todo 持ちページを読む）と assigneeList()
+// （その中でもう一度 openActions()）の IPC 2本を呼び、500 ページで同期ディスク読み
+// 1000 回になっていた。ここでは
+//   - 索引の openActionCount が 0 のページ（完了だけ・todo 無し）は読まない
+//   - 行（actions）・担当者の一覧（people）・件数（total）を1度に返す
+// people の count と total は q / assignee で絞る前の未完了件数（絞ってもチップの
+// 数字が変わらない）。q は searchFold で畳んで本文・議事録名・担当に当て、assignee は
+// 完全一致（チップで選ぶ名前なので部分一致は要らない）。
+function actionView({ q, assignee } = {}) {
+  const fq = searchFold(q);
+  const who = String(assignee || '');
+  const counts = new Map();
+  const actions = [];
+  let total = 0;
   for (const entry of index.pages) {
-    if (!entry.actionCount) continue;
+    if (!entry.openActionCount) continue;
     const page = getPage(entry.id);
     if (!page) continue;
     for (const b of page.blocks) {
-      if (b.type === 'todo' && !b.checked && b.text) {
-        out.push({
-          pageId: page.id, blockId: b.id, pageTitle: page.title, date: page.date,
-          text: b.text, assignee: b.assignee || '', due: b.due || '',
-          dueRaw: b.dueRaw || '', dueApprox: Boolean(b.dueApprox),
-        });
-      }
+      if (b.type !== 'todo' || b.checked || !b.text) continue;
+      const row = actionRow(page, b);
+      total++;
+      if (row.assignee) counts.set(row.assignee, (counts.get(row.assignee) || 0) + 1);
+      if (who && row.assignee !== who) continue;
+      if (fq && ![row.text, row.pageTitle, row.assignee].some((s) => searchFold(s).includes(fq))) continue;
+      actions.push(row);
     }
   }
-  // 期限が近い順。期限なしは末尾へ回す（無期限を先頭に出しても行動につながらない）
-  out.sort((a, b) => {
-    if (a.due && b.due) return a.due.localeCompare(b.due);
-    if (a.due) return -1;
-    if (b.due) return 1;
-    return String(b.date).localeCompare(String(a.date));
-  });
-  return out;
+  actions.sort(byDue);
+  const people = [...counts.entries()].map(([name, count]) => ({ name, count }))
+    .sort((x, y) => y.count - x.count);
+  return { actions, people, total };
 }
 
-// 未完了アクションに登場する担当者の一覧（絞り込み用）
+// 全ページ横断の未完了アクションアイテム（actionView の行だけ）
+function openActions() {
+  return actionView().actions;
+}
+
+// 未完了アクションに登場する担当者の一覧（絞り込み用。actionView の people だけ）
 function assigneeList() {
-  const counts = new Map();
-  for (const a of openActions()) {
-    if (!a.assignee) continue;
-    counts.set(a.assignee, (counts.get(a.assignee) || 0) + 1);
-  }
-  return [...counts.entries()].map(([name, count]) => ({ name, count }))
-    .sort((x, y) => y.count - x.count);
+  return actionView().people;
 }
 
 // ---------------------------------------------------------------- 進行中ドラフト
@@ -485,6 +510,6 @@ module.exports = {
   listPages, getPage, getTranscript, savePage, saveTranscript,
   createPage, deletePage,
   updateBlock, updateSegment, insertBlock, removeBlock, moveBlock, setTitle,
-  searchIndex, searchFullText, openActions, assigneeList,
+  searchIndex, searchFullText, actionView, openActions, assigneeList,
   readDraft, writeDraft, clearDraft,
 };
