@@ -20,6 +20,9 @@
     "electron": "^31.3.0",
     "electron-builder": "^24.13.3"
   },
+  "engines": {
+    "electron": ">=31.3.0"
+  },
   "build": {
     "appId": "local.listener.app",
     "productName": "Listener",

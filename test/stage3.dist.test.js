@@ -137,3 +137,16 @@ test('#33 installer が失敗したら draft のまま残し、要約に赤い�
   // draft の間はアプリの更新確認に前の版が出続ける、という注意が YAML に書いてある
   assert.ok(/releases\/latest/.test(yml) && /前の版/.test(yml), 'draft の間は前の版が latest のまま、という注意が無い');
 });
+
+// ---------------------------------------------------------------- #34 互換ゲート
+test('#34 package.json の engines.electron が devDependencies.electron と揃い、updater が読める形である', () => {
+  const pkg = JSON.parse(read('package.json'));
+  const range = pkg.engines && pkg.engines.electron;
+  assert.ok(range, 'package.json に engines.electron が無い（更新 zip が必要とする Electron を誰も見ない）');
+  const m = String(range).match(/^>=(\d+\.\d+\.\d+)$/);
+  assert.ok(m, `engines.electron は ">=x.y.z" の形にする（updater.satisfiesRange が読める形）: ${range}`);
+  const dev = String(pkg.devDependencies.electron).replace(/^\^/, '');
+  assert.strictEqual(m[1], dev, 'engines.electron と devDependencies.electron の版が揃っていない');
+  const { satisfiesRange } = require('../src/updater');
+  assert.strictEqual(satisfiesRange(dev, range), true, '同梱している Electron 自身が engines を満たさない');
+});

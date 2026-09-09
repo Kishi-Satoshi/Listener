@@ -253,6 +253,12 @@ powershell -ExecutionPolicy Bypass -File .\make-release.ps1 -Version 0.8.1
 適用前に現行の `src/` を `src.backup-*` として退避するので、
 展開に失敗しても起動できなくなることはありません（1世代だけ残します）。
 
+更新 zip では exe（Electron 本体）は入れ替わりません。zip の `package.json` の
+`engines.electron`（例: `>=31.3.0`）を `src/` を差し替える**前に**確かめ、今の Electron が
+満たさなければ「更新 x.y.z には Electron >=… が必要です。インストーラーで入れ直してください」
+で止めます（何も書き換えません）。Electron を上げる版を出すときは `devDependencies.electron`
+と `engines.electron` を一緒に上げ、インストーラーで入れ直してもらう前提で案内してください。
+
 ## デグレを止める仕組み
 
 実機でしか見つからない不具合を5件続けて出したため、機械で止める層を入れています。

@@ -261,3 +261,115 @@ test('apply() は落とせないときも既存の src を壊さない', async (
   assert.strictEqual(r.ok, false);
   assert.ok(fs.readFileSync(path.join(appRoot, 'src', 'main.js'), 'utf8').includes('無事であること'));
 });
+
+// ---------------------------------------------------------------- #34 互換ゲート
+test('#34 satisfiesRange は >=x.y.z / ^x.y.z / x.y.z / 空 だけを支える', () => {
+  const s = updater.satisfiesRange;
+  assert.strictEqual(typeof s, 'function', 'satisfiesRange が export されていない');
+  // >=
+  assert.strictEqual(s('31.3.0', '>=31.3.0'), true);
+  assert.strictEqual(s('32.0.0', '>=31.3.0'), true);
+  assert.strictEqual(s('31.2.9', '>=31.3.0'), false);
+  assert.strictEqual(s('30.9.9', '>=31.3.0'), false);
+  assert.strictEqual(s('31.10.0', '>=31.9.0'), true, '文字列比較で誤らない');
+  // ^（同じメジャーの範囲。0.x はマイナーまで固定）
+  assert.strictEqual(s('31.3.0', '^31.3.0'), true);
+  assert.strictEqual(s('31.9.9', '^31.3.0'), true);
+  assert.strictEqual(s('32.0.0', '^31.3.0'), false);
+  assert.strictEqual(s('31.2.9', '^31.3.0'), false);
+  assert.strictEqual(s('0.5.3', '^0.5.1'), true);
+  assert.strictEqual(s('0.6.0', '^0.5.1'), false);
+  assert.strictEqual(s('0.0.3', '^0.0.3'), true);
+  assert.strictEqual(s('0.0.4', '^0.0.3'), false);
+  // 完全一致
+  assert.strictEqual(s('31.3.0', '31.3.0'), true);
+  assert.strictEqual(s('31.3.1', '31.3.0'), false);
+  // 空 = 制約なし
+  assert.strictEqual(s('31.3.0', ''), true);
+  assert.strictEqual(s('31.3.0', undefined), true);
+  assert.strictEqual(s('31.3.0', null), true);
+  // 前後の空白・v 接頭辞・プレリリース付きの実行版
+  assert.strictEqual(s('v31.3.0', ' >=31.3.0 '), true);
+  assert.strictEqual(s('32.0.0-beta.1', '>=31.3.0'), true);
+  // 支えない書き方は「満たさない」（黙って通すと門が無いのと同じになる）
+  assert.strictEqual(s('31.3.0', '>=31.3.0 <33.0.0'), false);
+  assert.strictEqual(s('31.3.0', '~31.3.0'), false);
+  assert.strictEqual(s('31.3.0', '>=31'), false);
+  assert.strictEqual(s('', '>=31.3.0'), false, '版が取れないのに満たす扱いにしない');
+});
+
+test('#34 apply() は zip の engines.electron を満たさなければ src を触らず失敗し、満たせば今まで通り適用する',
+  { skip: !CAN_PACK && 'zip コマンドが無い' }, async (t) => {
+    const { packDir } = require('./helpers/pack');
+    const filler = () => require('node:crypto').randomBytes(1200).toString('hex');
+    // 実物と同じ構成（zip 直下に src/ と package.json）の zip を、engines だけ変えて作る
+    const mkZip = (name, pkg) => {
+      const stage = path.join(work, `${name}-stage`);
+      fs.rmSync(stage, { recursive: true, force: true });
+      fs.mkdirSync(path.join(stage, 'src', 'renderer'), { recursive: true });
+      for (const f of ['main.js', 'preload.js']) fs.writeFileSync(path.join(stage, 'src', f), `// ${f} 新版\n// ${filler()}`);
+      fs.writeFileSync(path.join(stage, 'src', 'renderer', 'app.html'), `<!doctype html>\n<!-- ${filler()} -->`);
+      fs.writeFileSync(path.join(stage, 'package.json'), JSON.stringify(pkg, null, 2), 'utf8');
+      return fs.readFileSync(packDir(stage, path.join(work, `${name}.zip`)));
+    };
+    const zips = {
+      '/need32.zip': mkZip('eng-need32', { name: 'listener', version: '9.9.9', engines: { electron: '>=32.0.0' } }),
+      '/need31.zip': mkZip('eng-need31', { name: 'listener', version: '9.9.9', engines: { electron: '>=31.0.0' } }),
+      '/none.zip': mkZip('eng-none', { name: 'listener', version: '9.9.9' }),
+    };
+    const server = http.createServer((req, res) => {
+      const b = zips[req.url];
+      if (!b) { res.writeHead(404); res.end(); return; }
+      res.writeHead(200); res.end(b);
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    t.after(() => server.close());
+    const url = (p) => `http://127.0.0.1:${server.address().port}${p}`;
+
+    const mkApp = (name) => {
+      const appRoot = path.join(work, name);
+      fs.mkdirSync(path.join(appRoot, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(appRoot, 'src', 'main.js'), '// 旧版のまま残るべき');
+      fs.writeFileSync(path.join(appRoot, 'package.json'),
+        JSON.stringify({ name: 'listener', version: '0.7.0', main: 'src/main.js' }, null, 2), 'utf8');
+      return appRoot;
+    };
+    const mainOf = (appRoot) => fs.readFileSync(path.join(appRoot, 'src', 'main.js'), 'utf8');
+    const versionOf = (appRoot) => JSON.parse(fs.readFileSync(path.join(appRoot, 'package.json'), 'utf8')).version;
+    const backupsOf = (appRoot) => fs.readdirSync(appRoot).filter((d) => d.startsWith('src.backup-'));
+
+    // --- 満たさない: src も package.json も触らない。バックアップも作らない ---
+    const a1 = mkApp('app-eng-ng');
+    const progress = [];
+    const r1 = await updater.apply(url('/need32.zip'), a1, work, (m) => progress.push(m), { electronVersion: '31.3.0' });
+    assert.strictEqual(r1.ok, false, '必要な Electron を満たさない zip を適用してしまった（起動不能になる）');
+    assert.strictEqual(r1.error,
+      '更新 9.9.9 には Electron >=32.0.0 が必要です（今は 31.3.0）。インストーラーで入れ直してください');
+    assert.ok(mainOf(a1).includes('旧版のまま残るべき'), 'src が差し替わっている');
+    assert.strictEqual(versionOf(a1), '0.7.0', 'package.json の version が進んでいる');
+    assert.deepStrictEqual(backupsOf(a1), [], '差し替えていないのにバックアップができている');
+    assert.ok(!progress.includes('適用しています…'), '差し替えの段階に進んでいる');
+
+    // --- 満たす: 今まで通り適用される ---
+    const a2 = mkApp('app-eng-ok');
+    const r2 = await updater.apply(url('/need31.zip'), a2, work, () => {}, { electronVersion: '31.3.0' });
+    assert.strictEqual(r2.ok, true, r2.error);
+    assert.ok(mainOf(a2).includes('新版'), 'src が差し替わっていない');
+    assert.strictEqual(versionOf(a2), '9.9.9');
+    assert.strictEqual(backupsOf(a2).length, 1);
+
+    // --- engines の無い zip: 今まで通り ---
+    const a3 = mkApp('app-eng-none');
+    const r3 = await updater.apply(url('/none.zip'), a3, work, () => {}, { electronVersion: '31.3.0' });
+    assert.strictEqual(r3.ok, true, r3.error);
+    assert.ok(mainOf(a3).includes('新版'));
+
+    // --- Electron の外（版が取れない）では検査しない: 省略時も明示 undefined も ---
+    assert.strictEqual(process.versions.electron, undefined, 'このテストは Node で走る前提');
+    const a4 = mkApp('app-eng-node');
+    const r4 = await updater.apply(url('/need32.zip'), a4, work, () => {});
+    assert.strictEqual(r4.ok, true, r4.error);
+    const a5 = mkApp('app-eng-undef');
+    const r5 = await updater.apply(url('/need32.zip'), a5, work, () => {}, { electronVersion: undefined });
+    assert.strictEqual(r5.ok, true, r5.error);
+  });
