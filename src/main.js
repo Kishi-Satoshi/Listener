@@ -43,7 +43,7 @@ const {
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs, nextSegmentMs, EtaTracker,
   skipPendingSegments, restoreAfterPaste,
-  planDataMove, sameTree, estimateTokens, foldNotes,
+  planDataMove, sameTree, estimateTokens, foldNotes, idleEnginesToStop,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -317,10 +317,14 @@ function buildPrompt(extraTail) { return promptParts(extraTail).prompt; }
 
 // ---------------------------------------------------------------- エンジン管理
 function makeEngine(name) {
-  return { name, proc: null, ready: false, lastError: '', readyPromise: null, startPromise: null, sig: '', stderrTail: '', stopping: false };
+  // lastUsed: 起動時と推論のたびの時刻。使われないまま engineIdleMin 分たったら止める（#58）
+  return { name, proc: null, ready: false, lastError: '', readyPromise: null, startPromise: null, sig: '', stderrTail: '', stopping: false, lastUsed: 0 };
 }
 const whisperEng = makeEngine('文字起こしエンジン');
 const sumEng = makeEngine('要約エンジン');
+const touchEngine = (eng) => { eng.lastUsed = Date.now(); };
+// 起動・終了・停止のたびにトレイ（「エンジンを停止」の有効／無効）を追随させる。終了中は触らない
+function engineChanged() { if (!quitting) updateTray(); }
 
 function engineLog(line) {
   try {
@@ -444,6 +448,8 @@ function startEngine(eng) {
       eng.lastError = `${eng.name}を起動できません: ${e.message}`; engineLog(eng.lastError); return;
     }
     eng.proc = p;
+    eng.lastUsed = Date.now();
+    engineChanged();
     // 以下のハンドラは「自分が起動したプロセス」のときだけ状態を触る（#57）。
     // 再起動のあとに古いプロセスの exit が届き、新しいプロセスを null にしていた。
     p.stderr.on('data', (d) => {
@@ -463,6 +469,7 @@ function startEngine(eng) {
         engineLog(eng.lastError);
       }
       eng.proc = null; eng.ready = false; eng.readyPromise = null;
+      engineChanged();
     });
   })().finally(() => { eng.startPromise = null; });
   return eng.startPromise;
@@ -471,6 +478,24 @@ function startEngine(eng) {
 function stopEngine(eng) {
   if (eng.proc) { eng.stopping = true; try { eng.proc.kill(); } catch (_) { /* noop */ } eng.proc = null; }
   eng.ready = false; eng.readyPromise = null;
+  engineChanged();
+}
+
+// 使われないエンジンを止める（#58）。60 秒ごとに呼ぶ。判断は mainlib.idleEnginesToStop
+// （手が空いていて、起動していて、engineIdleMin 分使われていない。0 = 止めない）。
+// 次に使うときは ensureEngineReady が起動し直す
+const ENGINE_IDLE_CHECK_MS = 60000;
+function releaseIdleEngines() {
+  for (const eng of idleEnginesToStop([whisperEng, sumEng], Date.now(), settings.engineIdleMin, isBusy())) {
+    engineLog(`${eng.name}: ${settings.engineIdleMin} 分使われていないため停止（メモリを解放）`);
+    stopEngine(eng);
+  }
+}
+// トレイの「エンジンを停止（メモリを解放）」。次に使うときは起動し直す
+function stopEnginesFromTray() {
+  if (isBusy()) return;
+  engineLog('トレイからエンジンを停止（メモリを解放）');
+  stopEngine(whisperEng); stopEngine(sumEng);
 }
 
 function ensureEngineReady(eng) {
@@ -548,8 +573,10 @@ async function transcribeLocal(wavBuffer, extraPromptTail, durationMs) {
   // トレードオフ: エンジンが応答しないままハングした場合、この時間まで
   // 待ち続ける（議事録は「破棄」で抜けられる）。喪失よりは待ちを選ぶ。
   const waitMs = Math.min(1800000, Math.max(240000, Math.round(durationMs || 0) * 5 + 60000));
+  touchEngine(whisperEng);
   const res = await fetch(`http://127.0.0.1:${settings.localPort}/inference`,
     { method: 'POST', body: form, signal: AbortSignal.timeout(waitMs) });
+  touchEngine(whisperEng);
   if (!res.ok) {
     let detail = '';
     try { detail = (await res.json())?.error || ''; } catch (_) { /* noop */ }
@@ -570,6 +597,7 @@ async function llmChat(messages, maxTokens, onWait) {
   let res;
   let waited = false;
   const deadline = Date.now() + 120000;
+  touchEngine(sumEng);
   for (;;) {
     res = await fetch(`http://127.0.0.1:${settings.sumPort}/v1/chat/completions`, {
       method: 'POST',
@@ -577,6 +605,7 @@ async function llmChat(messages, maxTokens, onWait) {
       body: JSON.stringify({ messages, temperature: 0.2, max_tokens: maxTokens }),
       signal: AbortSignal.timeout(900000),
     });
+    touchEngine(sumEng);
     if (res.status !== 503 || Date.now() >= deadline) break;
     if (!waited && onWait) {
       waited = true;
@@ -1149,6 +1178,7 @@ async function transcribeRecovered() {
   let q = recoveryQueue;
   if (!q) return;
   recoveryRunning = true;
+  updateTray();   // 復旧中は「手が塞がっている」（isBusy）。トレイの有効／無効を追随させる
   try {
     const seen = new Set();   // 同じ待ち行列を二度拾わない（recovery.json を消せなかったとき）
     while (q && !seen.has(q.dir)) {
@@ -1167,6 +1197,7 @@ async function transcribeRecovered() {
     }
   } finally {
     recoveryRunning = false;
+    updateTray();
   }
 }
 async function transcribeRecoveredItems(q) {
@@ -1252,7 +1283,9 @@ function startMeeting() {
   state = 'meeting';
   writeDraft();
   ensureEngineReady(whisperEng);
-  if (engineValid(sumEng)) startEngine(sumEng);
+  // 要約エンジンはここで先読みしない（#58）。記録開始で起動すると約 3GB が上がり、破棄しても
+  // 降りない（記録だけして要約しない会議でも掴んだまま）。要約直前の ensureEngineReady(sumEng)
+  // （generateMinutes）に任せる。その分、最初の要約はモデル読み込みの待ちを含む
   positionOverlay();
   overlayWin.showInactive();
   // 音声入力の開始（上の 'dictation'）には systemAudio を渡さない。
@@ -1690,6 +1723,8 @@ function updateTray() {
   // アプリ内更新で直すこともできなくなる（実機で起きた）。
   // 復旧の手段が、壊れうるものに依存していてはいけない。
   items.push({ label: '更新を確認', enabled: state === 'idle' && !isSummarizing(), click: checkUpdateFromTray });
+  // エンジンを手で止めてメモリを解放する（#58）。どちらかが起動していて、手が空いているときだけ
+  items.push({ label: 'エンジンを停止（メモリを解放）', enabled: (Boolean(whisperEng.proc) || Boolean(sumEng.proc)) && !isBusy(), click: stopEnginesFromTray });
   items.push({ type: 'separator' });
   items.push({ label: '終了', click: quitFromTray });
   // 既定で代替している／登録できていないキーがあれば、その旨を添える
@@ -2072,6 +2107,8 @@ if (!gotLock) {
     }
     createTray();
     if (engineValid(whisperEng)) startEngine(whisperEng);
+    // 使われないエンジンを 60 秒ごとに見て止める（#58。判断は mainlib.idleEnginesToStop）
+    setInterval(releaseIdleEngines, ENGINE_IDLE_CHECK_MS);
     // 復旧ページに文字起こし待ちの音声が残っていれば、エンジンの用意を待って順に片付ける
     transcribeRecovered().catch((e) => engineLog(`復旧の文字起こしに失敗: ${e.message}`));
     ensurePaster();

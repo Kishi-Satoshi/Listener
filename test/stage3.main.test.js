@@ -246,3 +246,73 @@ test('#41 統合プロンプトが文脈長に収まらないときは要点メ�
   // llmChatP の呼び出しは 3 か所のまま（repo.test.js が数える）。畳みは extract を通る
   assert.strictEqual((gen.match(/await llmChatP\(/g) || []).length, 3);
 });
+
+// ---------------------------------------------------------------- #58 メモリ（判断）
+const { idleEnginesToStop } = require('../src/mainlib');
+const MIN = 60000;
+
+test('idleEnginesToStop: 手が空いていて、起動していて、idleMin 分使われていないエンジンだけを選ぶ', () => {
+  const now = 10_000_000;
+  const w = { name: 'w', proc: {}, lastUsed: now - 10 * MIN };
+  const s = { name: 's', proc: {}, lastUsed: now - 3 * MIN };
+  assert.deepStrictEqual(idleEnginesToStop([w, s], now, 10, false), [w]);
+  assert.deepStrictEqual(idleEnginesToStop([w, s], now, 3, false), [w, s], 'ちょうど idleMin 分でも止める');
+  assert.deepStrictEqual(idleEnginesToStop([w, s], now, 11, false), []);
+  // 忙しいときは何も止めない／0 = 止めない
+  assert.deepStrictEqual(idleEnginesToStop([w, s], now, 10, true), []);
+  assert.deepStrictEqual(idleEnginesToStop([w, s], now, 0, false), []);
+  assert.deepStrictEqual(idleEnginesToStop([w, s], now, -1, false), []);
+  assert.deepStrictEqual(idleEnginesToStop([w, s], now, 'x', false), []);
+});
+
+test('idleEnginesToStop: 起動していない・準備完了を待っている人がいる・使った時刻が無い エンジンは止めない', () => {
+  const now = 10_000_000;
+  const off = { name: 'off', proc: null, lastUsed: now - 60 * MIN };
+  const waiting = { name: 'wait', proc: {}, lastUsed: now - 60 * MIN, readyPromise: Promise.resolve(true) };
+  const unknown = { name: 'unk', proc: {} };
+  const idle = { name: 'idle', proc: {}, lastUsed: now - 60 * MIN, readyPromise: null };
+  assert.deepStrictEqual(idleEnginesToStop([off, waiting, unknown, idle, null], now, 10, false), [idle]);
+  assert.deepStrictEqual(idleEnginesToStop(undefined, now, 10, false), []);
+});
+
+// ---------------------------------------------------------------- #58 メモリ（結線）
+test('#58 記録開始で要約エンジンを先読みしない（要約直前の ensureEngineReady に任せる）', () => {
+  const m = code(main);
+  const start = fnBody(m, 'function startMeeting()', '\nfunction stopMeeting');
+  assert.ok(!start.includes('startEngine(sumEng)'), '記録開始で要約エンジンを起動している（約 3GB が上がったまま降りない）');
+  assert.ok(start.includes('ensureEngineReady(whisperEng)'), '文字起こしエンジンの用意まで消している');
+  assert.ok(fnBody(m, 'async function generateMinutes', '\nfunction ensurePaster').includes('await ensureEngineReady(sumEng)'), '要約直前に用意していない');
+  // 理由はコメントに残す
+  assert.ok(/3GB/.test(fnBody(main, 'function startMeeting()', '\nfunction stopMeeting')), '先読みをやめた理由（約 3GB）がコメントに無い');
+  // 起動時の whisper 先読みは今まで通り
+  assert.ok(fnBody(m, 'app.whenReady().then(', '\n  });').includes('if (engineValid(whisperEng)) startEngine(whisperEng);'));
+});
+
+test('#58 lastUsed は起動時と推論のたびに更新し、60 秒ごとに使われないエンジンを止める', () => {
+  const m = code(main);
+  assert.ok(fnBody(m, 'function makeEngine(name)', '\n}').includes('lastUsed: 0'), 'エンジンに lastUsed が無い');
+  assert.match(m, /const touchEngine = \(eng\) => \{ eng\.lastUsed = Date\.now\(\); \};/);
+  const start = fnBody(m, 'function startEngine(eng)', '\nfunction stopEngine');
+  assert.ok(/eng\.proc = p;\s*\n\s*eng\.lastUsed = Date\.now\(\);/.test(start), '起動時に lastUsed を入れていない');
+  assert.strictEqual((fnBody(m, 'async function transcribeLocal(', '\n}').match(/touchEngine\(whisperEng\)/g) || []).length, 2, '文字起こしの前後で lastUsed を更新していない');
+  assert.strictEqual((fnBody(m, 'async function llmChat(', '\n}').match(/touchEngine\(sumEng\)/g) || []).length, 2, '要約の前後で lastUsed を更新していない');
+  // 判断は mainlib.idleEnginesToStop。busy は isBusy()（idle・要約中でない・復旧中でない・待ち 0）
+  const rel = fnBody(m, 'function releaseIdleEngines()', '\n}');
+  assert.ok(rel.includes('idleEnginesToStop([whisperEng, sumEng], Date.now(), settings.engineIdleMin, isBusy())'), '判断を mainlib.idleEnginesToStop で行っていない');
+  assert.ok(rel.includes('stopEngine(eng)'), '止めていない');
+  assert.ok(rel.includes('engineLog('), '止めたことをログに残していない');
+  assert.match(m, /const ENGINE_IDLE_CHECK_MS = 60000;/);
+  assert.ok(fnBody(m, 'app.whenReady().then(', '\n  });').includes('setInterval(releaseIdleEngines, ENGINE_IDLE_CHECK_MS)'), '60 秒ごとに見ていない');
+});
+
+test('#58 トレイに「エンジンを停止（メモリを解放）」があり、起動中かつ手が空いているときだけ押せる', () => {
+  const m = code(main);
+  const tray = fnBody(m, 'function updateTray()', '\nfunction createTray');
+  assert.ok(tray.includes("label: 'エンジンを停止（メモリを解放）', enabled: (Boolean(whisperEng.proc) || Boolean(sumEng.proc)) && !isBusy(), click: stopEnginesFromTray"), 'トレイの項目が無いか条件が違う');
+  const fn = fnBody(m, 'function stopEnginesFromTray()', '\n}');
+  assert.ok(fn.includes('stopEngine(whisperEng)') && fn.includes('stopEngine(sumEng)'), '両方止めていない');
+  // 起動・終了・停止のたびにトレイの有効／無効を追随させる（終了中は触らない）
+  assert.match(m, /function engineChanged\(\) \{ if \(!quitting\) updateTray\(\); \}/);
+  assert.ok(fnBody(m, 'function stopEngine(eng)', '\n}').includes('engineChanged()'), '停止でトレイを更新していない');
+  assert.strictEqual((fnBody(m, 'function startEngine(eng)', '\nfunction stopEngine').match(/engineChanged\(\)/g) || []).length, 2, '起動と exit でトレイを更新していない');
+});

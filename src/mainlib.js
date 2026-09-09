@@ -565,6 +565,22 @@ function skipPendingSegments(segments) {
   return { count, wavs };
 }
 
+// ---------------------------------------------------------------- 使われないエンジンの停止（#58）
+// 要約エンジンは起動すると約 3GB を掴んだまま降りない。使われないまま idleMin 分たったら止め、
+// 次に使うとき（ensureEngineReady）に起動し直す。engines は main.js のエンジン { proc, lastUsed,
+// readyPromise }（proc: 起動中のプロセス、lastUsed: 起動時と推論のたびの時刻、readyPromise:
+// 準備完了を待っている人がいる印）。戻り値は止めてよいエンジンの配列。
+//   - busy（記録・文字起こし・要約・復旧のどれか）なら何も止めない
+//   - idleMin が 0 以下・数でないなら止めない（0 = 止めない）
+//   - 起動していない／待っている人がいる／使った時刻が無い エンジンは止めない
+function idleEnginesToStop(engines, now, idleMin, busy) {
+  const min = Number(idleMin);
+  if (busy || !(min > 0)) return [];
+  const limit = min * 60000;
+  return (engines || []).filter((e) => e && e.proc && !e.readyPromise
+    && Number.isFinite(e.lastUsed) && now - e.lastUsed >= limit);
+}
+
 // ---------------------------------------------------------------- データ保存先の移動（#29）
 // 移動は「写す → 確かめる → 設定を切り替える」で、元のフォルダは消さない（消すのは利用者）。
 // ここは移動先を受けるかの判断。拒む理由の一文を返し、通すなら ''。
@@ -625,5 +641,5 @@ module.exports = {
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
   nextSegmentMs, EtaTracker, skipPendingSegments,
   planDataMove, sameTree,
-  estimateTokens, foldNotes,
+  estimateTokens, foldNotes, idleEnginesToStop,
 };
