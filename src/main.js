@@ -923,6 +923,8 @@ function meetingStatus() {
     segments: meeting ? publicSegments(meeting.segments) : [],   // wav（パス）は外す。待ちは pending: true
     pending: pendingSegs,
     stoppedAt: meeting && meeting.stoppedAt ? meeting.stoppedAt : null,
+    // 終了を押した後（文字起こし待ち）。画面はこれを見て残り区間と打ち切りの導線を出す
+    stopping: Boolean(meeting && meeting.stopping),
     paused: Boolean(meeting && meeting.paused),
     pausedMs: meeting ? meeting.pausedMs + (meeting.paused ? Date.now() - meeting.pausedAt : 0) : 0,
     systemAudio: Boolean(meeting && meeting.systemAudio),
@@ -946,6 +948,29 @@ function writeDraft() {
 // 復旧ページで文字起こし待ちのまま残った音声 { pageId, items: [{ id, wav, durationMs }], dir }。
 // 起動が済んでエンジンが用意できてから順に文字起こしする
 let recoveryQueue = null;
+const RECOVERY_FILE = 'recovery.json';
+// 復旧の待ち行列をフォルダに書いておく。エンジンが用意できずに終えられなかったとき、
+// 次の起動や設定の直しで続きから文字起こしできる（wav は消さない）
+function saveRecoveryQueue(q) {
+  try { fs.writeFileSync(path.join(q.dir, RECOVERY_FILE), JSON.stringify({ pageId: q.pageId, items: q.items }), 'utf8'); } catch (_) { /* noop */ }
+}
+function loadSavedRecoveryQueue() {
+  let names = [];
+  try { names = fs.readdirSync(segbufRoot()); } catch (_) { return null; }
+  for (const name of names) {
+    const dir = path.join(segbufRoot(), name);
+    const f = path.join(dir, RECOVERY_FILE);
+    if (!fs.existsSync(f)) continue;
+    try {
+      const j = JSON.parse(fs.readFileSync(f, 'utf8'));
+      const items = (j.items || []).filter((it) => it && it.wav && fs.existsSync(it.wav));
+      if (j.pageId && items.length && store.getPage(j.pageId)) return { pageId: j.pageId, items, dir };
+      try { fs.unlinkSync(f); } catch (_) { /* noop */ }
+      removeDirIfEmpty(dir);
+    } catch (_) { /* noop */ }
+  }
+  return null;
+}
 function recoverDraftIfAny() {
   const d = store.readDraft();
   if (!d || !Array.isArray(d.segments) || d.segments.length === 0) { store.clearDraft(); return; }
@@ -971,24 +996,42 @@ function recoverDraftIfAny() {
   store.savePage(page);
   store.clearDraft();
   recoveredPageId = page.id;
-  if (rec.todo.length) recoveryQueue = { pageId: page.id, items: rec.todo, dir: segbufDir(d.startedAt) };
-  else removeDirIfEmpty(segbufDir(d.startedAt));
+  if (rec.todo.length) {
+    recoveryQueue = { pageId: page.id, items: rec.todo, dir: segbufDir(d.startedAt) };
+    saveRecoveryQueue(recoveryQueue);
+  } else removeDirIfEmpty(segbufDir(d.startedAt));
 }
 
 // 復旧ページの「文字起こし待ち」を、起動が済んでエンジンが用意できてから順に文字起こしし、
 // store.updateSegment で本文を差し替える（failed が外れて要約の材料に戻る）。
 // 失敗した区間は失敗の文を残す。ページが消されていたら残りの wav を捨てて止める。
 // 済んだ wav は消し、空になった退避フォルダも消す。
+let recoveryRunning = false;
 async function transcribeRecovered() {
+  if (recoveryRunning) return;
   const q = recoveryQueue;
-  recoveryQueue = null;
   if (!q) return;
-  const ready = await ensureEngineReady(whisperEng);
+  recoveryRunning = true;
+  try {
+    const ready = await ensureEngineReady(whisperEng);
+    if (!ready) {
+      // エンジンが未設定・未起動のときは何も消さない。wav と待ち行列（recovery.json）を残し、
+      // 設定を直したとき（settings:save）や次の起動でもう一度ここへ来る
+      engineLog(`復旧の文字起こしを保留: ${whisperEng.lastError || 'エンジンが起動していません'}`);
+      return;
+    }
+    recoveryQueue = null;
+    await transcribeRecoveredItems(q);
+  } finally {
+    recoveryRunning = false;
+  }
+}
+async function transcribeRecoveredItems(q) {
   let done = 0;
   for (const item of q.items) {
     if (!store.getPage(q.pageId)) { unlinkQuiet(item.wav); continue; }   // ページが消された
     let text = null;
-    let err = ready ? '' : (whisperEng.lastError || '文字起こしエンジンが起動していません');
+    let err = '';
     if (!err) {
       try {
         text = await transcribeLocal(fs.readFileSync(item.wav), '', item.durationMs);
@@ -1007,9 +1050,10 @@ async function transcribeRecovered() {
       removeTranscriptSegment(q.pageId, item.id);   // 無音: 区間ごと消す（記録中と同じ扱い）
       done++;
     }
-    // 成否にかかわらず消す。失敗した wav をもう一度試す経路は無く、7 日残しても使われない
+    // 推論まで到達した wav は成否にかかわらず消す（同じ音声を何度も失敗させても意味が無い）
     unlinkQuiet(item.wav);
   }
+  try { fs.unlinkSync(path.join(q.dir, RECOVERY_FILE)); } catch (_) { /* noop */ }
   removeDirIfEmpty(q.dir);
   const page = store.getPage(q.pageId);
   if (!page) return;
@@ -1053,7 +1097,9 @@ function startMeeting() {
     // gen: 打ち切り（meeting:skipPending）で進める世代。進行中の結果を捨てる判断に使う
     // segmentMs: いま録音側に頼んでいる区間の長さ（背圧で伸縮する）
     // inFlightSince: 文字起こし中の区間の開始時刻（残り時間の見積もりで経過分を引く）
-    gen: 0, skipped: 0, micFallback: false, segmentMs: (settings.segmentSec || 75) * 1000, inFlightSince: 0 };
+    // finalSeen: 録音側の最後の区間が届いたか。skipAll: 打ち切り後に届く区間も文字起こしせず数だけ残す
+    gen: 0, skipped: 0, micFallback: false, segmentMs: (settings.segmentSec || 75) * 1000, inFlightSince: 0,
+    finalSeen: false, skipAll: false };
   segChain = Promise.resolve(); pendingSegs = 0;
   state = 'meeting';
   writeDraft();
@@ -1139,6 +1185,19 @@ function onMeetingSegment(buffer, durationMs, isFinal) {
   const m = meeting;
   const segOffset = m.offsetMs;
   m.offsetMs += durationMs;
+  if (isFinal) m.finalSeen = true;
+  // 打ち切り（meeting:skipPending）の後に届いた区間（録音側で変換中だった最後の区間）は
+  // 文字起こしせず「打ち切り」として残す。黙って捨てると残り件数にも出ず、痕跡が無くなる
+  if (m.skipAll) {
+    if (buffer.byteLength >= 4000) {
+      m.segments.push({ id: `s${++m.seq}`, atMs: segOffset, durationMs, text: '（文字起こしを打ち切り）', failed: true });
+      m.skipped++;
+      writeDraft();
+    }
+    sendToMainWin('meeting:update', meetingStatus());
+    if (isFinal) maybeFinalizeMeeting().catch((e) => engineLog(`finalize failed: ${e.message}`));
+    return;
+  }
   // 短すぎる端切れ（無音の切れ端）は区間にしない。件数には数え、最後の区間なら締めの引き金にする
   let seg = null;
   if (buffer.byteLength >= 4000) {
@@ -1193,6 +1252,9 @@ function onMeetingSegment(buffer, durationMs, isFinal) {
 async function maybeFinalizeMeeting() {
   if (!meeting || !meeting.stopping || pendingSegs > 0) return;
   if (state !== 'meeting-finalizing') return;
+  // 打ち切りで待ち件数を 0 にしても、録音側が変換中の最後の区間はこれから届く。
+  // 先に締めると、その区間は議事録の無いところへ届いて消える（打ち切りの数にも入らない）
+  if (meeting.skipAll && !meeting.finalSeen) return;
   const m = meeting;
   meeting = null;
 
@@ -1560,6 +1622,8 @@ function setupIpc() {
     persistSettings();
     applyTheme();
     if (!guard.kept.length) restartEnginesIfNeeded();
+    // 保留していた復旧（エンジン未設定で止めていた分）を、設定が直った機会にもう一度試す
+    if (recoveryQueue) transcribeRecovered().catch((e) => engineLog(`復旧の文字起こしに失敗: ${e.message}`));
     if (settings.autoLaunch !== prevAutoLaunch) {
       try { app.setLoginItemSettings({ openAtLogin: settings.autoLaunch }); } catch (_) { /* noop */ }
     }
@@ -1647,6 +1711,17 @@ function setupIpc() {
     m.skipped += r.count;
     m.inFlightSince = 0;
     pendingSegs = 0;
+    // 録音側の最後の区間がまだ届いていなければ、届いてから締める（届いた区間も打ち切り扱い）。
+    // 録音側が落ちて最後が来ないときのために 60 秒で諦めて締める
+    m.skipAll = true;
+    if (!m.finalSeen) {
+      setTimeout(() => {
+        if (meeting === m && m.skipAll && !m.finalSeen) {
+          m.finalSeen = true;
+          maybeFinalizeMeeting().catch((e) => engineLog(`finalize failed: ${e.message}`));
+        }
+      }, 60000);
+    }
     writeDraft();
     sendToMainWin('meeting:update', meetingStatus());
     maybeFinalizeMeeting().catch((e) => engineLog(`finalize failed: ${e.message}`));
@@ -1748,7 +1823,10 @@ function setupIpc() {
   // 録音側が実際にどのマイクを掴んだか。設定のマイクが抜かれている・名前が
   // 変わっている等で要求と合わなかったときだけ「代替中」にする（#56）。
   ipcMain.on('overlay:mic', (_e, info) => {
-    if (meeting) meeting.micFallback = !!(info && info.requested && !info.matched);
+    // 音声入力（議事録なし）からも届く。議事録が無いのに meeting:update を送ると、
+    // 画面が「記録していない」状態として描き直し、走っている要約の進捗表示を消す
+    if (!meeting) return;
+    meeting.micFallback = !!(info && info.requested && !info.matched);
     sendToMainWin('meeting:update', meetingStatus());
   });
   ipcMain.on('overlay:source', (_e, { systemAudio, wanted }) => {
@@ -1780,6 +1858,7 @@ if (!gotLock) {
   app.whenReady().then(() => {
     loadStores();
     recoverDraftIfAny();
+    if (!recoveryQueue) recoveryQueue = loadSavedRecoveryQueue();   // 前回エンジンが無くて残した分
     cleanOrphanSegbuf(recoveryQueue ? recoveryQueue.dir : '');   // 復旧の後で（復旧中のフォルダは残す）
     applyTheme();
     setupIpc();

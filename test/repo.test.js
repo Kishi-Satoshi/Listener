@@ -978,7 +978,8 @@ test('#8/#42(1) 区間の音声は文字起こしの前にディスクへ退避�
 
 test('#8/#42(2) 復旧ページの「文字起こし待ち」は起動後に文字起こしして差し替え、古い退避フォルダは消す', () => {
   const m = code(main);
-  const fn = fnBody(m, 'async function transcribeRecovered()', '\n}');
+  // エンジンの用意待ち（transcribeRecovered）と区間ごとの処理（transcribeRecoveredItems）に分かれている
+  const fn = fnBody(m, 'async function transcribeRecovered()', '\n}') + fnBody(m, 'async function transcribeRecoveredItems(', '\n}');
   assert.ok(fn.includes('await ensureEngineReady(whisperEng)'), 'エンジンの用意を待っていない');
   assert.ok(fn.includes('store.updateSegment(q.pageId, item.id, { text })'), '成功した区間を store.updateSegment で差し替えていない（failed が残る）');
   assert.ok(fn.includes('unlinkQuiet(item.wav)'), '文字起こした wav を消していない');
@@ -1038,4 +1039,35 @@ test('#42(5) 終了後の文字起こし待ちは打ち切れる（meeting:skipP
   const on = fnBody(m, 'function onMeetingSegment(', '\nasync function maybeFinalizeMeeting');
   assert.ok((on.match(/m\.gen !== gen/g) || []).length >= 3, '列の中で世代を見ていない（打ち切った区間の結果が後から混ざる）');
   assert.ok(preload.includes("  meetingSkipPending: () => ipcRenderer.invoke('meeting:skipPending'),"), 'preload の meetingSkipPending が無い');
+});
+
+// ---------------------------------------------------------------- 第2段の統合レビューで見つかった取りこぼし
+test('meetingStatus は stopping を返す（画面の残り区間・打ち切りの導線がこれを見る）', () => {
+  const main = fs.readFileSync(path.join(ROOT, 'src', 'main.js'), 'utf8');
+  const body = main.slice(main.indexOf('function meetingStatus()'), main.indexOf('function meetingStatus()') + 1500);
+  assert.ok(/stopping:\s*Boolean\(meeting && meeting\.stopping\)/.test(body), 'meetingStatus に stopping が無い（画面の打ち切りボタンが一度も出ない）');
+});
+
+test('打ち切りの後に届く最後の区間を捨てない（届くまで締めず、届いた区間は打ち切りとして数える）', () => {
+  const main = fs.readFileSync(path.join(ROOT, 'src', 'main.js'), 'utf8');
+  assert.ok(main.includes('if (isFinal) m.finalSeen = true;'), '最後の区間の到着を記録していない');
+  assert.ok(main.includes('if (meeting.skipAll && !meeting.finalSeen) return;'), '打ち切り後、最後の区間が届く前に締めている');
+  assert.ok(main.includes("text: '（文字起こしを打ち切り）', failed: true });\n      m.skipped++;"), '打ち切り後に届いた区間を数えていない');
+});
+
+test('復旧の文字起こしは、エンジンが用意できないときに wav を消さず待ち行列を残す', () => {
+  const main = fs.readFileSync(path.join(ROOT, 'src', 'main.js'), 'utf8');
+  const body = main.slice(main.indexOf('async function transcribeRecovered()'), main.indexOf('async function transcribeRecoveredItems('));
+  assert.ok(/if \(!ready\) \{[\s\S]*?return;/.test(body), 'エンジン未準備で return していない');
+  assert.ok(!/unlink/.test(body), 'エンジン未準備の経路で wav を消している');
+  assert.ok(main.includes('saveRecoveryQueue(recoveryQueue)'), '待ち行列を recovery.json に残していない');
+  assert.ok(main.includes('recoveryQueue = loadSavedRecoveryQueue()'), '起動時に残した待ち行列を拾っていない');
+  assert.ok(/if \(recoveryQueue\) transcribeRecovered\(\)/.test(main), '設定を直したときに復旧を再開していない');
+});
+
+test("overlay:mic は議事録が無いとき meeting:update を送らない（要約中の進捗表示を消さない）", () => {
+  const main = fs.readFileSync(path.join(ROOT, 'src', 'main.js'), 'utf8');
+  const i = main.indexOf("ipcMain.on('overlay:mic'");
+  const body = main.slice(i, i + 500);
+  assert.ok(/if \(!meeting\) return;/.test(body), 'overlay:mic に議事録なしのガードが無い');
 });

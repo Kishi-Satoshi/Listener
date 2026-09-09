@@ -685,7 +685,8 @@ test('アクション横断ビューの絞り込みは、句読点の違いを�
 
 // ================= 作成中の進捗と打ち切り（#8 / #42） =================
 // 終了後の文字起こしが長いと、何分待てばよいか分からず、途中で諦める手段も無かった。
-const 作成中 = (extra) => Object.assign({ active: true, finalizing: true, stopping: true, pending: 3, etaSec: 150, startedAt: Date.now() - 60000, stoppedAt: Date.now(), segments: [] }, extra);
+// main の meetingStatus() が返す形に揃える（stopping を含む）。finalizing だけの古い形でも出ることは別のテストで見る
+const 作成中 = (extra) => Object.assign({ active: true, finalizing: true, stopping: true, pending: 3, etaSec: 150, skipped: 0, micFallback: false, startedAt: Date.now() - 60000, stoppedAt: Date.now(), segments: [] }, extra);
 const バー = (l, id) => l.document.getElementById(id);
 
 test('作成中は残りの区間数と見込み時間が出て、打ち切りボタンは確認のうえ meetingSkipPending を呼ぶ', async () => {
@@ -842,4 +843,24 @@ test('記録中の文字起こし面で、まだ文字起こしされていな�
   assert.ok(rows[1].classList.contains('pending'));
   assert.ok(!/文字起こし中/.test(rows[0].textContent));
   assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('作成中の残り区間と打ち切りは、main が返す finalizing だけでも出る（stopping が無い形でも空振りしない）', async () => {
+  const st = { active: true, finalizing: true, pending: 2, etaSec: 150, skipped: 0, micFallback: false, startedAt: Date.now() - 60000, stoppedAt: Date.now(), segments: [] };
+  const l = await load(APP, { preloadSrc: preloadWith('meetingSkipPending', 'promptInfo'), returns: { meetingStatus: () => st } });
+  l.fire('onMeetingUpdate', st);
+  await l.drain();
+  assert.ok(!バー(l, 'liveEta').hidden, '残りの区間数が出ない（stopping にだけ頼っている）');
+  assert.ok(!バー(l, 'liveSkipBtn').hidden, '打ち切りボタンが出ない');
+  assert.deepStrictEqual(l.errors.map(fmt), []);
+});
+
+test('設定の保存では数値の項目を数で送る（文字列で送ると main の applied が毎回それを「保ったキー」として返す）', async () => {
+  const l = await load(APP);
+  l.byId.get('tabSettings').dispatchEvent({ type: 'change' });
+  await l.drain();
+  const sent = l.called('saveSettings')[0].args[0];
+  for (const k of ['localThreads', 'localPort', 'sumThreads', 'sumPort', 'segmentSec']) {
+    assert.strictEqual(typeof sent[k], 'number', `${k} が数でなく ${typeof sent[k]} で送られている`);
+  }
 });

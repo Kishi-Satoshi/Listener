@@ -1531,7 +1531,8 @@
   // 長い会議だと終了後の変換に何分もかかり、待つべきか分からず強制終了されていた
   //（区間ごと失われる）。残りと見込みを出し、諦めるなら要約だけ進められるようにする。
   function renderLiveNotes(st) {
-    const waiting = Boolean(st.stopping) && st.pending > 0;   // 終了後に、まだ変換していない区間がある
+    // 終了後に、まだ変換していない区間がある。main は stopping を返すが、古い版と組んだときのため finalizing も見る
+    const waiting = Boolean(st.stopping || st.finalizing) && st.pending > 0;
     const etaKnown = typeof st.etaSec === 'number' && Number.isFinite(st.etaSec);
     const etaEl = $('liveEta');
     etaEl.hidden = !waiting;
@@ -1839,18 +1840,18 @@
     const next = {
       localServerExe: $('localServerExe').value.trim(),
       localModelPath: $('localModelPath').value.trim(),
-      localThreads: $('localThreads').value.trim() || 4,
-      localPort: $('localPort').value.trim() || 8990,
+      localThreads: parseInt($('localThreads').value, 10) || 4,
+      localPort: parseInt($('localPort').value, 10) || 8990,
       vadModelPath: $('vadModelPath').value.trim(),
       useVad: $('useVad').checked,
       suppressNst: $('suppressNst').checked,
       sumServerExe: $('sumServerExe').value.trim(),
       sumModelPath: $('sumModelPath').value.trim(),
-      sumThreads: $('sumThreads').value.trim() || 4,
-      sumPort: $('sumPort').value.trim() || 8991,
+      sumThreads: parseInt($('sumThreads').value, 10) || 4,
+      sumPort: parseInt($('sumPort').value, 10) || 8991,
       hotkey: $('hotkey').value.trim() || 'Control+Shift+Space',
       meetingHotkey: $('meetingHotkey').value.trim() || 'Alt+M',
-      segmentSec: $('segmentSec').value.trim() || 75,
+      segmentSec: parseInt($('segmentSec').value, 10) || 75,
       pillPos: $('pillPos').value,
       micId: $('micSelect').value,
       language: $('language').value,
