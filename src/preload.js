@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('koeOverlay', {
   onCancel: (cb) => ipcRenderer.on('overlay:cancel', (_e, p) => cb(p)),
   onPhase: (cb) => ipcRenderer.on('overlay:phase', (_e, p) => cb(p)),
   onTick: (cb) => ipcRenderer.on('overlay:tick', () => cb()),
+  onSegmentMs: (cb) => ipcRenderer.on('overlay:segment-ms', (_e, ms) => cb(ms)),
   sendAudio: (buffer, mimeType, durationMs) => ipcRenderer.send('audio:done', { buffer, mimeType, durationMs }),
   sendSegment: (buffer, durationMs, final) => ipcRenderer.send('audio:segment', { buffer, durationMs, final }),
   sendError: (message) => ipcRenderer.send('audio:error', { message }),

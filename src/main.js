@@ -41,7 +41,7 @@ const {
   pasterScript, copyCommand,
   engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
-  publicSegments, settledSegments, recoverSegments, staleSegbufDirs,
+  publicSegments, settledSegments, recoverSegments, staleSegbufDirs, nextSegmentMs,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -891,6 +891,17 @@ function settleSegment(m, seg, patch) {
   sendToMainWin('meeting:update', meetingStatus());
 }
 
+// 文字起こしが追いつかないとき（待ちが 3 区間を超える）は区間を倍に伸ばして送る回数を
+// 減らし、追いついたら（待ち 1 以下）設定の長さに戻す（判断は mainlib.nextSegmentMs。#42）。
+// 変わったときだけオーバーレイへ送る（次の区切りから効く）
+function applyBackpressure(m, delta) {
+  const base = (settings.segmentSec || 75) * 1000;
+  const next = nextSegmentMs(pendingSegs, m.segmentMs || base, base, delta);
+  if (next === m.segmentMs) return;
+  m.segmentMs = next;
+  sendToOverlay('overlay:segment-ms', next);
+}
+
 // ---------------------------------------------------------------- 議事録
 function meetingStatus() {
   return {
@@ -1026,7 +1037,8 @@ function startMeeting() {
   meeting = { startedAt: Date.now(), memo: '', segments: [], offsetMs: 0, stopping: false, seq: 0,
     systemAudio: false, paused: false, pausedMs: 0, pausedAt: 0,
     // gen: 打ち切り（meeting:skipPending）で進める世代。進行中の結果を捨てる判断に使う
-    gen: 0, skipped: 0, micFallback: false };
+    // segmentMs: いま録音側に頼んでいる区間の長さ（背圧で伸縮する）
+    gen: 0, skipped: 0, micFallback: false, segmentMs: (settings.segmentSec || 75) * 1000 };
   segChain = Promise.resolve(); pendingSegs = 0;
   state = 'meeting';
   writeDraft();
@@ -1126,6 +1138,7 @@ function onMeetingSegment(buffer, durationMs, isFinal) {
   // 打ち切り（meeting:skipPending）で世代が進んだら、進行中・待ち行列の結果は捨てる
   const gen = m.gen;
   pendingSegs++;
+  applyBackpressure(m, 1);
   sendToMainWin('meeting:update', meetingStatus());
   segChain = segChain.then(async () => {
     if (meeting !== m || m.gen !== gen || !seg) return;
@@ -1149,7 +1162,7 @@ function onMeetingSegment(buffer, durationMs, isFinal) {
     settleSegment(m, seg, { text });
   }).catch(() => {}).finally(() => {
     // 破棄済みの議事録の区間は、破棄時に数え直した件数を減らさない
-    if (meeting === m) pendingSegs = Math.max(0, pendingSegs - 1);
+    if (meeting === m) { pendingSegs = Math.max(0, pendingSegs - 1); applyBackpressure(m, -1); }
     sendToMainWin('meeting:update', meetingStatus());
     if (meeting === m && (isFinal || (m.stopping && pendingSegs === 0))) {
       maybeFinalizeMeeting().catch((e) => engineLog(`finalize failed: ${e.message}`));

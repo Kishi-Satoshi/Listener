@@ -463,6 +463,22 @@ function recoverSegments(segments, exists) {
 // 退避フォルダのうち 7 日より古いもの（復旧されずに残った孤児）。フォルダ名は開始時刻（ms）
 // なのでそれで判断し、数字でなければ更新時刻で判断する。ちょうど 7 日は残す（境目で今日の
 // 分を消さない）。entries: [{ name, mtimeMs }]、戻り値は消してよい name の配列。
+// ---------------------------------------------------------------- 背圧: 区間の長さ（#42）
+// 文字起こしが録音に追いつかないとき（待ちが 3 区間を超える）は、次の区間の長さを倍にして
+// 送る回数を減らす（75→150→300 秒。上限 300 秒）。追いついたら（待ち 1 以下）設定の長さへ
+// 戻す。短い区間を積み上げ続けると、待ちがどこまでも伸びて終了後の待ち時間になる。
+//   pending: いまの待ち件数、currentMs: いまの区間の長さ、baseMs: 設定の長さ、
+//   delta: 待ちが増えた(+1)のか減った(-1)のか。減った側では倍にしない（5→4 で倍にすると
+//   一気に上限へ張り付く）。2〜3 のあいだは変えない（行ったり来たりで何度も送らない）。
+const SEGMENT_MS_CAP = 300000;
+function nextSegmentMs(pending, currentMs, baseMs, delta) {
+  const base = Math.max(1000, Number(baseMs) || 75000);
+  const cur = Number(currentMs) > 0 ? Number(currentMs) : base;
+  if (pending <= 1) return base;
+  if (pending > 3 && delta > 0) return Math.min(SEGMENT_MS_CAP, cur * 2);
+  return cur;
+}
+
 const SEGBUF_MAX_AGE_MS = 7 * 86400000;
 function staleSegbufDirs(entries, nowMs, maxAgeMs = SEGBUF_MAX_AGE_MS) {
   const out = [];
@@ -484,4 +500,5 @@ module.exports = {
   ENGINE_SETTING_KEYS, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
+  nextSegmentMs,
 };

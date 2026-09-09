@@ -21,6 +21,7 @@ const {
   engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   truncationMessage, extractNotes, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
+  nextSegmentMs,
 } = require('../src/mainlib');
 const { normalizeSettings } = require('../src/settings');
 
@@ -744,4 +745,21 @@ test('staleSegbufDirs: 7 日より古い退避フォルダだけを選ぶ（名�
   assert.deepStrictEqual(staleSegbufDirs([], now), []);
   // ちょうど 7 日は残す（境目で今日の分を消さない）
   assert.deepStrictEqual(staleSegbufDirs([{ name: String(now - 7 * day), mtimeMs: 0 }], now), []);
+});
+
+// ---------------------------------------------------------------- #42 背圧（区間の長さ）
+test('nextSegmentMs: 待ちが 3 を超えたら区間を倍に（上限 300 秒）、1 以下に戻ったら設定の長さへ', () => {
+  // 短い区間を積み上げ続けると待ちがどこまでも伸び、終了後の待ち時間になる
+  assert.strictEqual(nextSegmentMs(4, 75000, 75000, 1), 150000);
+  assert.strictEqual(nextSegmentMs(5, 150000, 75000, 1), 300000);
+  assert.strictEqual(nextSegmentMs(6, 300000, 75000, 1), 300000, '上限を超えている');
+  // 2〜3 のあいだは変えない（行ったり来たりでオーバーレイに何度も送らない）
+  assert.strictEqual(nextSegmentMs(3, 150000, 75000, 1), 150000);
+  assert.strictEqual(nextSegmentMs(2, 150000, 75000, -1), 150000);
+  // 減った側では倍にしない（5→4 で倍にすると一気に上限へ張り付く）
+  assert.strictEqual(nextSegmentMs(4, 150000, 75000, -1), 150000);
+  assert.strictEqual(nextSegmentMs(1, 300000, 75000, -1), 75000);
+  assert.strictEqual(nextSegmentMs(0, 300000, 75000, -1), 75000);
+  // 現在の長さが無ければ設定の長さから数える
+  assert.strictEqual(nextSegmentMs(4, 0, 75000, 1), 150000);
 });
