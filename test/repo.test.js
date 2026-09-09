@@ -951,3 +951,27 @@ test('#4 出典は要約の材料にした配列と今の配列の両方から�
   assert.ok(run.includes('const segmentsAtStart = segments;'), '入口で読んだ配列を取っておいていない');
   assert.ok(run.includes('const stat = attachAcross(blocks, fresh, segmentsAtStart);'), '両方の配列を渡していない');
 });
+
+// ---------------------------------------------------------------- 第2段（A: 音声の退避・復旧・背圧・進捗・打ち切り）
+test('#8/#42(1) 区間の音声は文字起こしの前にディスクへ退避し、draft に「待ち」として控える', () => {
+  const m = code(main);
+  assert.match(m, /path\.join\(app\.getPath\('userData'\), 'data', 'segbuf'\)/, '退避先が <userData>/data/segbuf ではない');
+  const spool = fnBody(m, 'function spoolSegment(', '\n}');
+  assert.ok(spool.includes('mkdirSync') && spool.includes('renameSync'), '一時ファイル経由で書いていない');
+  const on = fnBody(m, 'function onMeetingSegment(', '\nasync function maybeFinalizeMeeting');
+  assert.ok(on.includes('pending: true'), '区間を「待ち」として控えていない');
+  assert.ok(on.includes('spoolSegment('), '音声を退避していない');
+  assert.ok(on.indexOf('spoolSegment(') < on.indexOf('segChain = segChain.then'), '文字起こしの列に入れる前に退避していない');
+  assert.ok(on.indexOf('writeDraft()') < on.indexOf('segChain = segChain.then'), '列に入れる前に draft へ書いていない');
+  assert.ok((on.match(/settleSegment\(m, seg/g) || []).length >= 3, '成功・失敗・空 の全部で同じ要素を置き換えていない');
+  const settle = fnBody(m, 'function settleSegment(', '\n}');
+  assert.ok(settle.includes('unlinkQuiet(seg.wav)') && settle.includes('delete seg.pending') && settle.includes('delete seg.wav'),
+    '置き換え時に wav を消し pending/wav を外していない');
+  // 画面・保存・要約は「待ち」の区間とパスを見ない
+  assert.ok(fnBody(m, 'function meetingStatus()', '\n}').includes('publicSegments(meeting.segments)'), '画面へパスが漏れる');
+  assert.ok(fnBody(m, 'async function maybeFinalizeMeeting', '\nconst runSummary').includes('segments: settledSegments(m.segments)'), '保存に待ちの区間が混ざる');
+  assert.match(fnBody(m, 'async function doRunSummary', '\nlet hotkeyState'), /const usable = segments\.filter\(\(s\) => !s\.failed && !s\.pending\)/);
+  assert.ok(fnBody(m, 'function discardMeeting()', '\n}').includes('cleanupSegbuf(m)'), '破棄で退避した音声を消していない');
+  // 復旧: 待ちの区間は draft からページに載せるとき失敗扱いにする（判断は mainlib.recoverSegments）
+  assert.ok(fnBody(m, 'function recoverDraftIfAny()', '\n}').includes('recoverSegments(d.segments'), '復旧で待ちの区間を直していない');
+});

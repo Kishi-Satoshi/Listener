@@ -20,6 +20,7 @@ const {
   pasterScript, copyCommand,
   engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   truncationMessage, extractNotes, buildPromptParts,
+  publicSegments, settledSegments, pendingDurationMs, recoverSegments,
 } = require('../src/mainlib');
 const { normalizeSettings } = require('../src/settings');
 
@@ -92,6 +93,20 @@ test('promptTail: 2件とも失敗なら空（3件以上は遡らない）', () 
 test('promptTail: 末尾100文字に切る', () => {
   const long = 'あ'.repeat(300);
   assert.strictEqual(promptTail([{ text: long }]).length, 100);
+});
+
+test('promptTail: 文字起こし待ち（pending）の区間は飛ばし、その手前の成功区間から取る', () => {
+  // 区間は音声が届いた時点で本文が空のまま控えられる（#8/#42）。末尾の 2 件が待ちだと
+  // 何も返せず、直前の発言の文脈が毎回途切れる
+  const segs = [
+    { id: 's1', text: '一つ目の発言。' },
+    { id: 's2', text: '', pending: true },
+    { id: 's3', text: '', pending: true },
+  ];
+  assert.strictEqual(promptTail(segs), '一つ目の発言。');
+  assert.strictEqual(promptTail([{ id: 's1', text: '', pending: true }]), '');
+  // 待ちを除いたうえで、2 件しか遡らない
+  assert.strictEqual(promptTail([{ text: '成功' }, { text: '失敗1', failed: true }, { text: '失敗2', failed: true }, { text: '', pending: true }]), '');
 });
 
 // ---------------------------------------------------------------- #35/#49 ホットキー
@@ -673,4 +688,44 @@ test('buildPromptParts: 尻尾は語より先に、先頭から削る／日本�
   const noBuiltin = buildPromptParts({ ja: true, dictionary: [], useBuiltinTerms: false, tail: '', limitBytes: 600, builtinTerms: BUILTIN, sample: SAMPLE });
   assert.strictEqual(noBuiltin.prompt, SAMPLE);
   assert.deepStrictEqual([noBuiltin.kept, noBuiltin.total, noBuiltin.over], [0, 0, false]);
+});
+
+// ---------------------------------------------------------------- #8/#42 音声の退避と「文字起こし待ち」の区間
+test('publicSegments / settledSegments: 画面と保存にファイルのパスを漏らさず、保存には待ちの区間を入れない', () => {
+  const segs = [
+    { id: 's1', atMs: 0, text: '発言', durationMs: 75000 },
+    { id: 's2', atMs: 75000, text: '', pending: true, wav: 'C:/x/segbuf/1/2.wav', durationMs: 75000 },
+  ];
+  const pub = publicSegments(segs);
+  assert.strictEqual(pub.length, 2, '画面には待ちの区間も出す（進捗が見える）');
+  assert.ok(pub.every((s) => !('wav' in s)), 'パスが漏れている');
+  assert.strictEqual(pub[1].pending, true);
+  assert.ok('wav' in segs[1], '入力を書き換えている');
+  assert.deepStrictEqual(settledSegments(segs), [{ id: 's1', atMs: 0, text: '発言', durationMs: 75000 }]);
+  assert.deepStrictEqual(publicSegments(undefined), []);
+});
+
+test('pendingDurationMs: 文字起こし待ちの区間の長さの合計（残り時間の見積もりの材料）', () => {
+  assert.strictEqual(pendingDurationMs([{ pending: true, durationMs: 75000 }, { text: 'x', durationMs: 75000 }, { pending: true, durationMs: 30000 }]), 105000);
+  assert.strictEqual(pendingDurationMs([]), 0);
+  assert.strictEqual(pendingDurationMs([{ pending: true }]), 0);
+});
+
+test('recoverSegments: 待ちの区間は失敗扱いで「復旧中」にし、wav が残っていれば todo に載せる。パスはページに載せない', () => {
+  const segs = [
+    { id: 's1', atMs: 0, text: '発言' },
+    { id: 's2', atMs: 75000, text: '', pending: true, wav: '/b/2.wav', durationMs: 75000 },
+    { id: 's3', atMs: 150000, text: '', pending: true, wav: '/b/3.wav', durationMs: 30000 },
+    { id: 's4', atMs: 180000, text: '（この区間の認識に失敗: x）', failed: true },
+  ];
+  const r = recoverSegments(segs, (f) => f === '/b/2.wav');
+  assert.deepStrictEqual(r.segments, [
+    { id: 's1', atMs: 0, text: '発言' },
+    { id: 's2', atMs: 75000, text: '（復旧中: 文字起こし待ち）', failed: true, durationMs: 75000 },
+    { id: 's3', atMs: 150000, text: '（この区間の認識に失敗: 音声が残っていません）', failed: true, durationMs: 30000 },
+    { id: 's4', atMs: 180000, text: '（この区間の認識に失敗: x）', failed: true },
+  ]);
+  assert.deepStrictEqual(r.todo, [{ id: 's2', wav: '/b/2.wav', durationMs: 75000 }]);
+  assert.strictEqual(segs[1].pending, true, '入力を書き換えている');
+  assert.deepStrictEqual(recoverSegments([null, 'x'], () => true), { segments: [], todo: [] }, '壊れた要素で落ちる');
 });

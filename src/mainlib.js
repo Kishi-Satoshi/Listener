@@ -36,11 +36,14 @@ function meetingDurationSec(m, endAt) {
 // 「（この区間の認識に失敗: …）」というエラー文なので、渡すと次の区間が
 // エラー文を「文例」として真似る。直近の成功区間から取り、最大2件だけ遡る
 // （それ以上前の発言は文脈として古い）。
+// 文字起こし待ち（pending。本文がまだ無い）は飛ばす（#8/#42）。飛ばさないと、末尾に
+// 待ちが並んでいるあいだ毎回空になり、直前の発言の文脈が途切れる。
 function promptTail(segments) {
-  const n = segments.length;
+  const done = (segments || []).filter((s) => s && !s.pending);
+  const n = done.length;
   for (let i = n - 1; i >= Math.max(0, n - 2); i--) {
-    const s = segments[i];
-    if (s && !s.failed) return String(s.text || '').slice(-100);
+    const s = done[i];
+    if (!s.failed) return String(s.text || '').slice(-100);
   }
   return '';
 }
@@ -414,6 +417,50 @@ function buildPromptParts({ ja, dictionary, useBuiltinTerms, tail, limitBytes, b
   return { prompt, kept: nWords, total: words.length, over: nWords < words.length };
 }
 
+// ---------------------------------------------------------------- 音声の退避と「文字起こし待ち」の区間（#8/#42）
+// 区間は音声が届いた時点で { id, atMs, durationMs, pending: true, wav, text: '' } として
+// meeting.segments と draft.json に控え、文字起こしが終わったら同じ要素を結果で置き換える。
+// 以前は文字起こしが終わるまで draft に載らず、その間にアプリが落ちると音声ごと消えていた。
+
+// 画面へ返す形。wav（ファイルのパス）は外す。画面に出す理由が無く、状態をそのまま
+// ログや不具合報告に貼られるとパスが漏れる。待ちの区間は残す（進捗が見える）
+function publicSegments(segments) {
+  return (segments || []).map(({ wav, ...s }) => s);
+}
+// ページに保存する形。待ちの区間（本文が無い）は入れない。wav も外す
+function settledSegments(segments) {
+  return publicSegments((segments || []).filter((s) => s && !s.pending));
+}
+// 文字起こし待ちの区間の長さの合計（残り時間の見積もりの材料）
+function pendingDurationMs(segments) {
+  let sum = 0;
+  for (const s of (segments || [])) if (s && s.pending) sum += Number(s.durationMs) || 0;
+  return sum;
+}
+// draft.json の区間を復旧ページ用に直す。exists(path) は fs.existsSync 相当。
+// pending は失敗扱いにして本文を「復旧中」にし、wav が残っていれば todo に載せる（起動後に
+// 文字起こしして store.updateSegment で差し替える）。wav が無ければ失敗として残す。
+// wav（パス）はページに載せない。入力は書き換えない。
+function recoverSegments(segments, exists) {
+  const out = [];
+  const todo = [];
+  for (const raw of (segments || [])) {
+    if (!raw || typeof raw !== 'object') continue;
+    const { wav, pending, ...s } = raw;
+    if (pending) {
+      s.failed = true;
+      if (wav && exists(wav)) {
+        s.text = '（復旧中: 文字起こし待ち）';
+        todo.push({ id: s.id, wav, durationMs: Number(s.durationMs) || 0 });
+      } else {
+        s.text = '（この区間の認識に失敗: 音声が残っていません）';
+      }
+    }
+    out.push(s);
+  }
+  return { segments: out, todo };
+}
+
 module.exports = {
   saveIfExists, meetingDurationSec, promptTail,
   registerHotkeys, hotkeyFailureMessage, hotkeyStatus, resolveStartupHotkeys, saveHotkeys,
@@ -422,4 +469,5 @@ module.exports = {
   engineFileIssue, engineIssueMessage, portInUseError,
   ENGINE_SETTING_KEYS, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
+  publicSegments, settledSegments, pendingDurationMs, recoverSegments,
 };

@@ -41,6 +41,7 @@ const {
   pasterScript, copyCommand,
   engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
+  publicSegments, settledSegments, recoverSegments,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -846,6 +847,50 @@ function hideOverlayIfIdle() {
   if (state === 'idle' && overlayWin && !overlayWin.isDestroyed()) overlayWin.hide();
 }
 
+// ---------------------------------------------------------------- 区間の音声の退避（#8/#42）
+// 区間は音声が届いた時点で { id, atMs, durationMs, pending: true, wav, text: '' } として
+// meeting.segments と draft.json に控え、音声そのものを <userData>/data/segbuf/<開始時刻>/<seq>.wav
+// へ退避する。文字起こしが終わったら同じ要素を結果で置き換え、wav を消す。
+// 以前は文字起こしが終わるまで draft に載らず、その間にアプリが落ちると音声ごと消えていた。
+// 残った wav は次回起動時に文字起こしして復旧ページへ差し替える（recoverDraftIfAny）。
+const segbufRoot = () => path.join(app.getPath('userData'), 'data', 'segbuf');
+const segbufDir = (startedAt) => path.join(segbufRoot(), String(startedAt));
+function spoolSegment(dir, seq, buffer) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${seq}.wav`);
+    // 一時ファイルに書いてから置き換える（書き込み中に落ちても半端な wav を復旧しない）
+    fs.writeFileSync(`${file}.tmp`, buffer);
+    fs.renameSync(`${file}.tmp`, file);
+    return file;
+  } catch (e) {
+    engineLog(`音声の退避に失敗: ${e.message}`);   // 退避できなくても文字起こしは続ける
+    return '';
+  }
+}
+function unlinkQuiet(file) { if (file) { try { fs.unlinkSync(file); } catch (_) { /* noop */ } } }
+// 空のときだけ消す（rmdir は中身があれば失敗する）。中身が残っているなら復旧の材料
+function removeDirIfEmpty(dir) { try { fs.rmdirSync(dir); } catch (_) { /* noop */ } }
+// 破棄: 退避した音声は復旧の材料にしない（破棄は利用者の意思）
+function cleanupSegbuf(m) {
+  for (const s of m.segments) if (s.pending) unlinkQuiet(s.wav);
+  removeDirIfEmpty(segbufDir(m.startedAt));
+}
+// 文字起こし待ちの区間を結果で置き換える（id/atMs はそのまま。pending/wav を外し、wav を消す）。
+// patch が null なら区間ごと消す（空・直前の繰り返し。以前は push しなかったのと同じ）
+function settleSegment(m, seg, patch) {
+  unlinkQuiet(seg.wav);
+  if (patch) {
+    delete seg.pending; delete seg.wav;
+    Object.assign(seg, patch);
+  } else {
+    const i = m.segments.indexOf(seg);
+    if (i >= 0) m.segments.splice(i, 1);
+  }
+  writeDraft();
+  sendToMainWin('meeting:update', meetingStatus());
+}
+
 // ---------------------------------------------------------------- 議事録
 function meetingStatus() {
   return {
@@ -853,7 +898,7 @@ function meetingStatus() {
     finalizing: state === 'meeting-finalizing',
     startedAt: meeting ? meeting.startedAt : null,
     memo: meeting ? meeting.memo : '',
-    segments: meeting ? meeting.segments : [],
+    segments: meeting ? publicSegments(meeting.segments) : [],   // wav（パス）は外す。待ちは pending: true
     pending: pendingSegs,
     stoppedAt: meeting && meeting.stoppedAt ? meeting.stoppedAt : null,
     paused: Boolean(meeting && meeting.paused),
@@ -873,10 +918,17 @@ function writeDraft() {
   });
 }
 
+// 復旧ページで文字起こし待ちのまま残った音声 { pageId, items: [{ id, wav, durationMs }], dir }。
+// 起動が済んでエンジンが用意できてから順に文字起こしする
+let recoveryQueue = null;
 function recoverDraftIfAny() {
   const d = store.readDraft();
   if (!d || !Array.isArray(d.segments) || d.segments.length === 0) { store.clearDraft(); return; }
   const dt = new Date(d.startedAt || Date.now());
+  // 文字起こしが終わっていなかった区間（pending）は失敗扱いでページに載せ、wav が残っていれば
+  // あとで文字起こしして差し替える（mainlib.recoverSegments）。先にページを作るのは、
+  // エンジンの起動を待たずに復旧した本文を開けるようにするため
+  const rec = recoverSegments(d.segments, (f) => fs.existsSync(f));
   const page = store.createPage({
     title: `${dt.getFullYear()}/${dt.getMonth() + 1}/${dt.getDate()} ${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')} の議事録（復旧）`,
     // 日付はローカルの暦日（#51。UTC で作ると日本の朝の会議が前日になる）
@@ -884,14 +936,18 @@ function recoverDraftIfAny() {
     durationSec: Math.round((d.offsetMs || 0) / 1000),
     memo: d.memo || '',
     blocks: [],
-    segments: d.segments,
+    segments: rec.segments,
     createdAt: new Date(d.startedAt || Date.now()).toISOString(),
     recovered: true,
   });
-  page.summaryError = '録音が中断されたため要約は未生成です。「要約を生成」で作成できます。';
+  page.summaryError = rec.todo.length
+    ? '録音が中断されたため要約は未生成です。残っていた音声の文字起こしを続けています。終わったら「要約を生成」で作成できます。'
+    : '録音が中断されたため要約は未生成です。「要約を生成」で作成できます。';
   store.savePage(page);
   store.clearDraft();
   recoveredPageId = page.id;
+  if (rec.todo.length) recoveryQueue = { pageId: page.id, items: rec.todo, dir: segbufDir(d.startedAt) };
+  else removeDirIfEmpty(segbufDir(d.startedAt));
 }
 
 function startMeeting() {
@@ -899,7 +955,9 @@ function startMeeting() {
   const problem = whisperProblem();
   if (problem) return { ok: false, error: problem };
   meeting = { startedAt: Date.now(), memo: '', segments: [], offsetMs: 0, stopping: false, seq: 0,
-    systemAudio: false, paused: false, pausedMs: 0, pausedAt: 0 };
+    systemAudio: false, paused: false, pausedMs: 0, pausedAt: 0,
+    // gen: 打ち切り（meeting:skipPending）で進める世代。進行中の結果を捨てる判断に使う
+    gen: 0, skipped: 0, micFallback: false };
   segChain = Promise.resolve(); pendingSegs = 0;
   state = 'meeting';
   writeDraft();
@@ -959,6 +1017,8 @@ function stopMeeting() {
 function discardMeeting() {
   if (state !== 'meeting' && state !== 'meeting-finalizing') return { ok: false };
   sendToOverlay('overlay:cancel', {});
+  const m = meeting;
+  cleanupSegbuf(m);
   meeting = null; store.clearDraft();
   segChain = Promise.resolve(); pendingSegs = 0;
   state = 'idle'; updateTray();
@@ -983,31 +1043,41 @@ function onMeetingSegment(buffer, durationMs, isFinal) {
   const m = meeting;
   const segOffset = m.offsetMs;
   m.offsetMs += durationMs;
+  // 短すぎる端切れ（無音の切れ端）は区間にしない。件数には数え、最後の区間なら締めの引き金にする
+  let seg = null;
+  if (buffer.byteLength >= 4000) {
+    // 音声を先にディスクへ退避し、区間を「文字起こし待ち」として draft に控える（#8/#42）。
+    // 文字起こしは録音より遅れて終わる。その間にアプリが落ちても、wav が残っていれば
+    // 次回起動時に文字起こしして復旧できる
+    seg = { id: `s${++m.seq}`, atMs: segOffset, durationMs, pending: true, wav: '', text: '' };
+    seg.wav = spoolSegment(segbufDir(m.startedAt), m.seq, buffer);
+    m.segments.push(seg);
+    writeDraft();
+  }
+  // 打ち切り（meeting:skipPending）で世代が進んだら、進行中・待ち行列の結果は捨てる
+  const gen = m.gen;
   pendingSegs++;
   sendToMainWin('meeting:update', meetingStatus());
   segChain = segChain.then(async () => {
-    if (meeting !== m) return;
-    if (buffer.byteLength < 4000) return;
+    if (meeting !== m || m.gen !== gen || !seg) return;
     // 直近の「成功した」区間の末尾。失敗区間のエラー文を渡すと、次の区間が
-    // それを文例として真似る（mainlib.promptTail）。
+    // それを文例として真似る（mainlib.promptTail。待ちの区間は飛ばす）。
     const tail = promptTail(m.segments);
     let text = '';
     try {
       text = await transcribeLocal(buffer, tail, durationMs);
     } catch (e) {
-      if (meeting !== m) return;
-      m.segments.push({ id: `s${++m.seq}`, atMs: segOffset, text: `（この区間の認識に失敗: ${e.message}）`, failed: true });
-      writeDraft(); sendToMainWin('meeting:update', meetingStatus());
+      if (meeting !== m || m.gen !== gen) return;
+      settleSegment(m, seg, { text: `（この区間の認識に失敗: ${e.message}）`, failed: true });
       return;
     }
-    if (meeting !== m) return;
+    if (meeting !== m || m.gen !== gen) return;
     if (settings.removeFillers) text = removeFillersRule(text);
-    if (!text) return;
-    const prev = m.segments.length ? m.segments[m.segments.length - 1].text : '';
-    if (prev && text.length > 6 && prev === text) return; // 繰り返しハルシネーション抑制
-    m.segments.push({ id: `s${++m.seq}`, atMs: segOffset, text });
-    writeDraft();
-    sendToMainWin('meeting:update', meetingStatus());
+    // 空・直前と同じ（繰り返しハルシネーション）は区間ごと消す
+    const done = m.segments.filter((s) => !s.pending);
+    const prev = done.length ? done[done.length - 1].text : '';
+    if (!text || (prev && text.length > 6 && prev === text)) { settleSegment(m, seg, null); return; }
+    settleSegment(m, seg, { text });
   }).catch(() => {}).finally(() => {
     // 破棄済みの議事録の区間は、破棄時に数え直した件数を減らさない
     if (meeting === m) pendingSegs = Math.max(0, pendingSegs - 1);
@@ -1037,10 +1107,11 @@ async function maybeFinalizeMeeting() {
       title: fallbackTitle,
       date: localDateISO(dt),   // ローカルの暦日（#51）
       durationSec, memo: m.memo, blocks: [],
-      segments: m.segments,
+      segments: settledSegments(m.segments),   // 待ちの区間（本文なし）と wav のパスは載せない
       createdAt: dt.toISOString(),
     });
     store.clearDraft();
+    removeDirIfEmpty(segbufDir(m.startedAt));   // 全区間が片付いていれば空
   } catch (e) {
     // 保存に失敗しても draft.json は消さない（次回起動時に復旧できる）
     engineLog(`議事録の保存に失敗: ${e.message}`);
@@ -1088,7 +1159,7 @@ async function doRunSummary(pageId) {
   if (!page) { clearUi(); return { ok: false, error: 'ページが見つかりません' }; }
   let segments = store.getTranscript(pageId);   // 出典付与の直前に読み直して差し替える（下記）
   const segmentsAtStart = segments;   // 要約の材料にした配列。出典付けで今の配列と突き合わせる（#4）
-  const usable = segments.filter((s) => !s.failed);
+  const usable = segments.filter((s) => !s.failed && !s.pending);
   const plain = usable.map((s) => s.text).join('\n');
 
   if (!plain.trim()) {
