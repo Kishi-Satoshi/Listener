@@ -839,14 +839,18 @@ test('#27 クリップボードへ書くのは copyPrivate だけ（履歴・ク
   // 「書く入口が 1 つで、貼り付けもコピーもそこを通る」ことを見る
   const m = code(main);
   assert.strictEqual((m.match(/clipboard\.writeText\(/g) || []).length, 1, 'clipboard.writeText が copyPrivate 以外にもある');
-  const fn = fnBody(m, 'function copyPrivate(', '\n}');
-  assert.ok(fn.includes('clipboard.writeText('), 'copyPrivate が Electron で先に書いていない（PowerShell が無いと何も残らない）');
-  assert.ok(fn.includes('copyCommand('), '常駐 PowerShell に置き直しを頼んでいない');
-  assert.ok(fn.indexOf('clipboard.writeText(') < fn.indexOf('copyCommand('), '置き直しが Electron の書き込みより先にある');
+  const fn = fnBody(m, 'async function copyPrivate(', '\n}');
+  assert.ok(fn.includes('copyCommand('), '常駐 PowerShell に除外印付きで置かせていない');
+  assert.ok(fn.includes('clipboard.writeText('), 'PowerShell が置けなかったとき Electron で書いていない（何も残らない）');
+  // 先に Electron で書くと、その最初の書き込みが履歴・クラウド同期に採られる（除外印は後から付けても消えない）
+  assert.ok(fn.indexOf('copyCommand(') < fn.indexOf('clipboard.writeText('), 'Electron の書き込みが PowerShell の置き直しより先にある（最初の書き込みが履歴に採られる）');
+  assert.ok(fn.includes('if (clipEquals(readClipboardText(), t)) return;'), '置けたことを読み返して確かめていない（確かめずに Electron で書けば元の木阿弥）');
   const deliver = fnBody(m, 'async function deliverText(', '\n}');
-  assert.ok(deliver.includes('copyPrivate('), '自動貼り付けが copyPrivate を通っていない');
+  assert.ok(deliver.includes('await copyPrivate(text)'), '自動貼り付けが置き終わるのを待たずに貼っている');
   assert.ok(deliver.includes('clipboard.readText()'), '貼り付け後に戻す元の中身を読んでいない');
-  assert.match(m, /ipcMain\.handle\('clipboard:copy', \(_e, t\) => \{ copyPrivate\(/, '画面のコピーが copyPrivate を通っていない');
+  assert.ok(deliver.includes('restoreAfterPaste(prev, text)'), '戻すかの判断を mainlib.restoreAfterPaste で行っていない');
+  assert.match(m, /const RESTORE_DELAY_MS = 2000;/, '戻すまでの間が 2 秒でない（読み取りの遅いアプリで古い方が貼られる）');
+  assert.match(m, /ipcMain\.handle\('clipboard:copy', async \(_e, t\) => \{ await copyPrivate\(/, '画面のコピーが copyPrivate を（待って）通っていない');
   assert.ok(fnBody(m, 'function ensurePaster()', '\n}').includes('pasterScript()'), '常駐 PowerShell のスクリプトを mainlib から取っていない');
 });
 
@@ -890,7 +894,8 @@ test('#32 エンジンの実行ファイルとモデルは存在だけでなく�
 
 test('#57(2) 記録中はエンジンに関わる設定を変えず、留めた値を applied で画面へ戻す', () => {
   const save = fnBody(code(main), "ipcMain.handle('settings:save'", '\n  });');
-  assert.ok(save.includes('guardEngineSettings(settings, merged, Boolean(meeting))'), 'mainlib.guardEngineSettings を通していない');
+  // 音声入力（recording）の最中も同じ: 文字起こし中に whisper を再起動すると、その発話が失われる
+  assert.ok(save.includes("guardEngineSettings(settings, merged, Boolean(meeting) || state === 'recording')"), 'mainlib.guardEngineSettings を（音声入力中も）通していない');
   assert.ok(save.includes('if (!guard.kept.length) restartEnginesIfNeeded();'), '留めたのにエンジンを再起動している');
   assert.ok(save.includes('Object.assign(applied, keptDifferent(next, settings))'), '留めた値を applied に載せていない');
   assert.ok(save.includes('guard.warning'), '警告を画面へ返していない');
@@ -1070,4 +1075,67 @@ test("overlay:mic は議事録が無いとき meeting:update を送らない（�
   const i = main.indexOf("ipcMain.on('overlay:mic'");
   const body = main.slice(i, i + 500);
   assert.ok(/if \(!meeting\) return;/.test(body), 'overlay:mic に議事録なしのガードが無い');
+});
+
+// ---------------------------------------------------------------- 第2段 レビュー2（忠実さ・実機リスク）
+test('トレイの「終了」も、閉じるボタンと同じく記録中・要約中は確かめる', () => {
+  const m = code(main);
+  assert.ok(m.includes("items.push({ label: '終了', click: quitFromTray });"), 'トレイの終了が quitFromTray を通っていない');
+  const fn = fnBody(m, 'function quitFromTray()', '\n}');
+  assert.ok(fn.includes("closeConfirm(state === 'meeting' || state === 'meeting-finalizing', isSummarizing())"), '終了確認の文を mainlib.closeConfirm で組んでいない');
+  assert.ok(fn.includes('dialog.showMessageBoxSync('), '確認を出していない');
+  assert.ok(/if \(r !== 0\) return;/.test(fn), 'キャンセルで終了を止めていない');
+  assert.ok(fn.indexOf('showMessageBoxSync(') < fn.indexOf('quitting = true'), '確認より先に終了している');
+});
+
+test('認識に失敗した区間の wav は残し、議事録を締めたあと（要約の後）にもう一度文字起こしする', () => {
+  const m = code(main);
+  const settle = fnBody(m, 'function settleSegment(', '\n}');
+  assert.ok(settle.includes('const keepWav = Boolean(patch && patch.failed && seg.wav);'), '失敗した区間の wav を残す判断が無い');
+  assert.ok(settle.includes('if (!keepWav) unlinkQuiet(seg.wav);'), '失敗した区間の wav も消している');
+  assert.ok(settle.includes('if (keepWav) seg.wav = wav;'), '残した wav のパスを区間に戻していない（締めのときに見つからない）');
+  const fin = fnBody(m, 'async function maybeFinalizeMeeting', '\nconst runSummary');
+  assert.ok(fin.includes('m.segments.filter((s) => s.failed && s.wav && fs.existsSync(s.wav))'), '失敗した区間を待ち行列に集めていない');
+  assert.ok(fin.includes('saveRecoveryQueue(q)'), '待ち行列を recovery.json に残していない（途中で落ちると消える）');
+  assert.ok(fin.includes('if (!recoveryQueue) recoveryQueue = q;'), '別の復旧が待っているときに上書きしている');
+  assert.ok(fin.indexOf('await runSummary(page.id)') < fin.indexOf('transcribeRecovered()'), '要約より先にやり直している（要約が待たされる）');
+  const rec = fnBody(m, 'async function transcribeRecovered()', '\n}');
+  assert.ok(rec.includes('while (q && !seen.has(q.dir)) {') && rec.includes('q = recoveryQueue = loadSavedRecoveryQueue();'), '残りの待ち行列を順に拾っていない／同じ行列を二度拾いうる');
+  assert.ok(fnBody(m, 'function cleanupSegbuf(', '\n}').includes('for (const s of m.segments) unlinkQuiet(s.wav);'), '破棄で失敗区間の wav が残る');
+  const items = fnBody(m, 'async function transcribeRecoveredItems(', '\n}');
+  assert.ok(items.includes('q.retry') && items.includes('やり直しました'), 'やり直しの通知文が復旧の文のまま');
+  // 記録中に落ちて draft に残った失敗区間も、wav があればやり直す（mainlib.recoverSegments）
+  assert.ok(m.includes("JSON.stringify({ pageId: q.pageId, items: q.items, retry: Boolean(q.retry) })"), 'recovery.json に retry の印を残していない');
+});
+
+test('退避フォルダの掃除は、待ち行列（recovery.json）が残っているフォルダを消さない', () => {
+  const clean = fnBody(code(main), 'function cleanOrphanSegbuf(', '\n}');
+  assert.ok(clean.includes('if (fs.existsSync(path.join(dir, RECOVERY_FILE))) continue;'), 'recovery.json 付きのフォルダを 7 日で消してしまう');
+  const load = fnBody(code(main), 'function loadSavedRecoveryQueue()', '\n}');
+  assert.ok(/catch \(_\) \{\s*try \{ fs\.unlinkSync\(f\); \}/.test(load), '壊れた recovery.json を消していない（掃除が永久に避け続ける）');
+});
+
+test('録音側のエラーで議事録を締めるときは、会議の長さをそこで止め、利用者に伝える', () => {
+  const m = code(main);
+  const i = m.indexOf("ipcMain.on('audio:error'");
+  const body = m.slice(i, m.indexOf("ipcMain.on('overlay:hidden-request'", i));
+  assert.ok(body.includes('meeting.stoppedAt = Date.now();'), '会議の長さに文字起こし待ちが混ざる');
+  assert.ok(body.includes('meeting.pausedMs += meeting.stoppedAt - meeting.pausedAt;'), '一時停止したまま切れたとき一時停止を締めていない');
+  assert.ok(body.includes("sendToMainWin('app:notice'"), '利用者に伝えていない');
+  assert.ok(body.indexOf('meeting.stoppedAt = Date.now();') < body.indexOf('maybeFinalizeMeeting()'), '締めた後に時刻を書いている');
+});
+
+test('区間の onstop は、次の区間の開始（rollSegment）を try の中で呼ぶ（投げても番号を埋める）', () => {
+  // 外で投げると finally が走らず、この区間の番号が待ち行列で埋まらない。以後の区間も
+  // 空の最後も永久に届かず、main は終了しても議事録を締められない
+  const onstop = overlayHtml.slice(overlayHtml.indexOf('rec.onstop = async () => {'), overlayHtml.indexOf('autoStopId = setTimeout(() => rollSegment(rec), thisSegMs);'));
+  const tryAt = onstop.indexOf('try {');
+  const roll = onstop.indexOf('rollSegment(rec);');
+  assert.ok(tryAt >= 0 && roll > tryAt, 'rollSegment(rec) が try の外にある');
+  assert.ok(onstop.indexOf('finally {') > roll && onstop.includes('settle(null);'), 'finally で番号を埋めていない');
+  // 次の区間の start() が投げても（マイクの切断）、番号を空の最後で埋めて録音を畳む
+  const seg = overlayHtml.slice(overlayHtml.indexOf('function startMeetingSegment()'), overlayHtml.indexOf('function newClosing()'));
+  assert.ok(/try \{\s*rec\.start\(250\);\s*\} catch \(e\) \{/.test(seg), 'rec.start(250) を try で包んでいない');
+  assert.ok(seg.includes('settleSeg(seq, { wav: new Uint8Array(0), durationMs: 0, isFinal: true });'), '投げたときに番号を空の最後で埋めていない');
+  assert.ok(seg.includes("errorAfterFinal = 'マイクが切断されました';"), 'エラーを最後の区間の後に回していない');
 });

@@ -598,3 +598,26 @@ test('matchLine: 固有のバイグラムが 3 つに満たない節（同じ文
   assert.ok(!ids.includes('r1'), `繰り返しの節が発言を指した: ${ids}`);
   assert.deepStrictEqual(ids, ['r2']);
 });
+
+test('matchLine: 同じ言い回しで主題が違う発言（展示会の準備は順調）を、資料の準備の根拠にしない', () => {
+  const idx = buildIndex([
+    { id: 'p1', text: '展示会の準備は順調です。来場者の案内も決まりました。' },
+    { id: 'p2', text: '講師の手配はまだ決まっていません。候補を当たります。' },
+    { id: 'p3', text: '予算は先月と同じで進めます。' },
+  ]);
+  const text = '資料の準備は順調だが、講師の手配は決まっていない';
+  assert.ok(splitClauses(text).length >= 2, '前提が崩れた（節に割れていない）');
+  const ids = matchLine(text, idx).map((h) => h.id);
+  assert.ok(!ids.includes('p1'), `展示会の準備を資料の準備の根拠にした: ${ids}`);
+  assert.deepStrictEqual(ids, ['p2'], '講師の手配の根拠が消えた');
+  // 主題が同じなら今まで通り指す
+  assert.ok(matchLine('展示会の準備は順調だが、講師の手配は決まっていない', idx).some((h) => h.id === 'p1'), '同じ主題の発言を指さなくなった');
+  // 要約側が言い添えた修飾（来期の）は、主題を持たない発言（採用計画は据え置き）の根拠を奪わない
+  const idx2 = buildIndex([
+    { id: 'q1', text: '採用計画は据え置きにします。人数は変えません。' },
+    { id: 'q2', text: '研修は続けます。予算も前年どおりです。' },
+    { id: 'q3', text: '来期の方針を話します。' },
+  ]);
+  const ids2 = matchLine('来期の採用計画は据え置きだが、研修は継続する', idx2).map((h) => h.id);
+  assert.ok(ids2.includes('q1'), `修飾を足しただけの要点が根拠を失った: ${ids2}`);
+});

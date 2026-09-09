@@ -242,6 +242,17 @@ function pasterScript() {
     + ' [System.Windows.Forms.Clipboard]::SetDataObject($d, $true) } catch {} } }';
 }
 
+// 自動貼り付けのあとに元のクリップボードを戻すか。戻すのは短い1行の文字列だけ。
+// 複数行・長文は、書式付きのコピー（Word・ブラウザ）の文字部分であることが多く、文字だけで
+// 戻すと元より劣るものに置き換わる。貼り付けた本文と同じなら戻す意味が無い
+const RESTORE_MAX_CHARS = 200;
+function restoreAfterPaste(prev, text) {
+  const p = String(prev ?? '');
+  if (!p || p === String(text ?? '')) return false;
+  if (/[\r\n]/.test(p)) return false;
+  return p.length <= RESTORE_MAX_CHARS;
+}
+
 // 常駐 PowerShell へ流す「置き直し」命令（改行なし。呼び出し側が '\n' を足す）
 function copyCommand(text) {
   return `copy ${Buffer.from(String(text ?? ''), 'utf8').toString('base64')}`;
@@ -455,6 +466,9 @@ function recoverSegments(segments, exists) {
       } else {
         s.text = '（この区間の認識に失敗: 音声が残っていません）';
       }
+    } else if (s.failed && wav && exists(wav)) {
+      // 認識に失敗した区間（wav は残してある）もやり直す。失敗の文は残し、成功したら差し替わる
+      todo.push({ id: s.id, wav, durationMs: Number(s.durationMs) || 0 });
     }
     out.push(s);
   }
@@ -535,7 +549,7 @@ module.exports = {
   saveIfExists, meetingDurationSec, promptTail,
   registerHotkeys, hotkeyFailureMessage, hotkeyStatus, resolveStartupHotkeys, saveHotkeys,
   makeSummaryRunner, tickStep,
-  pasterScript, copyCommand,
+  pasterScript, copyCommand, restoreAfterPaste,
   engineFileIssue, engineIssueMessage, portInUseError,
   ENGINE_SETTING_KEYS, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,

@@ -220,8 +220,21 @@ function backsClause(clause, counts) {
   const head = clauseHead(t);
   const has = (s) => bigrams(s).some((g) => counts.has(g));
   if (!has(head)) return false;
+  if (otherSubject(head, counts)) return false;
   const rest = t.slice(head.length);
   return normalize(rest).length < 2 || has(rest);
+}
+// 主題が「Aの B は」の形（資料の準備は）で、発言が「の+B」（の準備）を持つのに A（資料）の
+// バイグラムを一つも持たなければ、同じ言い回しの別の主題（展示会の準備は順調です）。
+// 節は短いので、A を除いた残り（の準備は順調）だけで被覆率に届いてしまう。
+// 発言に「の+B」が無ければ（採用計画は据え置きにします）A は要約側が言い添えた修飾（来期の）
+// とみなして減点しない。
+function otherSubject(head, counts) {
+  const no = head.indexOf('の');
+  if (no < 2 || no >= head.length - 2) return false;
+  const bHead = bigrams(head.slice(no, no + 2));
+  if (!bHead.length || !counts.has(bHead[0])) return false;
+  return !bigrams(head.slice(0, no)).some((g) => counts.has(g));
 }
 
 /**

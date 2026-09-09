@@ -182,6 +182,7 @@
   let segSeq = 0;                // 次に始める区間（または直に送る空の最後）に振る番号。録音をまたいで増え続ける
   let sendNext = 0;              // 次に main へ送る番号
   const sendQueue = new Map();   // 番号 -> { wav, durationMs, isFinal } | null（その番号は送るものが無い）
+  let errorAfterFinal = '';      // 最後の区間を送り終えてから main に伝えるエラー（マイクの切断）
   // #8/#42 main からの区間長の上げ下げ（背圧）はこの範囲に丸める。短すぎると文字起こしの
   // 文脈が細切れになり、長すぎると1区間の変換・認識が時間切れになる（実機で9分の区間が消えた）
   const SEG_MIN_MS = 20000, SEG_MAX_MS = 300000;
@@ -531,6 +532,10 @@
     paused = false; pausedAt = 0; pausedMs = 0;
     segClosing = null;    // 前回の締めが残っていると、一時停止中の終了が何も送らなくなる
     session++;            // 前の録音の区間（まだ変換待ち）が、この録音のマイクや区間に触らないための印
+    // 前の録音の待ち行列は捨てる。前の録音の区間は session の印で空として埋まるが、
+    // 番号が埋まらないまま終わった録音（マイクの切断で start() が投げた等）が残っていると、
+    // この録音の区間が永久に届かない
+    sendQueue.clear(); sendNext = segSeq; errorAfterFinal = '';
     micFallback = false;  // openStream が開いたトラックを見て決め直す
     pill.classList.remove('paused');
     shownLabel = '';
@@ -544,6 +549,9 @@
     } catch (e) {
       // 相手の声を先に開いていることがある。閉じないと画面キャプチャが残る。
       cleanup();
+      // 議事録なら main は「最後の区間」で締める。エラーだけ送ると main は待たずに締め、
+      // 変換中の区間があれば捨てる（今は無いが、経路を揃えておく）
+      if (mode === 'meeting') sendSegmentQueued(new Uint8Array(0), 0, true);
       window.koeOverlay.sendError('マイクにアクセスできません（OSのマイク許可を確認してください）');
       return;
     }
@@ -629,12 +637,17 @@
   // 番号順に main へ渡す。番号が飛んでいる間（前の区間がまだ変換中）は後の区間を溜める。
   // 番号は必ず埋める（送るものが無ければ null）。埋め忘れると、後の区間が永久に届かない。
   function settleSeg(seq, item) {
+    if (seq < sendNext) return;   // 前の録音の番号（start() で待ち行列を捨てた後に届いた）
     sendQueue.set(seq, item);
     while (sendQueue.has(sendNext)) {
       const it = sendQueue.get(sendNext);
       sendQueue.delete(sendNext);
       sendNext++;
-      if (it) window.koeOverlay.sendSegment(it.wav, it.durationMs, it.isFinal);
+      if (!it) continue;
+      window.koeOverlay.sendSegment(it.wav, it.durationMs, it.isFinal);
+      // マイクの切断は、最後の区間を送り「終えてから」伝える。先に伝えると main は
+      // 締めに入り、変換中だった区間（最大75秒）を議事録の無いところへ届けて捨てる
+      if (it.isFinal && errorAfterFinal) { const msg = errorAfterFinal; errorAfterFinal = ''; window.koeOverlay.sendError(msg); }
     }
   }
   // 区間を持たない送り（空の最後）も番号を取り、それまでに始まった区間の後に届ける
@@ -671,16 +684,18 @@
       // 前の録音の区間（破棄→すぐ次の録音、の間に onstop や変換が終わった）。今の録音の
       // マイクや区間には触らず、番号だけ空で埋める（埋めないと後の区間が永久に届かない）。
       if (mySession !== session) { settle(null); return; }
-      // 上限時間で切られた区間なら、変換を待たずにここで次の区間を始める（#13）。
-      // 見張り（rollSegment）側で既に始めていれば何もしない。
-      rollSegment(rec);
-      // 末尾の区間なら、送り終えるまでの印を立てる。一時停止側が先に立てていればそれを継ぐ。
-      // 印が無いと、一時停止→終了で stop() が空の最後を先に送り、あとから届く本物の区間が
-      // 最後の印の後になって main に捨てられる（最大75秒が消える）。
       let closing = null;
-      if (isLast()) { if (!segClosing) segClosing = newClosing(); closing = segClosing; }
       const done = () => { if (closing && segClosing === closing) { segClosing = null; closing.resolve(); } };
       try {
+        // 上限時間で切られた区間なら、変換を待たずにここで次の区間を始める（#13）。
+        // 見張り（rollSegment）側で既に始めていれば何もしない。try の中で呼ぶ: ここで
+        // 投げると（次の区間の start() がマイクの切断で落ちる等）finally が番号を埋める。
+        // 外で投げると番号が埋まらず、以後の区間が永久に届かない
+        rollSegment(rec);
+        // 末尾の区間なら、送り終えるまでの印を立てる。一時停止側が先に立てていればそれを継ぐ。
+        // 印が無いと、一時停止→終了で stop() が空の最後を先に送り、あとから届く本物の区間が
+        // 最後の印の後になって main に捨てられる（最大75秒が消える）。
+        if (isLast()) { if (!segClosing) segClosing = newClosing(); closing = segClosing; }
         if (cancelled) { cleanup(); return; }
         const blob = new Blob(segChunks, { type: rec.mimeType || 'audio/webm' });
         let wav = null;
@@ -721,7 +736,21 @@
       }
     };
     autoStopId = setTimeout(() => rollSegment(rec), thisSegMs);
-    rec.start(250);
+    try {
+      rec.start(250);
+    } catch (e) {
+      // マイクが抜かれた・トラックが終わった直後は start() が投げる（InvalidStateError 等）。
+      // 投げたままにすると、この番号が埋まらず以後の区間（空の最後も）が永久に届かない。
+      // この番号を「空の最後」で埋め（変換中の前の区間の後に届く）、録音を畳む。
+      // main には最後の区間を送り終えてから伝える（settleSeg）。
+      if (autoStopId) { clearTimeout(autoStopId); autoStopId = null; }
+      stopping = true;
+      errorAfterFinal = 'マイクが切断されました';
+      if (recorder === rec) recorder = null;
+      cleanup();
+      setPhase('processing', '議事録を作成中…');
+      settleSeg(seq, { wav: new Uint8Array(0), durationMs: 0, isFinal: true });
+    }
   }
 
   // 区間を送り終えるまでの印。待つ側（resumeRec / 一時停止中の stop）は await し、

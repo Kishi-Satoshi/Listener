@@ -17,7 +17,7 @@ const {
   saveIfExists, meetingDurationSec, promptTail, registerHotkeys,
   hotkeyFailureMessage, hotkeyStatus, resolveStartupHotkeys, saveHotkeys,
   makeSummaryRunner, tickStep,
-  pasterScript, copyCommand,
+  pasterScript, copyCommand, restoreAfterPaste,
   engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   truncationMessage, extractNotes, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
@@ -718,15 +718,20 @@ test('recoverSegments: 待ちの区間は失敗扱いで「復旧中」にし、
     { id: 's2', atMs: 75000, text: '', pending: true, wav: '/b/2.wav', durationMs: 75000 },
     { id: 's3', atMs: 150000, text: '', pending: true, wav: '/b/3.wav', durationMs: 30000 },
     { id: 's4', atMs: 180000, text: '（この区間の認識に失敗: x）', failed: true },
+    // 認識に失敗して wav を残した区間（settleSegment）: 失敗の文のまま、やり直しに載せる
+    { id: 's5', atMs: 200000, text: '（この区間の認識に失敗: 時間切れ）', failed: true, wav: '/b/5.wav', durationMs: 75000 },
+    { id: 's6', atMs: 275000, text: '（この区間の認識に失敗: y）', failed: true, wav: '/b/6.wav', durationMs: 75000 },
   ];
-  const r = recoverSegments(segs, (f) => f === '/b/2.wav');
+  const r = recoverSegments(segs, (f) => f === '/b/2.wav' || f === '/b/5.wav');
   assert.deepStrictEqual(r.segments, [
     { id: 's1', atMs: 0, text: '発言' },
     { id: 's2', atMs: 75000, text: '（復旧中: 文字起こし待ち）', failed: true, durationMs: 75000 },
     { id: 's3', atMs: 150000, text: '（この区間の認識に失敗: 音声が残っていません）', failed: true, durationMs: 30000 },
     { id: 's4', atMs: 180000, text: '（この区間の認識に失敗: x）', failed: true },
+    { id: 's5', atMs: 200000, text: '（この区間の認識に失敗: 時間切れ）', failed: true, durationMs: 75000 },
+    { id: 's6', atMs: 275000, text: '（この区間の認識に失敗: y）', failed: true, durationMs: 75000 },
   ]);
-  assert.deepStrictEqual(r.todo, [{ id: 's2', wav: '/b/2.wav', durationMs: 75000 }]);
+  assert.deepStrictEqual(r.todo, [{ id: 's2', wav: '/b/2.wav', durationMs: 75000 }, { id: 's5', wav: '/b/5.wav', durationMs: 75000 }]);
   assert.strictEqual(segs[1].pending, true, '入力を書き換えている');
   assert.deepStrictEqual(recoverSegments([null, 'x'], () => true), { segments: [], todo: [] }, '壊れた要素で落ちる');
 });
@@ -797,4 +802,14 @@ test('skipPendingSegments: 待ちの区間を全部「打ち切り」の失敗�
   assert.deepStrictEqual(segs[1], { id: 's2', atMs: 75000, text: '（文字起こしを打ち切り）', failed: true, durationMs: 75000 });
   assert.deepStrictEqual(segs[2], { id: 's3', atMs: 150000, text: '（文字起こしを打ち切り）', failed: true, durationMs: 30000 });
   assert.deepStrictEqual(skipPendingSegments([]), { count: 0, wavs: [] });
+});
+
+test('restoreAfterPaste: 短い1行だけ戻す（空・同じ本文・改行入り・200 字超は戻さない）', () => {
+  assert.strictEqual(restoreAfterPaste('直前にコピーした語', '貼り付けた本文'), true);
+  assert.strictEqual(restoreAfterPaste('', '本文'), false, '空を戻している');
+  assert.strictEqual(restoreAfterPaste('本文', '本文'), false, '貼り付けた本文そのものを戻している');
+  assert.strictEqual(restoreAfterPaste('1行目\n2行目', '本文'), false, '複数行を戻している（書式付きコピーが文字だけに劣化する）');
+  assert.strictEqual(restoreAfterPaste('a'.repeat(200), '本文'), true, '200 字を戻していない');
+  assert.strictEqual(restoreAfterPaste('a'.repeat(201), '本文'), false, '201 字を戻している');
+  assert.strictEqual(restoreAfterPaste(null, '本文'), false);
 });

@@ -365,6 +365,53 @@ test('先に切った区間の変換が後から終わっても、区間は切�
 });
 
 /*
+ * マイクの切断。トラックが終わった直後に次の区間の MediaRecorder.start() が投げる
+ * （InvalidStateError）。投げたままだと、その番号が待ち行列で埋まらず、変換中の区間も
+ * 空の最後も永久に届かない（main は終了しても締められない）。番号を空の最後で埋め、
+ * 変換中の区間を送り終えてから main にエラーを伝える。
+ */
+test('次の区間の start() がマイクの切断で投げても、変換中の区間は届き、空の最後で締めてから伝える', async () => {
+  let 変換を進める; let streams;
+  const { log } = await 議事録を開始({ setup: (l) => { 変換を進める = 変換を待たせる(l); streams = マイクを数える(l); } });
+  const MR = log.window.MediaRecorder;
+  const startWrapped = MR.prototype.start;
+  MR.prototype.start = function () { throw new Error('InvalidStateError: The MediaRecorder\'s stream is inactive'); };
+  log.recorders[0].stop();                  // 上限時間の打ち切り → onstop → 次の区間の start() が投げる
+  await log.drain();                        // 切った区間は変換待ち
+  assert.deepStrictEqual(log.errors.map(fmt), [], '次の区間の start() の例外が漏れている');
+  assert.strictEqual(log.called('sendSegment').length, 0, '変換が終わる前に何かを送っている（検査が空振り）');
+  assert.strictEqual(log.called('sendError').length, 0, '変換中の区間を送り終える前にエラーを伝えている（main が先に締めて区間が消える）');
+  変換を進める();
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '例外');
+  assert.deepStrictEqual(log.called('sendSegment').map((c) => c.args[2]), [false, true],
+    '変換中だった区間と空の最後が、この順に1回ずつ届いていない');
+  assert.ok(log.called('sendSegment')[0].args[0].length > 0, '変換中だった区間の音声が空');
+  assert.deepStrictEqual(log.called('sendError').map((c) => c.args[0]), ['マイクが切断されました'], 'エラーが1回だけ伝わっていない');
+  assert.ok(streams[0].track.stops >= 1, 'マイクを手放していない');
+  // 次の録音は普通に始まり、区間が届く（前の録音の番号が待ち行列を塞いでいない）
+  MR.prototype.start = startWrapped;
+  log.fire('onStart', { mode: 'meeting', segmentSec: 75, sound: false, systemAudio: false });
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '次の録音の開始で例外');
+  log.fire('onStop');
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '次の録音の終了で例外');
+  assert.deepStrictEqual(log.called('sendSegment').map((c) => c.args[2]), [false, true, true], '次の録音の最後の区間が届かない（待ち行列が前の録音で止まっている）');
+});
+
+test('議事録の開始でマイクを開けなかったときは、空の最後を送ってからエラーを伝える（main が締められる）', async () => {
+  const log = await load(OVL);
+  非同期onstopに(log);
+  log.window.navigator.mediaDevices.getUserMedia = () => Promise.reject(new Error('NotAllowedError'));
+  log.fire('onStart', { mode: 'meeting', segmentSec: 75, sound: false, systemAudio: false });
+  await log.drain();
+  assert.deepStrictEqual(log.errors.map(fmt), [], '例外');
+  assert.deepStrictEqual(log.called('sendSegment').map((c) => c.args[2]), [true], '空の最後が届いていない');
+  assert.strictEqual(log.called('sendError').length, 1, 'エラーが1回伝わっていない');
+});
+
+/*
  * preload はこの作業木ではまだ reportMic / onSegmentMs を公開していない。
  * simrun の偽 IPC は preload から名前を読むので、契約どおりの行を足した preload を渡す
  * （runtime.app.test.js の preloadWithHotkey と同じ手）。preload が追いついたらそのまま通る。

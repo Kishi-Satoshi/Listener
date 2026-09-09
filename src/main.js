@@ -42,7 +42,7 @@ const {
   engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs, nextSegmentMs, EtaTracker,
-  skipPendingSegments,
+  skipPendingSegments, restoreAfterPaste,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -628,6 +628,20 @@ function ensurePaster() {
   } catch (_) { pasterProc = null; }
   return pasterProc;
 }
+// トレイの「終了」も、閉じるボタンと同じく記録中・要約中は確かめる（mainlib.closeConfirm）。
+// トレイからは会議の状態が見えないので、閉じるボタンより間違えやすい
+function quitFromTray() {
+  const confirm = closeConfirm(state === 'meeting' || state === 'meeting-finalizing', isSummarizing());
+  if (confirm) {
+    const r = dialog.showMessageBoxSync({
+      type: 'warning', buttons: ['終了する', 'キャンセル'], defaultId: 1, cancelId: 1,
+      message: confirm.message, detail: confirm.detail,
+    });
+    if (r !== 0) return;
+  }
+  quitting = true;
+  app.quit();
+}
 function stopPaster() {
   if (pasterProc) { try { pasterProc.stdin.end(); pasterProc.kill(); } catch (_) { /* noop */ } pasterProc = null; }
 }
@@ -646,33 +660,47 @@ function simulatePaste() {
     }
   });
 }
-// クリップボードへ書く唯一の入口（#27）。Electron の clipboard で先に書き（これは
-// 必ず効く）、Windows では常駐 PowerShell に頼んで、クリップボード履歴（Win+V）と
-// クラウド同期から除外する書式を付けて置き直す（書式は mainlib.pasterScript）。
-// 置き直しに失敗しても本文は残る。'paste' と同じ標準入力に順に流すので、
+// クリップボードへ書く唯一の入口（#27）。Windows では常駐 PowerShell に頼んで、クリップボード
+// 履歴（Win+V）とクラウド同期から除外する書式を付けて置く（書式は mainlib.pasterScript）。
+// 置けたことをクリップボードを読み返して確かめ、置けていなければ（PowerShell が居ない・
+// まだ起動中・失敗）Electron の clipboard で書く（履歴には入るが、何も残らないよりはよい）。
+// 先に Electron で書くと、その最初の書き込みが履歴とクラウド同期に採られる。除外の印は
+// 後から置き直しても、採られた分は消えない。'paste' と同じ標準入力に順に流すので、
 // 置き直しが貼り付けより後になることはない。
-function copyPrivate(text) {
+const COPY_SETTLE_MS = 150;
+async function copyPrivate(text) {
   const t = String(text ?? '');
-  clipboard.writeText(t);
-  if (process.platform !== 'win32') return;
-  const p = ensurePaster();
+  const p = process.platform === 'win32' ? ensurePaster() : null;
   if (p && p.stdin && p.stdin.writable) {
-    try { p.stdin.write(`${copyCommand(t)}\n`); } catch (_) { /* noop */ }
+    try {
+      p.stdin.write(`${copyCommand(t)}\n`);
+      await new Promise((r) => setTimeout(r, COPY_SETTLE_MS));
+      if (clipEquals(readClipboardText(), t)) return;
+    } catch (_) { /* 下で Electron が書く */ }
   }
+  clipboard.writeText(t);
 }
+function readClipboardText() {
+  try { return clipboard.readText(); } catch (_) { return null; }
+}
+// 改行の形（CRLF / LF）の違いは置けた・置けていないの判断に使わない
+function clipEquals(a, b) {
+  return typeof a === 'string' && a.replace(/\r\n/g, '\n') === String(b).replace(/\r\n/g, '\n');
+}
+// 貼り付け先がクリップボードを読む前に戻すと古い方が貼られる。SendWait は処理完了まで
+// 待つが、読み取りが遅いアプリ（ブラウザの入力欄・Teams）は 500ms では間に合わなかった
+const RESTORE_DELAY_MS = 2000;
 async function deliverText(text) {
-  // 自動貼り付けのあとは元のクリップボードを戻す（文字列だったときだけ・できる範囲で）。
-  // 音声入力は「いま書いている場所へ入れる」道具なので、貼り付けた本文が
-  // クリップボードに残り続けると、直前にコピーしていたものが失われる。
+  // 自動貼り付けのあとは元のクリップボードを戻す（短い文字列だったときだけ・できる範囲で。
+  // 判断は mainlib.restoreAfterPaste）。音声入力は「いま書いている場所へ入れる」道具なので、
+  // 貼り付けた本文がクリップボードに残り続けると、直前にコピーしていたものが失われる。
   let prev = '';
   if (settings.autoPaste) { try { prev = clipboard.readText(); } catch (_) { prev = ''; } }
-  copyPrivate(text);
+  await copyPrivate(text);
   if (!settings.autoPaste) return;
   await new Promise((r) => setTimeout(r, 50));
   await simulatePaste();
-  // 貼り付け先がクリップボードを読む前に戻すと古い方が貼られる。SendWait は
-  // 処理完了まで待つが、読み取りが遅いアプリに備えて少し置いてから戻す。
-  if (prev && prev !== text) setTimeout(() => copyPrivate(prev), 500);
+  if (restoreAfterPaste(prev, text)) setTimeout(() => { copyPrivate(prev).catch(() => {}); }, RESTORE_DELAY_MS);
 }
 
 // ---------------------------------------------------------------- ウィンドウ
@@ -874,16 +902,22 @@ function unlinkQuiet(file) { if (file) { try { fs.unlinkSync(file); } catch (_) 
 function removeDirIfEmpty(dir) { try { fs.rmdirSync(dir); } catch (_) { /* noop */ } }
 // 破棄: 退避した音声は復旧の材料にしない（破棄は利用者の意思）
 function cleanupSegbuf(m) {
-  for (const s of m.segments) if (s.pending) unlinkQuiet(s.wav);
+  for (const s of m.segments) unlinkQuiet(s.wav);   // 待ちの区間も、失敗して残した区間も
   removeDirIfEmpty(segbufDir(m.startedAt));
 }
 // 文字起こし待ちの区間を結果で置き換える（id/atMs はそのまま。pending/wav を外し、wav を消す）。
-// patch が null なら区間ごと消す（空・直前の繰り返し。以前は push しなかったのと同じ）
+// patch が null なら区間ごと消す（空・直前の繰り返し。以前は push しなかったのと同じ）。
+// 認識に失敗した区間（時間切れ・エンジンの落ち）は wav を残す: 議事録を締めるときに
+// 復旧と同じ待ち行列に載せ、要約のあとでもう一度文字起こしする（maybeFinalizeMeeting）。
+// 消してしまうと、その 75 秒は二度と戻らない
 function settleSegment(m, seg, patch) {
-  unlinkQuiet(seg.wav);
+  const keepWav = Boolean(patch && patch.failed && seg.wav);
+  if (!keepWav) unlinkQuiet(seg.wav);
   if (patch) {
+    const wav = seg.wav;
     delete seg.pending; delete seg.wav;
     Object.assign(seg, patch);
+    if (keepWav) seg.wav = wav;
   } else {
     const i = m.segments.indexOf(seg);
     if (i >= 0) m.segments.splice(i, 1);
@@ -952,7 +986,7 @@ const RECOVERY_FILE = 'recovery.json';
 // 復旧の待ち行列をフォルダに書いておく。エンジンが用意できずに終えられなかったとき、
 // 次の起動や設定の直しで続きから文字起こしできる（wav は消さない）
 function saveRecoveryQueue(q) {
-  try { fs.writeFileSync(path.join(q.dir, RECOVERY_FILE), JSON.stringify({ pageId: q.pageId, items: q.items }), 'utf8'); } catch (_) { /* noop */ }
+  try { fs.writeFileSync(path.join(q.dir, RECOVERY_FILE), JSON.stringify({ pageId: q.pageId, items: q.items, retry: Boolean(q.retry) }), 'utf8'); } catch (_) { /* noop */ }
 }
 function loadSavedRecoveryQueue() {
   let names = [];
@@ -964,10 +998,12 @@ function loadSavedRecoveryQueue() {
     try {
       const j = JSON.parse(fs.readFileSync(f, 'utf8'));
       const items = (j.items || []).filter((it) => it && it.wav && fs.existsSync(it.wav));
-      if (j.pageId && items.length && store.getPage(j.pageId)) return { pageId: j.pageId, items, dir };
+      if (j.pageId && items.length && store.getPage(j.pageId)) return { pageId: j.pageId, items, dir, retry: Boolean(j.retry) };
       try { fs.unlinkSync(f); } catch (_) { /* noop */ }
       removeDirIfEmpty(dir);
-    } catch (_) { /* noop */ }
+    } catch (_) {
+      try { fs.unlinkSync(f); } catch (_2) { /* noop */ }   // 壊れた待ち行列。残すと掃除（cleanOrphanSegbuf）が避け続ける
+    }
   }
   return null;
 }
@@ -1009,19 +1045,25 @@ function recoverDraftIfAny() {
 let recoveryRunning = false;
 async function transcribeRecovered() {
   if (recoveryRunning) return;
-  const q = recoveryQueue;
+  let q = recoveryQueue;
   if (!q) return;
   recoveryRunning = true;
   try {
-    const ready = await ensureEngineReady(whisperEng);
-    if (!ready) {
-      // エンジンが未設定・未起動のときは何も消さない。wav と待ち行列（recovery.json）を残し、
-      // 設定を直したとき（settings:save）や次の起動でもう一度ここへ来る
-      engineLog(`復旧の文字起こしを保留: ${whisperEng.lastError || 'エンジンが起動していません'}`);
-      return;
+    const seen = new Set();   // 同じ待ち行列を二度拾わない（recovery.json を消せなかったとき）
+    while (q && !seen.has(q.dir)) {
+      seen.add(q.dir);
+      const ready = await ensureEngineReady(whisperEng);
+      if (!ready) {
+        // エンジンが未設定・未起動のときは何も消さない。wav と待ち行列（recovery.json）を残し、
+        // 設定を直したとき（settings:save）や次の起動でもう一度ここへ来る
+        engineLog(`復旧の文字起こしを保留: ${whisperEng.lastError || 'エンジンが起動していません'}`);
+        return;
+      }
+      recoveryQueue = null;
+      await transcribeRecoveredItems(q);
+      // 別の会議の分（議事録を締めたとき既に待ち行列があった失敗区間）が残っていれば続ける
+      q = recoveryQueue = loadSavedRecoveryQueue();
     }
-    recoveryQueue = null;
-    await transcribeRecoveredItems(q);
   } finally {
     recoveryRunning = false;
   }
@@ -1065,7 +1107,9 @@ async function transcribeRecoveredItems(q) {
   });
   sendToMainWin('pages:updated', store.listPages());
   sendToMainWin('page:updated', { page: latest || page, segments: store.getTranscript(q.pageId) });
-  sendToMainWin('app:notice', `中断されていた文字起こしの復旧が終わりました（${done}/${q.items.length} 区間）。「要約を生成」で議事録を作成できます。`);
+  sendToMainWin('app:notice', q.retry
+    ? `認識に失敗していた区間の文字起こしをやり直しました（${done}/${q.items.length} 区間）。「要約を生成」で議事録を作り直せます。`
+    : `中断されていた文字起こしの復旧が終わりました（${done}/${q.items.length} 区間）。「要約を生成」で議事録を作成できます。`);
 }
 function removeTranscriptSegment(pageId, segId) {
   store.saveTranscript(pageId, store.getTranscript(pageId).filter((s) => s.id !== segId));
@@ -1084,6 +1128,9 @@ function cleanOrphanSegbuf(keepDir) {
   for (const name of staleSegbufDirs(entries, Date.now())) {
     const dir = path.join(segbufRoot(), name);
     if (dir === keepDir) continue;
+    // 待ち行列が残っている（エンジンが用意できず 7 日以上そのまま等）フォルダは復旧の材料。
+    // 今回の復旧が終わったあと transcribeRecovered が順に拾う
+    if (fs.existsSync(path.join(dir, RECOVERY_FILE))) continue;
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* noop */ }
   }
 }
@@ -1275,6 +1322,15 @@ async function maybeFinalizeMeeting() {
       createdAt: dt.toISOString(),
     });
     store.clearDraft();
+    // 認識に失敗した区間の wav は残してある（settleSegment）。復旧と同じ待ち行列に載せ、
+    // 要約のあとでもう一度文字起こしする。途中で落ちても recovery.json から次の起動で続く
+    const retry = m.segments.filter((s) => s.failed && s.wav && fs.existsSync(s.wav))
+      .map((s) => ({ id: s.id, wav: s.wav, durationMs: Number(s.durationMs) || 0 }));
+    if (retry.length) {
+      const q = { pageId: page.id, items: retry, dir: segbufDir(m.startedAt), retry: true };
+      saveRecoveryQueue(q);
+      if (!recoveryQueue) recoveryQueue = q;   // 別の復旧が待っていれば、その後に拾う（transcribeRecovered）
+    }
     removeDirIfEmpty(segbufDir(m.startedAt));   // 全区間が片付いていれば空
   } catch (e) {
     // 保存に失敗しても draft.json は消さない（次回起動時に復旧できる）
@@ -1294,6 +1350,7 @@ async function maybeFinalizeMeeting() {
   sendToMainWin('page:open', page.id);
 
   await runSummary(page.id);
+  if (recoveryQueue) transcribeRecovered().catch((e) => engineLog(`retry failed: ${e.message}`));
 }
 
 // 同じページの要約は同時に一つだけ（mainlib.makeSummaryRunner。main.test.js で
@@ -1530,7 +1587,7 @@ function updateTray() {
   // 復旧の手段が、壊れうるものに依存していてはいけない。
   items.push({ label: '更新を確認', enabled: state === 'idle' && !isSummarizing(), click: checkUpdateFromTray });
   items.push({ type: 'separator' });
-  items.push({ label: '終了', click: () => { quitting = true; app.quit(); } });
+  items.push({ label: '終了', click: quitFromTray });
   // 既定で代替している／登録できていないキーがあれば、その旨を添える
   // （画面を開かなくても気づけるように）
   if (hotkeyNote) items.push({ label: `ホットキー ${hotkeyNote}`, enabled: false });
@@ -1596,7 +1653,8 @@ function setupIpc() {
     // 記録中はエンジンに関わる設定を前の値に留める（#57。判断は mainlib.guardEngineSettings）。
     // 保存のたびにエンジンが再起動すると、文字起こし中の区間が失われる。留めた値は
     // applied で画面へ戻し、warning で伝える。
-    const guard = guardEngineSettings(settings, merged, Boolean(meeting));
+    // 音声入力（recording）の最中も同じ。文字起こし中に whisper を再起動すると、その発話が失われる
+    const guard = guardEngineSettings(settings, merged, Boolean(meeting) || state === 'recording');
     Object.assign(merged, guard.settings);
 
     // ホットキーは変えた側だけ登録し直し、失敗した側だけ前の値に戻して、他の設定は
@@ -1728,7 +1786,7 @@ function setupIpc() {
     return { ok: true, skipped: r.count };
   });
 
-  ipcMain.handle('clipboard:copy', (_e, t) => { copyPrivate(String(t ?? '')); return true; });
+  ipcMain.handle('clipboard:copy', async (_e, t) => { await copyPrivate(String(t ?? '')); return true; });
   ipcMain.handle('app:test', async () => {
     const problem = engineCheck(whisperEng);   // 原因を名指しする（#32）
     if (problem) return { ok: false, error: problem };
@@ -1841,7 +1899,16 @@ function setupIpc() {
   ipcMain.on('audio:error', (_e, { message }) => {
     if (state === 'meeting' || state === 'meeting-finalizing') {
       if (meeting) {
+        // 録音側は最後の区間を送り終えてからこれを送る（overlay の settleSeg）ので、
+        // ここで締めに入っても変換中の区間を取りこぼさない
+        if (state === 'meeting') {
+          // 会議の長さはここまで（stopMeeting と同じ締め方。文字起こし待ちを混ぜない）
+          meeting.stoppedAt = Date.now();
+          if (meeting.paused) { meeting.pausedMs += meeting.stoppedAt - meeting.pausedAt; meeting.paused = false; meeting.pausedAt = 0; }
+          sendToMainWin('app:notice', `${message || 'マイクにアクセスできません'}。ここまでの録音で議事録を作成します。`);
+        }
         meeting.stopping = true; state = 'meeting-finalizing';
+        sendToMainWin('meeting:update', meetingStatus());
         maybeFinalizeMeeting().catch((e) => engineLog(`finalize failed: ${e.message}`));
       }
     } else finishWithError(message || 'マイクにアクセスできません');
