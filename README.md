@@ -231,6 +231,13 @@ git push origin v0.8.1
 [設定] → [アップデート] に表示されます。
 タグと `package.json` のバージョンが食い違うとワークフローが止まります。
 
+Release はまず **draft** として作られ（zip と ps1 を添付）、Windows ランナーで
+`Listener-<版>-setup.exe` を添付できてから公開（latest）になります。
+exe の添付に失敗すると draft のまま残り、Actions の要約に赤い見出し
+「公開されていません（draft のまま）」が出ます。draft の間は `releases/latest` に
+出ないので、各PCの更新確認には前の版が出続けます（新しい版が見えないだけで、壊れはしません）。
+そのときはワークフローを再実行するか、Releases ページで draft を確かめてください。
+
 タグを push できない環境（プロキシが `refs/tags` を拒否する等）では、
 Actions 画面の **Run workflow**、または `release/v0.8.1` という名前の
 ブランチを push しても同じ結果になります（そのブランチは公開後に自動で消えます）。
