@@ -285,7 +285,7 @@ powershell -ExecutionPolicy Bypass -File .\make-release.ps1 -Version 0.8.1
 
 | 層 | 何をするか |
 |---|---|
-| **不変条件**（`test/invariants.js`） | 「この製品では常にこうでなければならない」を34件、表として持つ。HTMLの木・色の対比・透過ウィンドウの禁止事項・復旧の導線・配布物の形式をまとめて検査する |
+| **不変条件**（`test/invariants.js`） | 「この製品では常にこうでなければならない」を26件、表として持つ。HTMLの木・色の対比・透過ウィンドウの禁止事項・復旧の導線・配布物の形式をまとめて検査する |
 | **起動ハーネス**（`test/helpers/`） | 画面のスクリプトを素のNodeで実際に実行し、初期化が例外なく完走することを確かめる。存在しない要素への代入は、ここで落ちる |
 | **変更危険度ゲート**（`tools/risk.js`） | 前の版と比べ「新たに壊れたもの」だけを報告する。既存の例外に対して誤検知が出ない |
 
@@ -307,6 +307,7 @@ node tools/hedit.js move  src/renderer/app.html --node '#x' --after '#y'
 
 ```bash
 npm run hook     # pre-commit フックを据える（クローン直後に1回）
+                 # フックはゲートの後に npm test も走らせる（約15秒。急ぐときは LISTENER_SKIP_TESTS=1）
 ```
 
 危険な変更があると commit が止まります。意図的な場合だけ、理由を残して越えられます。
