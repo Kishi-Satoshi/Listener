@@ -247,6 +247,9 @@ async function apply(url, appRoot, userDataPath, onProgress, opts) {
     // 更新画面（復旧口）ごと消える。Electron の版が取れないときは検査しない。
     const range = nxt && nxt.engines && nxt.engines.electron;
     if (electronVersion && range && !satisfiesRange(electronVersion, range)) {
+      // 解釈できない範囲指定も「満たさない」として止める（安全側）。理由を残さないと
+      // 「更新が来ない」だけの静かな故障になり、engines を書き換えた本人も気づけない
+      log(userDataPath, `engines.electron=${String(range).trim()} を満たさないため適用しない（今: ${electronVersion}）`);
       throw new Error(`更新 ${nxt.version || '?'} には Electron ${String(range).trim()} が必要です（今は ${electronVersion}）。インストーラーで入れ直してください`);
     }
 

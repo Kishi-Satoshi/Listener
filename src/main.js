@@ -43,7 +43,7 @@ const {
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs, nextSegmentMs, EtaTracker,
   skipPendingSegments, restoreAfterPaste,
-  planDataMove, sameTree, estimateTokens, foldNotes, idleEnginesToStop,
+  planDataMove, dataMoveMode, dataDirFallback, sameTree, estimateTokens, foldNotes, idleEnginesToStop,
 } = require('./mainlib');
 
 const CPU_OLD_DEFAULT_THREADS = Math.max(4, Math.floor(os.cpus().length / 2));
@@ -162,6 +162,8 @@ const FG_REPLY_MS = 300;      // fg の応答待ち。常駐が起動中なら�
 const PASTE_REPLY_MS = 1500;  // paste の応答待ち。無応答なら貼れたものとして扱う（unknown）
 let programmaticMove = false;
 let recoveredPageId = null;
+// 保存先について画面が出てから知らせること（開けなかった／空だった。mainlib.dataDirFallback）
+let dataDirNotice = '';
 
 let meeting = null;
 let segChain = Promise.resolve();
@@ -210,9 +212,24 @@ function loadStores() {
   }
   history = loadJson(historyPath(), []);
   if (!Array.isArray(history)) history = [];
-  // 第2引数が空でなければそこをデータフォルダにする（#29）。設定した場所が無くなっていても
-  // （外付けディスクを抜いた等）store 側が作り直すので、起動は止まらない
-  store.init(app.getPath('userData'), settings.dataDir || '');
+  // 第2引数が空でなければそこをデータフォルダにする（#29）。設定した場所が開けない
+  // （外付けディスクを抜いた・ネットワークが落ちた・ドライブ文字が変わった）と store.init は
+  // 投げる。ここは app.whenReady の中なので、投げるとウィンドウごと出ず、設定を直す手段まで
+  // 消える。既定の場所で開き直し、理由は画面が出てから知らせる（判断は mainlib.dataDirFallback）
+  const wanted = settings.dataDir || '';
+  let result;
+  try {
+    store.init(app.getPath('userData'), wanted);
+    result = { ok: true, empty: store.listPages().length === 0 };
+  } catch (e) {
+    result = { ok: false, error: e.message };
+  }
+  const fb = dataDirFallback(wanted, result);
+  if (fb.useDefault) {
+    engineLog(`データ保存先を開けないため既定の場所で起動: ${wanted} (${result.error})`);
+    store.init(app.getPath('userData'), '');
+  }
+  dataDirNotice = fb.notice;
 }
 // いまのデータフォルダの絶対パス。store.root が無い版でも動くよう守り、無ければ既定の場所
 const dataRoot = () => (typeof store.root === 'function' ? store.root() : path.join(app.getPath('userData'), 'data'));
@@ -247,23 +264,32 @@ async function moveDataDir(dir) {
   const why = planDataMove(from, raw, (p) => fs.existsSync(p), listDir);
   if (why) return { ok: false, error: why };
   const to = path.normalize(raw);
+  // 既に Listener のデータがあるフォルダなら写さずに切り替える（元の保存先へ戻る道。mainlib.dataMoveMode）
+  const mode = dataMoveMode(to, (p) => fs.existsSync(p));
   try {
-    fs.mkdirSync(to, { recursive: true });
-    const skipFrom = path.join(from, SEGBUF_DIR);
-    fs.cpSync(from, to, { recursive: true, filter: (src) => src !== skipFrom });
-    if (!sameTree(treeSummary(from, skipFrom), treeSummary(to, path.join(to, SEGBUF_DIR)))) {
-      return { ok: false, error: '写した内容が元と一致しないため、保存先を切り替えませんでした。元の場所のデータはそのままです' };
+    if (mode === 'copy') {
+      fs.mkdirSync(to, { recursive: true });
+      const skipFrom = path.join(from, SEGBUF_DIR);
+      fs.cpSync(from, to, { recursive: true, filter: (src) => src !== skipFrom });
+      if (!sameTree(treeSummary(from, skipFrom), treeSummary(to, path.join(to, SEGBUF_DIR)))) {
+        return { ok: false, error: '写した内容が元と一致しないため、保存先を切り替えませんでした。元の場所のデータはそのままです' };
+      }
     }
+    // 設定を保存する前に、新しい場所で本当に開けることを確かめる。先に保存すると、
+    // 開けなかったときに設定だけが壊れた場所を指して残る
+    store.init(app.getPath('userData'), to);
   } catch (e) {
+    try { store.init(app.getPath('userData'), settings.dataDir || ''); } catch (_) { /* 元の場所へ戻す */ }
     return { ok: false, error: `移動に失敗しました: ${e.message}。元の場所のデータはそのままです` };
   }
   settings.dataDir = to;
   persistSettings();
-  store.init(app.getPath('userData'), settings.dataDir);
-  engineLog(`データ保存先を移動: ${from} → ${to}`);
+  engineLog(`データ保存先を${mode === 'switch' ? '切り替え' : '移動'}: ${from} → ${to}`);
   sendToMainWin('pages:updated', store.listPages());
-  sendToMainWin('app:notice', `データの保存先を ${to} に変えました。元の場所のデータは残しています（不要なら手で削除してください）`);
-  return { ok: true, dir: to };
+  sendToMainWin('app:notice', mode === 'switch'
+    ? `データの保存先を ${to} に切り替えました。そのフォルダにあった議事録を開いています（元の場所のデータはそのままです）`
+    : `データの保存先を ${to} に変えました。元の場所のデータは残しています（不要なら手で削除してください）`);
+  return { ok: true, dir: to, mode };
 }
 
 // ---------------------------------------------------------------- テキスト整形
@@ -954,6 +980,12 @@ function createMainWindow() {
       sendToMainWin('app:notice', '前回中断された議事録の文字起こしを復旧しました。「要約を生成」から議事録を作成できます。');
       sendToMainWin('page:open', id);
     });
+  }
+  // 保存先を開けなかった／空だった知らせ（R1）。画面が出てから送る（起動直後は受け手が居ない）
+  if (dataDirNotice) {
+    const msg = dataDirNotice;
+    dataDirNotice = '';
+    mainWin.webContents.once('did-finish-load', () => sendToMainWin('app:notice', msg));
   }
   // 閉じるボタンの挙動。既定はそのまま終了。設定でトレイ常駐に切り替えられる。
   mainWin.on('close', (e) => {

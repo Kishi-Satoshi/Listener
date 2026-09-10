@@ -628,10 +628,49 @@ function planDataMove(from, to, exists, listDir) {
   if (t.startsWith(`${f}/`)) return '今のデータフォルダの中には移せません';
   if (f.startsWith(`${t}/`)) return '今のデータフォルダを含むフォルダ（親フォルダ）には移せません';
   const raw = String(to ?? '').trim();
-  const sub = (name) => `${raw.replace(/[\\/]+$/, '')}${raw.includes('\\') ? '\\' : '/'}${name}`;
-  if (exists(sub('pages')) || exists(sub('index.json'))) return '移動先に既に Listener のデータがあります。別の空のフォルダを選んでください';
-  if (exists(raw) && (listDir(raw) || []).length > 0) return '移動先は空のフォルダにしてください';
+  // 既に Listener のデータがあるフォルダは拒まない。写さずにそこへ切り替える（dataMoveMode）。
+  // 拒むと、一度移した人が元の保存先へ戻せなくなる（元のフォルダにはデータが残っているため）。
+  // 「空でないだけ」のフォルダは拒む（利用者の書類の中に pages/ が混ざる）
+  if (dataMoveMode(raw, exists) === 'copy' && exists(raw) && (listDir(raw) || []).length > 0) {
+    return '移動先は空のフォルダにしてください（Listener のデータがあるフォルダを選べば、写さずにそこへ切り替えます）';
+  }
   return '';
+}
+// 移動先の扱い。既に Listener のデータ（index.json か pages/）があれば 'switch'（写さずに
+// そこへ切り替える。元の保存先へ戻る道でもある）、無ければ 'copy'（今のデータを写す）。
+// exists は fs.existsSync 相当（Windows なので \ と / を区別しない前提）
+function dataMoveMode(to, exists) {
+  const raw = String(to ?? '').trim().replace(/[\\/]+$/, '');
+  if (!raw) return 'copy';
+  const sep = raw.includes('\\') ? '\\' : '/';
+  return (exists(`${raw}${sep}index.json`) || exists(`${raw}${sep}pages`)) ? 'switch' : 'copy';
+}
+
+// 設定した保存先を使えるかを見た結果から、どこで起動するかと知らせる文を決める（#29 の R1）。
+//   wanted: settings.dataDir（'' なら既定の場所を使っている）
+//   result: { ok:true, empty:bool }（その場所で開けた）/ { ok:false, error }（開けなかった）
+// 開けなければ既定の場所へ落とす。設定は書き換えない——外付けを繋ぎ直して起動し直せば
+// 元の保存先に戻るべきで、こちらが勝手に既定へ書き換えると戻れなくなる。
+// 開けたが議事録が1件も無いときは落とさずに知らせるだけ（勝手に既定へ移すとデータが二重になる）。
+function dataDirFallback(wanted, result) {
+  const w = String(wanted || '');
+  if (!w) return { useDefault: false, notice: '' };
+  if (!result || result.ok !== true) {
+    const why = (result && result.error) ? result.error : '理由不明';
+    return {
+      useDefault: true,
+      notice: `データ保存先「${w}」を開けませんでした（${why}）。既定の場所のデータで起動しています。`
+        + '外付けディスクやネットワークを繋ぎ直してアプリを起動し直すと、元の保存先に戻ります（設定は変えていません）。',
+    };
+  }
+  if (result.empty) {
+    return {
+      useDefault: false,
+      notice: `データ保存先「${w}」に議事録がありません。フォルダが空か、別のディスクが同じドライブ文字になっている可能性があります。`
+        + '設定の「データ保存先」を確かめてください。',
+    };
+  }
+  return { useDefault: false, notice: '' };
 }
 // 写した結果の検証。a / b は { files: ファイル数, bytes: 合計バイト数 }。両方一致で同じ木とみなす。
 // 数えられなかった（NaN）ときは一致としない（確かめていないのに切り替えない）
@@ -663,6 +702,6 @@ module.exports = {
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
   nextSegmentMs, EtaTracker, skipPendingSegments,
-  planDataMove, sameTree,
+  planDataMove, dataMoveMode, dataDirFallback, sameTree,
   estimateTokens, foldNotes, idleEnginesToStop,
 };

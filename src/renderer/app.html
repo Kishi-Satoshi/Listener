@@ -1811,7 +1811,7 @@
     if (typeof window.koeApp.dataDirMove !== 'function') return;   // 古い preload
     const dir = await window.koeApp.pickFile('folder');
     if (!dir) return;
-    if (!confirm(`データの保存先を次の場所へ移します。\n${dir}\n\n議事録と設定をここへ写し、以後はここに保存します。元の場所のデータは消しません。\n\n続行しますか？`)) return;
+    if (!confirm(`データの保存先を次の場所に変えます。\n${dir}\n\nそのフォルダに議事録が既にあればそれに切り替え、無ければ今の議事録をここへ写します。\nどちらの場合も元の場所のデータは消しません。\n\n続行しますか？`)) return;
     const b = $('dataDirMoveBtn'); b.disabled = true;
     let r;
     try { r = await window.koeApp.dataDirMove(dir); }
