@@ -300,18 +300,41 @@ function engineFileIssue(file, minBytes, statFn) {
   return 'ok';
 }
 
-// 検査結果を、原因を名指しする一文にする。kind: 'exe' | 'model'。size は truncated のときの大きさ。
-// 「見つかりません」だけでは、あるように見えるファイルを前に利用者が何もできない。
-function engineIssueMessage(issue, kind, size) {
+// 検査結果を、原因を名指しする一文にする。kind: 'exe' | 'model'。size は truncated のときの大きさ、
+// file はそのファイルのパス。
+// パスを必ず添える: 設定欄には2つ以上のパスが並んでいて、どれの話か分からないと利用者は動けない。
+// 「setup-*.ps1 を再実行してください」だけでは足りない。スクリプトは自分の置き場所の下の
+// local-engine\… に作るので、設定欄が指している壊れたファイルは再実行しても直らない。
+// できたファイルのパスを欄に貼り直すところまで言う（実機でこれに嵌まった）。
+function engineIssueMessage(issue, kind, size, file) {
   const entity = kind === 'exe' ? '実行ファイル' : 'モデル';
-  const file = kind === 'exe' ? '実行ファイル' : 'モデルファイル';
-  if (issue === 'placeholder') return `${entity}の実体がこの PC にありません（OneDrive などのプレースホルダの可能性）`;
+  const name = kind === 'exe' ? '実行ファイル' : 'モデルファイル';
+  const at = file ? `: ${file}` : '';
+  if (issue === 'placeholder') return `${entity}の実体がこの PC にありません（OneDrive などのプレースホルダの可能性）${at}`;
   if (issue === 'truncated') {
     const mb = (Number(size) || 0) / 1048576;
-    return `${file}が途中で切れています（${mb >= 10 ? Math.round(mb) : mb.toFixed(1)}MB）。setup-*.ps1 を再実行してください`;
+    return `${name}が壊れています（${mb >= 10 ? Math.round(mb) : mb.toFixed(1)}MB）${at}。`
+      + 'setup-*.ps1 を実行し直し、できたファイルのパスをこの欄に貼り直してください';
   }
-  if (issue === 'missing') return `${file}が見つかりません`;
+  if (issue === 'missing') return `${name}が見つかりません${at}`;
   return '';
+}
+
+// エンジンがアプリのインストール先（%LOCALAPPDATA%\Programs\Listener）の中に置かれていないか。
+// インストーラは更新のたびに旧版を消してから入れ直すので、そこへ置いたエンジンは更新のたびに
+// 消えうる（実機で llama-server.exe が 0 バイトになった）。appDir が分からないときは黙る。
+function engineInAppDir(enginePath, appDir) {
+  const p = normPath(enginePath);
+  const d = normPath(appDir);
+  if (!p || !d) return false;
+  return p.startsWith(`${d}/`);
+}
+// 上に当てはまるエンジンが1つでもあれば、移動を促す一文。無ければ ''
+function engineDirWarning(paths, appDir) {
+  const hit = (paths || []).some((p) => engineInAppDir(p, appDir));
+  if (!hit) return '';
+  return 'エンジンがアプリのインストール先に置かれています。更新のたびに消えることがあります。'
+    + '%LOCALAPPDATA%\\Listener-engine など別の場所へ移し、設定のパスを貼り直してください';
 }
 
 // ---------------------------------------------------------------- ポートの衝突（#28/#31）
@@ -697,7 +720,7 @@ module.exports = {
   registerHotkeys, hotkeyFailureMessage, hotkeyStatus, resolveStartupHotkeys, saveHotkeys,
   makeSummaryRunner, tickStep,
   pasterScript, copyCommand, restoreAfterPaste, parsePasterLine,
-  engineFileIssue, engineIssueMessage, portInUseError,
+  engineFileIssue, engineIssueMessage, engineInAppDir, engineDirWarning, portInUseError,
   ENGINE_SETTING_KEYS, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,

@@ -200,6 +200,9 @@ powershell -ExecutionPolicy Bypass -File .\get-installer.ps1
 インストーラーはユーザー単位のインストールなので
 管理者権限は不要で、`%LOCALAPPDATA%\Programs\Listener\Listener.exe` に入り、
 デスクトップとスタートメニューにショートカットが作られます。
+エンジン（whisper / llama とモデル）は**このインストール先には置かないでください**。
+更新のたびに旧版を消してから入れ直すので、そこへ置いたエンジンは消えます
+（`%LOCALAPPDATA%\Listener-engine` などに置く。起動テストでも注意が出ます）。
 設定の「Windowsサインイン時に自動起動」もこの形でのみ動作します。
 
 `build.asar` を `false` にしてあるため、`src/` は素のファイルとして置かれ、

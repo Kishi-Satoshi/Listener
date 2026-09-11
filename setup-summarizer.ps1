@@ -174,13 +174,25 @@ if (-not $binOk) {
 $binDir = Join-Path $llmRoot "bin"
 if (Test-Path $binDir) { Remove-Item -Recurse -Force $binDir }
 Expand-Archive -Path $binZip -DestinationPath $binDir -Force
-Remove-Item $binZip
 
 $server = Get-ChildItem -Path $binDir -Recurse -Include "llama-server.exe" | Select-Object -First 1
 if (-not $server) {
     Write-Host "llama-server.exe が見つかりませんでした。" -ForegroundColor Red
     exit 1
 }
+# 大きさまで見る。展開が途中で終わった・ウイルス対策ソフトに中身を削られた等で
+# 0 バイトの exe が残ることがあり、それを「完了」と言うと、アプリ側で
+# 「実行ファイルが壊れています（0.0MB）」に化けるまで誰も気づけない（実機で発生）
+if ($server.Length -lt 1MB) {
+    $kb = [math]::Round($server.Length / 1KB)
+    Write-Host ("llama-server.exe が壊れています（" + $kb + " KB）。") -ForegroundColor Red
+    Write-Host "展開が途中で終わったか、ウイルス対策ソフトに削られた可能性があります。"
+    Write-Host "もう一度実行してください。直らない場合は、ウイルス対策ソフトの除外設定に次のフォルダを追加してください:"
+    Write-Host ("  " + $binDir)
+    exit 1
+}
+# ここまで来て初めて zip を捨てる（失敗したら残しておき、再実行で取り直しから始めない）
+Remove-Item $binZip
 
 # ---------------------------------------------------------------------
 # 2) 要約用LLMモデル（GGUF形式）

@@ -114,13 +114,24 @@ else {
 
     if (Test-Path $binDir) { Remove-Item -Recurse -Force $binDir }
     Expand-Archive -Path $binZip -DestinationPath $binDir -Force
-    Remove-Item $binZip
 
     $server = Get-ChildItem -Path $binDir -Recurse -Include "whisper-server.exe","server.exe" | Select-Object -First 1
     if (-not $server) {
         Write-Host "whisper-server.exe が見つかりませんでした。zipの内容が変わった可能性があります。" -ForegroundColor Red
         exit 1
     }
+    # 大きさまで見る。0 バイトの exe を「完了」と言うと、アプリ側で
+    # 「実行ファイルが壊れています（0.0MB）」に化けるまで誰も気づけない
+    if ($server.Length -lt 1MB) {
+        $kb = [math]::Round($server.Length / 1KB)
+        Write-Host ("whisper-server.exe が壊れています（" + $kb + " KB）。") -ForegroundColor Red
+        Write-Host "展開が途中で終わったか、ウイルス対策ソフトに削られた可能性があります。"
+        Write-Host "もう一度実行してください。直らない場合は、ウイルス対策ソフトの除外設定に次のフォルダを追加してください:"
+        Write-Host ("  " + $binDir)
+        exit 1
+    }
+    # ここまで来て初めて zip を捨てる
+    Remove-Item $binZip
 }
 
 # ---------------------------------------------------------------------

@@ -1912,8 +1912,11 @@
     m.textContent = '確認中…（初回はモデル読み込みに時間がかかります）';
     if (!await save(true)) { m.textContent = ''; return; }
     const r = await fn();
-    m.textContent = r.ok ? `✓ ${r.info || 'OK'}` : `✗ ${r.error}`;
-    m.className = r.ok ? 'save-msg ok' : 'save-msg ng';
+    // 置き場所の注意（エンジンがアプリのインストール先にある＝更新のたびに消えうる）は、
+    // 成否にかかわらず同じ行に添える。成功していても次の更新で壊れるので黙ってはいけない
+    const warn = r && r.warning ? `　⚠ ${r.warning}` : '';
+    m.textContent = (r.ok ? `✓ ${r.info || 'OK'}` : `✗ ${r.error}`) + warn;
+    m.className = r.ok && !warn ? 'save-msg ok' : (r.ok ? 'save-msg' : 'save-msg ng');
   }
   $('testBtn').onclick = () => runTest(() => window.koeApp.testApi(), 'testMsg');
   $('testSumBtn').onclick = () => runTest(() => window.koeApp.testSum(), 'testSumMsg');

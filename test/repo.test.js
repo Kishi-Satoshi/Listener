@@ -1142,3 +1142,58 @@ test('区間の onstop は、次の区間の開始（rollSegment）を try の�
   assert.ok(seg.includes('settleSeg(seq, { wav: new Uint8Array(0), durationMs: 0, isFinal: true });'), '投げたときに番号を空の最後で埋めていない');
   assert.ok(seg.includes("errorAfterFinal = 'マイクが切断されました';"), 'エラーを最後の区間の後に回していない');
 });
+
+// ---------------------------------------------------------------- エンジンの壊れ方（実機の報告）
+test('エンジンの不具合は、どのファイルかを名指しして伝える', () => {
+  const m = code(main);
+  const fn = fnBody(m, 'function engineCheck(eng)', '\n}');
+  assert.ok(fn.includes("engineIssueMessage(exe, 'exe', fileSize(engineExe(eng)), engineExe(eng))"), '実行ファイルのパスを文に渡していない');
+  assert.ok(fn.includes("engineIssueMessage(model, 'model', fileSize(engineModel(eng)), engineModel(eng))"), 'モデルのパスを文に渡していない');
+});
+
+test('起動テストは、エンジンがアプリのインストール先にあれば移動を促す（更新のたびに消える）', () => {
+  const m = code(main);
+  assert.ok(m.includes('const appInstallDir = () => path.dirname(process.execPath);'), 'インストール先を求めていない');
+  assert.ok(m.includes('engineDirWarning([engineExe(eng), engineModel(eng)], appInstallDir())'), '判断を mainlib.engineDirWarning に任せていない');
+  for (const [ch, eng] of [["app:test'", 'whisperEng'], ["app:test-sum'", 'sumEng']]) {
+    const i = m.indexOf(`ipcMain.handle('${ch}`);
+    assert.ok(i > 0, `${ch} が無い`);
+    const body = m.slice(i, m.indexOf('  });', i));
+    assert.ok(body.includes(`const warning = engineDirNote(${eng});`), `${ch} が置き場所を見ていない`);
+    // 成功でも失敗でも添える（動いていても次の更新で壊れる）。返す物を1つずつ、文の終わりまで見る
+    const at = [...body.matchAll(/\bok: (?:true|false)\b/g)].map((x) => x.index);
+    assert.ok(at.length >= 3, `${ch} の戻り値を数えられない（検査が空振り）`);
+    for (const i of at) {
+      const end = body.indexOf('};', i);
+      const stmt = body.slice(i, end > 0 ? end : i + 200);
+      assert.ok(/\bwarning\b/.test(stmt), `${ch} の経路「${stmt.slice(0, 50)}…」が注意を伝えていない`);
+    }
+  }
+  // 画面は成否にかかわらず同じ行に出す
+  const run = appHtml.slice(appHtml.indexOf('async function runTest('), appHtml.indexOf("$('testBtn').onclick"));
+  assert.ok(run.includes('r.warning'), '画面が注意を出していない');
+});
+
+test('セットアップは、展開した実行ファイルの大きさを確かめてから zip を消す', () => {
+  for (const [name, exe] of [['setup-summarizer.ps1', 'llama-server.exe'], ['setup-local-engine.ps1', 'whisper-server.exe']]) {
+    const s = read(name);
+    const i = s.indexOf('Expand-Archive');
+    assert.ok(i > 0, `${name}: 展開していない`);
+    const after = s.slice(i);
+    const check = after.indexOf('.Length -lt 1MB');
+    assert.ok(check > 0, `${name}: 展開した ${exe} の大きさを見ていない（0 バイトでも「完了」と言ってしまう）`);
+    const rm = after.indexOf('Remove-Item $binZip');
+    assert.ok(rm > 0 && check < rm, `${name}: 確かめる前に zip を消している（再実行で取り直せない）`);
+    assert.match(after.slice(check, check + 400), /ウイルス対策|除外/, `${name}: 直し方（除外設定）を案内していない`);
+  }
+});
+
+test('アプリのインストール先にエンジンを置かないことが文書に書いてある', () => {
+  for (const name of ['README.md', 'INSTALL.md']) {
+    const s = read(name);
+    const i = s.indexOf('Programs\\Listener');
+    assert.ok(i > 0, `${name}: インストール先に触れていない`);
+    assert.match(s, /インストール先[^\n]*(置かない|置かないで)|エンジン[^\n]*インストール先[^\n]*消え/,
+      `${name}: インストール先にエンジンを置かない注意が無い`);
+  }
+});

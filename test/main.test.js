@@ -18,7 +18,7 @@ const {
   hotkeyFailureMessage, hotkeyStatus, resolveStartupHotkeys, saveHotkeys,
   makeSummaryRunner, tickStep,
   pasterScript, copyCommand, restoreAfterPaste,
-  engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
+  engineFileIssue, engineIssueMessage, engineInAppDir, engineDirWarning, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   truncationMessage, extractNotes, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs,
   nextSegmentMs, EtaTracker, skipPendingSegments,
@@ -499,17 +499,45 @@ test('engineFileIssue: blocks が取れない環境では実体の有無を判�
   assert.strictEqual(engineFileIssue('f', 600_000_000, stat), 'truncated');
 });
 
-test('engineIssueMessage: 原因を名指しし、切れているときは大きさと直し方を添える', () => {
-  assert.strictEqual(engineIssueMessage('placeholder', 'model', 500_000_000),
-    'モデルの実体がこの PC にありません（OneDrive などのプレースホルダの可能性）');
-  assert.strictEqual(engineIssueMessage('truncated', 'model', 120_000_000),
-    'モデルファイルが途中で切れています（114MB）。setup-*.ps1 を再実行してください');
-  assert.strictEqual(engineIssueMessage('missing', 'model'), 'モデルファイルが見つかりません');
-  assert.strictEqual(engineIssueMessage('placeholder', 'exe', 1_000_000),
-    '実行ファイルの実体がこの PC にありません（OneDrive などのプレースホルダの可能性）');
-  assert.match(engineIssueMessage('truncated', 'exe', 40_000), /^実行ファイルが途中で切れています（0\.0MB）/);
+test('engineIssueMessage: どのファイルかを名指しし、切れているときは大きさと「貼り直す」まで案内する', () => {
+  const M = 'D:\\e\\model.gguf';
+  const X = 'D:\\e\\llama-server.exe';
+  assert.strictEqual(engineIssueMessage('placeholder', 'model', 500_000_000, M),
+    `モデルの実体がこの PC にありません（OneDrive などのプレースホルダの可能性）: ${M}`);
+  assert.strictEqual(engineIssueMessage('missing', 'model', 0, M), `モデルファイルが見つかりません: ${M}`);
+  assert.strictEqual(engineIssueMessage('ok', 'model', 1, M), '');
+  // 切れている: 大きさ・パス・「実行し直す」だけでなく「貼り直す」まで言う。
+  // スクリプトは local-engine 配下に作るので、再実行だけでは設定欄が指す壊れたパスは直らない
+  const t = engineIssueMessage('truncated', 'exe', 0, X);
+  assert.ok(t.startsWith('実行ファイルが壊れています（0.0MB）: ' + X), `文頭が違う: ${t}`);
+  assert.match(t, /setup-\*\.ps1/);
+  assert.match(t, /貼り直/, '再実行だけでは直らないことを伝えていない');
+  assert.match(engineIssueMessage('truncated', 'model', 120_000_000, M), /^モデルファイルが壊れています（114MB）: /);
+  // パスを渡さない呼び方でも壊れない（古い呼び出しが残っても文が崩れない）
   assert.strictEqual(engineIssueMessage('missing', 'exe'), '実行ファイルが見つかりません');
-  assert.strictEqual(engineIssueMessage('ok', 'model', 1), '');
+});
+
+// ---------------------------------------------------------------- エンジンの置き場所（更新で消える）
+test('engineInAppDir: アプリのインストール先の中に置かれたエンジンだけを true にする', () => {
+  const APP = 'C:\\Users\\u\\AppData\\Local\\Programs\\Listener';
+  assert.strictEqual(engineInAppDir(`${APP}\\engine\\llama-server.exe`, APP), true);
+  assert.strictEqual(engineInAppDir(`${APP}/engine/llama-server.exe`, APP), true, '区切りの違いで見落としている');
+  assert.strictEqual(engineInAppDir(`${APP.toLowerCase()}\\engine\\x.exe`, APP), true, '大文字小文字で見落としている');
+  assert.strictEqual(engineInAppDir('C:\\Users\\u\\AppData\\Local\\Listener-engine\\local-engine\\llm\\bin\\llama-server.exe', APP), false);
+  // 名前が前方一致するだけの別フォルダを巻き込まない
+  assert.strictEqual(engineInAppDir(`${APP}-engine\\x.exe`, APP), false);
+  assert.strictEqual(engineInAppDir(APP, APP), false, 'フォルダそのものは「中」ではない');
+  assert.strictEqual(engineInAppDir('', APP), false);
+  assert.strictEqual(engineInAppDir(`${APP}\\engine\\x.exe`, ''), false, 'インストール先が分からないときは黙る');
+});
+
+test('engineDirWarning: インストール先に置かれていれば移動を促す一文、そうでなければ空', () => {
+  const APP = 'C:\\P\\Listener';
+  const w = engineDirWarning([`${APP}\\engine\\llama-server.exe`, 'D:\\ok\\x.gguf'], APP);
+  assert.match(w, /インストール先/); assert.match(w, /更新/); assert.match(w, /Listener-engine/);
+  assert.strictEqual(engineDirWarning(['D:\\ok\\a.exe', 'D:\\ok\\b.gguf'], APP), '');
+  assert.strictEqual(engineDirWarning([], APP), '');
+  assert.strictEqual(engineDirWarning(['', null], APP), '');
 });
 
 // ---------------------------------------------------------------- #28/#31 ポートの衝突

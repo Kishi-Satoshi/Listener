@@ -39,7 +39,7 @@ const {
   saveIfExists, meetingDurationSec, promptTail,
   registerHotkeys, resolveStartupHotkeys, saveHotkeys, makeSummaryRunner, tickStep,
   pasterScript, copyCommand, parsePasterLine,
-  engineFileIssue, engineIssueMessage, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
+  engineFileIssue, engineIssueMessage, engineInAppDir, engineDirWarning, portInUseError, guardEngineSettings, keptDifferent, closeConfirm,
   extractNotes, truncationMessage, buildPromptParts,
   publicSegments, settledSegments, pendingDurationMs, recoverSegments, staleSegbufDirs, nextSegmentMs, EtaTracker,
   skipPendingSegments, restoreAfterPaste,
@@ -413,11 +413,16 @@ function engineCheck(eng) {
   if (!engineConfigured(eng)) return `${eng.name}の実行ファイルまたはモデルが見つかりません`;
   const stat = (f) => fs.statSync(f);
   const exe = engineFileIssue(engineExe(eng), ENGINE_MIN_BYTES.exe, stat);
-  if (exe !== 'ok') return `${eng.name}の${engineIssueMessage(exe, 'exe', fileSize(engineExe(eng)))}`;
+  if (exe !== 'ok') return `${eng.name}の${engineIssueMessage(exe, 'exe', fileSize(engineExe(eng)), engineExe(eng))}`;
   const model = engineFileIssue(engineModel(eng), eng === whisperEng ? ENGINE_MIN_BYTES.whisper : ENGINE_MIN_BYTES.gguf, stat);
-  if (model !== 'ok') return `${eng.name}の${engineIssueMessage(model, 'model', fileSize(engineModel(eng)))}`;
+  if (model !== 'ok') return `${eng.name}の${engineIssueMessage(model, 'model', fileSize(engineModel(eng)), engineModel(eng))}`;
   return '';
 }
+// アプリのインストール先（Listener.exe のあるフォルダ）。開発中は Electron の実行ファイルの
+// 場所になるが、その下にエンジンを置く人は居ないので誤検知しない
+const appInstallDir = () => path.dirname(process.execPath);
+// エンジンがインストール先の中にあれば移動を促す一文（更新のたびに消えうる。mainlib.engineDirWarning）
+const engineDirNote = (eng) => engineDirWarning([engineExe(eng), engineModel(eng)], appInstallDir());
 const engineValid = (e) => !engineCheck(e);
 // 未設定なのか、設定はあるが中身に問題があるのかを分けて伝える
 function whisperProblem() {
@@ -2012,21 +2017,24 @@ function setupIpc() {
 
   ipcMain.handle('clipboard:copy', async (_e, t) => { await copyPrivate(String(t ?? '')); return true; });
   ipcMain.handle('app:test', async () => {
+    // 置き場所の注意は、動いていても動いていなくても添える（原因の説明にも予防にもなる）
+    const warning = engineDirNote(whisperEng);
     const problem = engineCheck(whisperEng);   // 原因を名指しする（#32）
-    if (problem) return { ok: false, error: problem };
+    if (problem) return { ok: false, error: problem, warning };
     const ok = await ensureEngineReady(whisperEng);
-    if (!ok) return { ok: false, error: whisperEng.lastError || '起動に失敗しました' };
+    if (!ok) return { ok: false, error: whisperEng.lastError || '起動に失敗しました', warning };
     const vad = settings.useVad ? resolveVadModel() : '';
     const notes = [vad ? `VAD有効（${path.basename(vad)}）` : 'VAD無効'];
     if (settings.suppressNst) notes.push('非発話トークン抑制');
-    return { ok: true, info: `文字起こしエンジンは起動済みです（${notes.join(' / ')}）` };
+    return { ok: true, info: `文字起こしエンジンは起動済みです（${notes.join(' / ')}）`, warning };
   });
   ipcMain.handle('app:test-sum', async () => {
+    const warning = engineDirNote(sumEng);
     const problem = engineCheck(sumEng);
-    if (problem) return { ok: false, error: problem };
+    if (problem) return { ok: false, error: problem, warning };
     const ok = await ensureEngineReady(sumEng);
-    return ok ? { ok: true, info: '要約エンジンは起動済みです（オフライン動作可）' }
-      : { ok: false, error: sumEng.lastError || '起動に失敗しました' };
+    return ok ? { ok: true, info: '要約エンジンは起動済みです（オフライン動作可）', warning }
+      : { ok: false, error: sumEng.lastError || '起動に失敗しました', warning };
   });
   // 辞書が初期プロンプトの予算に収まっているか（#23）。kept: 収まった語数、total: 辞書の語数。
   // 尻尾（直前の発言）は付けずに数える（辞書そのものの収まり具合を見せるため）
