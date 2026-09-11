@@ -300,21 +300,26 @@ function engineFileIssue(file, minBytes, statFn) {
   return 'ok';
 }
 
-// 検査結果を、原因を名指しする一文にする。kind: 'exe' | 'model'。size は truncated のときの大きさ、
-// file はそのファイルのパス。
+// 検査結果を、原因を名指しする一文にする。kind: 'exe' | 'model'、size は truncated のときの大きさ、
+// file はそのファイルのパス、script は実行し直すスクリプト名。
+//
 // パスを必ず添える: 設定欄には2つ以上のパスが並んでいて、どれの話か分からないと利用者は動けない。
-// 「setup-*.ps1 を再実行してください」だけでは足りない。スクリプトは自分の置き場所の下の
-// local-engine\… に作るので、設定欄が指している壊れたファイルは再実行しても直らない。
-// できたファイルのパスを欄に貼り直すところまで言う（実機でこれに嵌まった）。
-function engineIssueMessage(issue, kind, size, file) {
+// ただし **パスは必ず文末に置く**。文の途中に置くと、後ろに続く文と地続きに読まれる。実機で
+// 「…llama-server.exe。setup-*.ps1」をひと続きのコマンドと読み、PowerShell に貼り付けた人がいた。
+// 「今のパス: 」の札を付けて最後に置けば、命令ではなく情報として読める。
+// スクリプトは名指しする: `setup-*.ps1` は実在するファイル名ではなく、どれを実行するか分からない。
+// 「再実行してください」だけでも足りない。スクリプトは自分の置き場所の下の local-engine\… に
+// 作るので、設定欄が指している壊れたファイルは再実行しても変わらない。貼り直すまで言う。
+function engineIssueMessage(issue, kind, size, file, script) {
   const entity = kind === 'exe' ? '実行ファイル' : 'モデル';
   const name = kind === 'exe' ? '実行ファイル' : 'モデルファイル';
-  const at = file ? `: ${file}` : '';
+  const at = file ? `。今のパス: ${file}` : '';
+  const ps = script || 'setup-*.ps1';
   if (issue === 'placeholder') return `${entity}の実体がこの PC にありません（OneDrive などのプレースホルダの可能性）${at}`;
   if (issue === 'truncated') {
     const mb = (Number(size) || 0) / 1048576;
-    return `${name}が壊れています（${mb >= 10 ? Math.round(mb) : mb.toFixed(1)}MB）${at}。`
-      + 'setup-*.ps1 を実行し直し、できたファイルのパスをこの欄に貼り直してください';
+    return `${name}が壊れています（${mb >= 10 ? Math.round(mb) : mb.toFixed(1)}MB）。`
+      + `${ps} を実行し直し、表示されたパスをこの欄に貼り直してください${at}`;
   }
   if (issue === 'missing') return `${name}が見つかりません${at}`;
   return '';

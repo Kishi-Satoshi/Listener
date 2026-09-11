@@ -1147,8 +1147,10 @@ test('区間の onstop は、次の区間の開始（rollSegment）を try の�
 test('エンジンの不具合は、どのファイルかを名指しして伝える', () => {
   const m = code(main);
   const fn = fnBody(m, 'function engineCheck(eng)', '\n}');
-  assert.ok(fn.includes("engineIssueMessage(exe, 'exe', fileSize(engineExe(eng)), engineExe(eng))"), '実行ファイルのパスを文に渡していない');
-  assert.ok(fn.includes("engineIssueMessage(model, 'model', fileSize(engineModel(eng)), engineModel(eng))"), 'モデルのパスを文に渡していない');
+  assert.ok(fn.includes("engineIssueMessage(exe, 'exe', fileSize(engineExe(eng)), engineExe(eng), ps)"), '実行ファイルのパスを文に渡していない');
+  assert.ok(fn.includes("engineIssueMessage(model, 'model', fileSize(engineModel(eng)), engineModel(eng), ps)"), 'モデルのパスを文に渡していない');
+  // エンジンごとに実行し直すスクリプトを名指しする（setup-*.ps1 では利用者がどれか分からない）
+  assert.ok(fn.includes("eng === whisperEng ? 'setup-local-engine.ps1' : 'setup-summarizer.ps1'"), 'スクリプトを名指ししていない');
 });
 
 test('起動テストは、エンジンがアプリのインストール先にあれば移動を促す（更新のたびに消える）', () => {

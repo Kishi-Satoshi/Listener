@@ -499,20 +499,43 @@ test('engineFileIssue: blocks が取れない環境では実体の有無を判�
   assert.strictEqual(engineFileIssue('f', 600_000_000, stat), 'truncated');
 });
 
+// 実機で、この文を PowerShell に貼り付けて実行した人がいた（`llama-server.exe。setup-*.ps1` を
+// ひと続きのコマンドと読んだ）。パスの後ろに文を続けると必ずそう読まれるので、文末に置く。
+test('engineIssueMessage: パスを渡したら文は必ずそのパスで終わる（後ろに続けるとコマンドに見える）', () => {
+  const F = 'C:\\Users\\u\\AppData\\Local\\Programs\\Listener\\engine\\llama-server.exe';
+  for (const issue of ['truncated', 'missing', 'placeholder']) {
+    for (const kind of ['exe', 'model']) {
+      const msg = engineIssueMessage(issue, kind, 0, F, 'setup-summarizer.ps1');
+      assert.ok(msg.endsWith(F), `${issue}/${kind}: パスが文末に無い → ${msg}`);
+      // パスの直後に句点や語が続いていないこと（`…exe。setup-*.ps1` の形を禁じる）
+      assert.strictEqual(msg.indexOf(F), msg.length - F.length, `${issue}/${kind}: パスが文中にある`);
+      assert.ok(/。今のパス: $/.test(msg.slice(0, msg.length - F.length)), `${issue}/${kind}: パスに「今のパス: 」の札が無い`);
+    }
+  }
+});
+
+test('engineIssueMessage: 実行し直すスクリプトを名指しする（setup-*.ps1 は実在しないファイル名）', () => {
+  const F = 'D:\\e\\llama-server.exe';
+  assert.match(engineIssueMessage('truncated', 'exe', 0, F, 'setup-summarizer.ps1'), /setup-summarizer\.ps1 を実行し直し/);
+  assert.match(engineIssueMessage('truncated', 'exe', 0, F, 'setup-local-engine.ps1'), /setup-local-engine\.ps1 を実行し直し/);
+  // 渡されなければ従来どおり（呼び出しが漏れても文が壊れない）
+  assert.match(engineIssueMessage('truncated', 'exe', 0, F), /setup-\*\.ps1 を実行し直し/);
+});
+
 test('engineIssueMessage: どのファイルかを名指しし、切れているときは大きさと「貼り直す」まで案内する', () => {
   const M = 'D:\\e\\model.gguf';
   const X = 'D:\\e\\llama-server.exe';
   assert.strictEqual(engineIssueMessage('placeholder', 'model', 500_000_000, M),
-    `モデルの実体がこの PC にありません（OneDrive などのプレースホルダの可能性）: ${M}`);
-  assert.strictEqual(engineIssueMessage('missing', 'model', 0, M), `モデルファイルが見つかりません: ${M}`);
+    `モデルの実体がこの PC にありません（OneDrive などのプレースホルダの可能性）。今のパス: ${M}`);
+  assert.strictEqual(engineIssueMessage('missing', 'model', 0, M), `モデルファイルが見つかりません。今のパス: ${M}`);
   assert.strictEqual(engineIssueMessage('ok', 'model', 1, M), '');
-  // 切れている: 大きさ・パス・「実行し直す」だけでなく「貼り直す」まで言う。
+  // 切れている: 大きさ・「実行し直す」だけでなく「貼り直す」まで言い、パスは文末に置く。
   // スクリプトは local-engine 配下に作るので、再実行だけでは設定欄が指す壊れたパスは直らない
-  const t = engineIssueMessage('truncated', 'exe', 0, X);
-  assert.ok(t.startsWith('実行ファイルが壊れています（0.0MB）: ' + X), `文頭が違う: ${t}`);
-  assert.match(t, /setup-\*\.ps1/);
+  const t = engineIssueMessage('truncated', 'exe', 0, X, 'setup-summarizer.ps1');
+  assert.ok(t.startsWith('実行ファイルが壊れています（0.0MB）。'), `文頭が違う: ${t}`);
   assert.match(t, /貼り直/, '再実行だけでは直らないことを伝えていない');
-  assert.match(engineIssueMessage('truncated', 'model', 120_000_000, M), /^モデルファイルが壊れています（114MB）: /);
+  assert.ok(t.endsWith(`。今のパス: ${X}`), `パスが文末に無い: ${t}`);
+  assert.match(engineIssueMessage('truncated', 'model', 120_000_000, M), /^モデルファイルが壊れています（114MB）。/);
   // パスを渡さない呼び方でも壊れない（古い呼び出しが残っても文が崩れない）
   assert.strictEqual(engineIssueMessage('missing', 'exe'), '実行ファイルが見つかりません');
 });

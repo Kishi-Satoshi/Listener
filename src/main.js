@@ -412,10 +412,12 @@ const fileSize = (f) => { try { return fs.statSync(f).size; } catch (_) { return
 function engineCheck(eng) {
   if (!engineConfigured(eng)) return `${eng.name}の実行ファイルまたはモデルが見つかりません`;
   const stat = (f) => fs.statSync(f);
+  // 実行し直すスクリプトはエンジンごとに違う。名指ししないと利用者はどれか分からない
+  const ps = eng === whisperEng ? 'setup-local-engine.ps1' : 'setup-summarizer.ps1';
   const exe = engineFileIssue(engineExe(eng), ENGINE_MIN_BYTES.exe, stat);
-  if (exe !== 'ok') return `${eng.name}の${engineIssueMessage(exe, 'exe', fileSize(engineExe(eng)), engineExe(eng))}`;
+  if (exe !== 'ok') return `${eng.name}の${engineIssueMessage(exe, 'exe', fileSize(engineExe(eng)), engineExe(eng), ps)}`;
   const model = engineFileIssue(engineModel(eng), eng === whisperEng ? ENGINE_MIN_BYTES.whisper : ENGINE_MIN_BYTES.gguf, stat);
-  if (model !== 'ok') return `${eng.name}の${engineIssueMessage(model, 'model', fileSize(engineModel(eng)), engineModel(eng))}`;
+  if (model !== 'ok') return `${eng.name}の${engineIssueMessage(model, 'model', fileSize(engineModel(eng)), engineModel(eng), ps)}`;
   return '';
 }
 // アプリのインストール先（Listener.exe のあるフォルダ）。開発中は Electron の実行ファイルの
