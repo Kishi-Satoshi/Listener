@@ -493,6 +493,25 @@ test('engineFileIssue: 無い・切れている・実体が無い・正常 を�
   assert.strictEqual(engineFileIssue('empty', 300_000_000, stat), 'truncated', '0 バイトはプレースホルダではなく切れている');
 });
 
+// 上流（llama.cpp / whisper.cpp）の配布構成は変わる。実際に llama.cpp は exe を薄いランチャにし、
+// 中身を llama-server-impl.dll（8.9MB）へ移した。exe の大きさに床を置くと、動く物を止めてしまう。
+// 実測（b10901 の bin-win-cpu-x64.zip / whisper v1.8.0 の bin-x64.zip の中央ディレクトリ）を焼き込む。
+test('engineFileIssue: 実行ファイルは大きさで壊れていると決めつけない（上流が薄いランチャにした）', () => {
+  const stat = statOf({
+    // llama.cpp b10901: llama-server.exe は 9,216 バイト。中身は llama-server-impl.dll にある
+    llama: { size: 9216, blocks: 24 },
+    // whisper.cpp v1.8.0: Release\\whisper-server.exe は 721,408 バイト
+    whisper: { size: 721408, blocks: 1410 },
+    empty: { size: 0, blocks: 0 },
+    cloud: { size: 9216, blocks: 0 },
+  });
+  assert.strictEqual(engineFileIssue('llama', 0, stat), 'ok', '9KB の llama-server.exe を壊れている扱いにした');
+  assert.strictEqual(engineFileIssue('whisper', 0, stat), 'ok', '704KB の whisper-server.exe を壊れている扱いにした');
+  // 0 バイトだけは今まで通り「壊れている」。プレースホルダも見分ける
+  assert.strictEqual(engineFileIssue('empty', 0, stat), 'truncated', '0 バイトを通している');
+  assert.strictEqual(engineFileIssue('cloud', 0, stat), 'placeholder');
+});
+
 test('engineFileIssue: blocks が取れない環境では実体の有無を判定しない（誤って使えなくしない）', () => {
   const stat = statOf({ f: { size: 500_000_000 } });
   assert.strictEqual(engineFileIssue('f', 300_000_000, stat), 'ok');

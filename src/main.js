@@ -406,7 +406,12 @@ const engineConfigured = (e) => Boolean(engineExe(e) && engineModel(e));
 // 途中で切れたダウンロードを「ある」と誤認し、起動して落ちるまで原因が分からない。
 // 下限はどの配布物でも下回らない大きさ（exe は数 MB、whisper は tiny でも 75MB、
 // 要約の gguf は最小のものでも数百 MB）。
-const ENGINE_MIN_BYTES = { exe: 100_000, whisper: 50_000_000, gguf: 300_000_000 };
+// 床を置くのはモデルだけ。実行ファイルの大きさでは壊れているか判断しない——上流の配布構成は
+// 変わる。llama.cpp は llama-server.exe を 9,216 バイトの薄いランチャにし、中身を
+// llama-server-impl.dll（約 8.9MB）へ移した。床を置くと、その正常な exe を「壊れている」と
+// 断じて製品を使えなくする（実機で起きた）。本当の判定は起動して /health が応えるかどうかで、
+// ここの検査は「より良い文を出すためのおまけ」に過ぎない。誤検知の害の方が桁違いに大きい。
+const ENGINE_MIN_BYTES = { whisper: 50_000_000, gguf: 300_000_000 };
 const fileSize = (f) => { try { return fs.statSync(f).size; } catch (_) { return 0; } };
 // 問題があれば利用者向けの一文、無ければ ''
 function engineCheck(eng) {
@@ -414,7 +419,7 @@ function engineCheck(eng) {
   const stat = (f) => fs.statSync(f);
   // 実行し直すスクリプトはエンジンごとに違う。名指ししないと利用者はどれか分からない
   const ps = eng === whisperEng ? 'setup-local-engine.ps1' : 'setup-summarizer.ps1';
-  const exe = engineFileIssue(engineExe(eng), ENGINE_MIN_BYTES.exe, stat);
+  const exe = engineFileIssue(engineExe(eng), 0, stat);   // 大きさの床は置かない（0 バイトとプレースホルダだけ見る）
   if (exe !== 'ok') return `${eng.name}の${engineIssueMessage(exe, 'exe', fileSize(engineExe(eng)), engineExe(eng), ps)}`;
   const model = engineFileIssue(engineModel(eng), eng === whisperEng ? ENGINE_MIN_BYTES.whisper : ENGINE_MIN_BYTES.gguf, stat);
   if (model !== 'ok') return `${eng.name}の${engineIssueMessage(model, 'model', fileSize(engineModel(eng)), engineModel(eng), ps)}`;

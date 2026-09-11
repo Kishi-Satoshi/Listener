@@ -890,7 +890,8 @@ test('#32 エンジンの実行ファイルとモデルは存在だけでなく�
   const chk = fnBody(m, 'function engineCheck(eng)', '\n}');
   assert.strictEqual((chk.match(/engineFileIssue\(/g) || []).length, 2, '実行ファイルとモデルの両方を見ていない');
   assert.ok(chk.includes('engineIssueMessage('), '原因を名指しする文を mainlib から取っていない');
-  assert.match(m, /exe: 100_000/); assert.match(m, /whisper: 50_000_000/); assert.match(m, /gguf: 300_000_000/);
+  // 床はモデルだけ（実行ファイルの大きさでは判断しない。上流が薄いランチャにした）
+  assert.match(m, /whisper: 50_000_000/); assert.match(m, /gguf: 300_000_000/);
   // 設定画面の「テスト」も原因を名指しする
   assert.ok(!m.includes('またはモデルファイルのパスが正しくありません'), 'テストの失敗が原因を名指ししていない');
 });
@@ -1176,14 +1177,14 @@ test('起動テストは、エンジンがアプリのインストール先に�
   assert.ok(run.includes('r.warning'), '画面が注意を出していない');
 });
 
-test('セットアップは、展開した実行ファイルの大きさを確かめてから zip を消す', () => {
-  for (const [name, exe] of [['setup-summarizer.ps1', 'llama-server.exe'], ['setup-local-engine.ps1', 'whisper-server.exe']]) {
+test('セットアップは、展開が不完全でないかを確かめてから zip を消す', () => {
+  for (const name of ['setup-summarizer.ps1', 'setup-local-engine.ps1']) {
     const s = read(name);
     const i = s.indexOf('Expand-Archive');
     assert.ok(i > 0, `${name}: 展開していない`);
     const after = s.slice(i);
-    const check = after.indexOf('.Length -lt 1MB');
-    assert.ok(check > 0, `${name}: 展開した ${exe} の大きさを見ていない（0 バイトでも「完了」と言ってしまう）`);
+    const check = after.indexOf('-lt 5MB');
+    assert.ok(check > 0, `${name}: 展開物の合計を見ていない（0 バイトでも「完了」と言ってしまう）`);
     const rm = after.indexOf('Remove-Item $binZip');
     assert.ok(rm > 0 && check < rm, `${name}: 確かめる前に zip を消している（再実行で取り直せない）`);
     assert.match(after.slice(check, check + 400), /ウイルス対策|除外/, `${name}: 直し方（除外設定）を案内していない`);
@@ -1198,4 +1199,32 @@ test('アプリのインストール先にエンジンを置かないことが�
     assert.match(s, /インストール先[^\n]*(置かない|置かないで)|エンジン[^\n]*インストール先[^\n]*消え/,
       `${name}: インストール先にエンジンを置かない注意が無い`);
   }
+});
+
+test('エンジンの実行ファイルは大きさの床で弾かない（上流が薄いランチャにした）', () => {
+  const m = code(main);
+  // 床はモデルだけ。exe に床を置くと、9KB の llama-server.exe（正常）を「壊れている」と言ってしまう
+  assert.match(m, /const ENGINE_MIN_BYTES = \{ whisper: 50_000_000, gguf: 300_000_000 \};/, 'exe の床が残っている');
+  const fn = fnBody(m, 'function engineCheck(eng)', '\n}');
+  assert.ok(fn.includes('engineFileIssue(engineExe(eng), 0, stat)'), 'exe に床を渡している');
+  assert.ok(!/ENGINE_MIN_BYTES\.exe/.test(m), 'ENGINE_MIN_BYTES.exe をまだ参照している');
+});
+
+test('セットアップは展開物ぜんたいの大きさで確かめる（exe の大きさでは判定しない）', () => {
+  for (const name of ['setup-summarizer.ps1', 'setup-local-engine.ps1']) {
+    const s = read(name);
+    assert.ok(!/\$server\.Length -lt 1MB/.test(s), `${name}: exe の大きさで判定している（薄いランチャを弾く）`);
+    assert.match(s, /Measure-Object[^\n]*Length[^\n]*-Sum/, `${name}: 展開物の合計を数えていない`);
+    assert.match(s, /-lt 5MB/, `${name}: 合計の下限を見ていない`);
+    const i = s.indexOf('Measure-Object');
+    assert.ok(s.indexOf('Remove-Item $binZip') > i, `${name}: 確かめる前に zip を消している`);
+  }
+});
+
+test('whisper のバイナリはリリース一覧から探す（固定URLは 404 になった）', () => {
+  const s = read('setup-local-engine.ps1');
+  assert.ok(!/releases\/latest\/download\/whisper-bin-x64\.zip/.test(s), '固定URLの直打ちが残っている（latest では 404）');
+  assert.match(s, /api\.github\.com\/repos\/ggml-org\/whisper\.cpp\/releases/, 'リリース一覧を見ていない');
+  assert.match(s, /Find-WinAsset|Find-WhisperAsset/, '資産を探す関数が無い');
+  assert.match(s, /v1\.8\.0/, '見つからないときの既知の版に落ちていない');
 });

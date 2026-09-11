@@ -47,6 +47,36 @@ function Get-BigFile {
     return $false
 }
 
+# --- リリース情報を取る（Invoke-RestMethod が通らない環境では curl.exe に落とす） ---
+function Get-Json {
+    param([string]$Url)
+    $r = $null
+    try { $r = Invoke-RestMethod -Uri $Url }
+    catch {
+        try { $r = (& curl.exe -L -sS $Url) | ConvertFrom-Json } catch { }
+    }
+    return $r
+}
+
+# Windows x64 の zip を選ぶ。whisper.cpp は配布の名前を変えることがある
+# （v1.9 で whisper-bin-x64.zip が消えた）ので、既知の名前を順に試し、
+# GPU 向け（cuBLAS / CUDA / Vulkan など）と ARM は避ける。
+function Find-WinAsset {
+    param($Assets)
+    if (-not $Assets) { return $null }
+    $patterns = @("*bin-x64.zip", "*bin-win-x64.zip", "*bin-win-cpu-x64.zip", "*win-x64.zip")
+    foreach ($p in $patterns) {
+        $hit = $Assets | Where-Object {
+            $_.name -like $p -and
+            $_.name -notlike "*cublas*" -and $_.name -notlike "*cuda*" -and $_.name -notlike "*cudart*" -and
+            $_.name -notlike "*clblast*" -and $_.name -notlike "*vulkan*" -and $_.name -notlike "*hip*" -and
+            $_.name -notlike "*sycl*" -and $_.name -notlike "*arm*" -and $_.name -notlike "*opencl*"
+        } | Select-Object -First 1
+        if ($hit) { return $hit }
+    }
+    return $null
+}
+
 # --- モデル名の解決（switch式を使わず 5.1 互換に） ---
 $modelFile = ""
 $modelUrl  = ""
@@ -102,9 +132,31 @@ else {
 
     Write-Host "[1/2] whisper.cpp バイナリをダウンロード中..." -ForegroundColor Cyan
     $binZip = Join-Path $root "whisper-bin-x64.zip"
-    $binUrl = "https://github.com/ggml-org/whisper.cpp/releases/latest/download/whisper-bin-x64.zip"
+    # 配布の名前は変わる。固定URL（releases/latest の whisper-bin-x64.zip）は v1.9 以降 404 に
+    # なった。リリース一覧から Windows x64 の zip を探し、見つからなければ最後に存在を確認できた
+    # 版（v1.8.0）に落とす。
+    $asset = $null
+    $rels = @()
+    $one = Get-Json "https://api.github.com/repos/ggml-org/whisper.cpp/releases/latest"
+    if ($one) { $rels += $one }
+    $list = Get-Json "https://api.github.com/repos/ggml-org/whisper.cpp/releases?per_page=20"
+    if ($list) { $rels += $list }
+    foreach ($r in $rels) {
+        $a = Find-WinAsset $r.assets
+        if ($a) { $asset = $a; break }
+    }
+    $binUrl = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.0/whisper-bin-x64.zip"
+    $binMin = [long]3MB
+    if ($asset) {
+        $binUrl = $asset.browser_download_url
+        $binMin = [long]$asset.size
+        Write-Host ("  " + $asset.name) -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host "  リリース一覧から取れなかったので、既知の版 v1.8.0 を使います" -ForegroundColor Yellow
+    }
     # 再開ありで取る。社内回線は大容量ダウンロードを途中で切ることがある
-    $binOk = Get-BigFile -Url $binUrl -Out $binZip -MinBytes 5MB
+    $binOk = Get-BigFile -Url $binUrl -Out $binZip -MinBytes $binMin
     if (-not $binOk) {
         Write-Host "whisper.cpp バイナリを取得できませんでした。" -ForegroundColor Red
         Write-Host "ブラウザで次のURLを開いて $root に置き、もう一度実行してください:"
@@ -120,11 +172,12 @@ else {
         Write-Host "whisper-server.exe が見つかりませんでした。zipの内容が変わった可能性があります。" -ForegroundColor Red
         exit 1
     }
-    # 大きさまで見る。0 バイトの exe を「完了」と言うと、アプリ側で
-    # 「実行ファイルが壊れています（0.0MB）」に化けるまで誰も気づけない
-    if ($server.Length -lt 1MB) {
-        $kb = [math]::Round($server.Length / 1KB)
-        Write-Host ("whisper-server.exe が壊れています（" + $kb + " KB）。") -ForegroundColor Red
+    # 展開が不完全でないかを **展開物ぜんたいの合計** で見る。exe の大きさでは判断しない
+    # （上流は exe を薄いランチャにすることがある。llama.cpp が実際にそうした）
+    $sum = (Get-ChildItem -Path $binDir -Recurse -File | Measure-Object -Property Length -Sum).Sum
+    if ($null -eq $sum -or $sum -lt 5MB) {
+        $mb = [math]::Round(([long]$sum) / 1MB, 1)
+        Write-Host ("展開が不完全です（合計 " + $mb + " MB）。") -ForegroundColor Red
         Write-Host "展開が途中で終わったか、ウイルス対策ソフトに削られた可能性があります。"
         Write-Host "もう一度実行してください。直らない場合は、ウイルス対策ソフトの除外設定に次のフォルダを追加してください:"
         Write-Host ("  " + $binDir)

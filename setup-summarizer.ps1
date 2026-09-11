@@ -180,12 +180,14 @@ if (-not $server) {
     Write-Host "llama-server.exe が見つかりませんでした。" -ForegroundColor Red
     exit 1
 }
-# 大きさまで見る。展開が途中で終わった・ウイルス対策ソフトに中身を削られた等で
-# 0 バイトの exe が残ることがあり、それを「完了」と言うと、アプリ側で
-# 「実行ファイルが壊れています（0.0MB）」に化けるまで誰も気づけない（実機で発生）
-if ($server.Length -lt 1MB) {
-    $kb = [math]::Round($server.Length / 1KB)
-    Write-Host ("llama-server.exe が壊れています（" + $kb + " KB）。") -ForegroundColor Red
+# 展開が途中で終わった・ウイルス対策ソフトに削られた等を捕まえる。ただし **exe の大きさでは
+# 判断しない**。llama.cpp は llama-server.exe を 9KB の薄いランチャにし、中身を
+# llama-server-impl.dll（約 9MB）へ移した。exe に床を置くと正常な配布物を止めてしまう。
+# 見るのは展開物ぜんたいの合計。
+$sum = (Get-ChildItem -Path $binDir -Recurse -File | Measure-Object -Property Length -Sum).Sum
+if ($null -eq $sum -or $sum -lt 5MB) {
+    $mb = [math]::Round(([long]$sum) / 1MB, 1)
+    Write-Host ("展開が不完全です（合計 " + $mb + " MB）。") -ForegroundColor Red
     Write-Host "展開が途中で終わったか、ウイルス対策ソフトに削られた可能性があります。"
     Write-Host "もう一度実行してください。直らない場合は、ウイルス対策ソフトの除外設定に次のフォルダを追加してください:"
     Write-Host ("  " + $binDir)

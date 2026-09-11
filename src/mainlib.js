@@ -295,7 +295,9 @@ function engineFileIssue(file, minBytes, statFn) {
   try { st = statFn(file); } catch (_) { return 'missing'; }
   if (!st) return 'missing';
   const size = Number(st.size) || 0;
-  if (size > 0 && st.blocks === 0) return 'placeholder';
+  // 空のファイルはどんな床でも壊れている（ダウンロードが始まる前に落ちた等）
+  if (size === 0) return 'truncated';
+  if (st.blocks === 0) return 'placeholder';
   if (size < minBytes) return 'truncated';
   return 'ok';
 }
